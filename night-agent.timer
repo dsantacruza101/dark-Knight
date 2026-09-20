@@ -1,0 +1,9 @@
+[Unit]
+Description=Night Agent Timer — inicia a las 10 PM CST diariamente
+
+[Timer]
+OnCalendar=*-*-* 22:00:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target
