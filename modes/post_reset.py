@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -68,6 +69,9 @@ def run_claude(
     accept_edits: bool = False,
     timeout: int = CLAUDE_TIMEOUT,
 ) -> Optional[str]:
+    if shutil.which(claude_bin) is None:
+        log.error("Comando '%s' no encontrado, se omite la llamada a claude", claude_bin)
+        return None
     cmd = [claude_bin, "-p", prompt]
     if accept_edits:
         cmd += ["--permission-mode", "acceptEdits"]
@@ -208,6 +212,15 @@ def judge_ollama_output(claude_bin: str, pair: dict) -> Optional[tuple[float, st
 
 
 def evaluate_ollama_quality(claude_bin: str, pairs: list[dict]) -> dict:
+    total_pairs = len(pairs)
+    if total_pairs == 0:
+        return {
+            "avg_score": 0.0,
+            "evaluated": 0,
+            "total_pairs": 0,
+            "synthesis": "Sin pares Claude/Ollama registrados esta semana.",
+        }
+
     scores: list[float] = []
     notes: list[str] = []
     for pair in pairs:
@@ -305,7 +318,7 @@ def write_weekly_report(
                 lines.append(f"\nArchivos modificados: {', '.join(result['files_changed'])}")
             lines.append("")
     else:
-        lines += ["- No hubo commits de night-agent esta semana.", ""]
+        lines += ["- Primera semana — sin commits de night-agent aún.", ""]
 
     lines += [
         "## Score de Nightwing esta semana:",
