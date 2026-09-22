@@ -68,7 +68,7 @@ REPAIR_RETRY_DELAY_SECONDS = 5
 # Signal es un vigilante diurno (6 AM-10 PM CST), no un servicio 24/7: fuera
 # de ese horario terminar es el comportamiento esperado, no una caida.
 SIGNAL_SERVICE_NAME = "signal.service"
-SIGNAL_OPERATING_HOURS_UTC = (12, 4)  # 6 AM-10 PM CST == 12:00-04:00 UTC (cruza medianoche)
+SIGNAL_OPERATING_HOURS_UTC = (12, 22)  # 6 AM-4 PM CST == 12:00-22:00 UTC (no cruza medianoche)
 
 PRIORITIES = ("critical", "high", "medium", "low")
 
@@ -149,7 +149,7 @@ def is_signal_operating_hours() -> bool:
     """True si la hora actual esta dentro del horario diurno de Signal."""
     hour = datetime.now(timezone.utc).hour
     start, end = SIGNAL_OPERATING_HOURS_UTC
-    return hour >= start or hour < end
+    return start <= hour < end
 
 
 def check_systemd(name: str) -> bool:
