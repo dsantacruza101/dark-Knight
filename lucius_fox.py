@@ -50,6 +50,7 @@ ENV_PATH = Path("/etc/night-agent.env")
 LOG_PATH = BASE_DIR / "lucius_fox.log"
 COMMS_PATH = BASE_DIR / "batcave" / "comms.json"
 
+CLAUDE_NODE_BIN = "/home/dsantacruz/.nvm/versions/node/v22.23.2/bin/node"
 CLAUDE_INSTALL_SCRIPT = (
     "/home/dsantacruz/.nvm/versions/node/v22.23.2/lib/node_modules/"
     "@anthropic-ai/claude-code/install.cjs"
@@ -161,7 +162,7 @@ def check_claude_binary(_name: str) -> bool:
 
 
 def repair_claude_binary(_name: str) -> bool:
-    _run(["node", CLAUDE_INSTALL_SCRIPT], timeout=300)
+    _run([CLAUDE_NODE_BIN, CLAUDE_INSTALL_SCRIPT], timeout=300)
     time.sleep(REPAIR_RETRY_DELAY_SECONDS)
     return check_claude_binary(_name)
 
