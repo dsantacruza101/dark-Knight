@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -23,6 +24,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
+from batcave import memory_store
 from modes.monitoring import run_monitor_mode
 from modes.post_reset import run_post_reset_mode
 
@@ -198,6 +200,46 @@ def run_dev_mode(config: dict, issues: list[dict]) -> str:
     return "\n".join(results) if results else "Sin resultados."
 
 
+def update_batman_memory(mode: str, context: Any, report_body: str) -> None:
+    """Actualiza batcave/memory/batman.md segun el modo ejecutado esta noche."""
+    try:
+        memory_store.touch_last_activity("batman")
+        memory_store.bump_stat("batman", "ciclos")
+
+        if mode == "dev":
+            for issue in context or []:
+                tag = f"{issue['repo']}#{issue['number']}"
+                if f"✅ {tag}" in report_body:
+                    memory_store.append_success(
+                        "batman",
+                        problema=f"Issue {tag}: {issue['title']}",
+                        como_se_resolvio="Resuelto por Claude en modo Desarrollo y pusheado a dev",
+                    )
+                else:
+                    memory_store.append_error(
+                        "batman",
+                        error=f"Issue {tag}: {issue['title']}",
+                        causa="claude no genero cambios o fallo al resolverlo",
+                        solucion="ninguna, requiere revision manual",
+                        resultado="sin resolver",
+                    )
+        elif mode == "post_reset":
+            score_match = re.search(r"calidad Ollama: ([\d.]+)", report_body)
+            score = score_match.group(1) if score_match else "N/D"
+            memory_store.append_success(
+                "batman",
+                problema="Auditoria semanal Post-Reset",
+                como_se_resolvio=f"Score de Nightwing (calidad Ollama vs Claude): {score}",
+            )
+        elif mode == "monitor":
+            last_line = report_body.splitlines()[-1] if report_body else "completado"
+            memory_store.append_success(
+                "batman", problema="Ronda de Monitoreo nocturno", como_se_resolvio=last_line
+            )
+    except OSError as exc:
+        log.warning("No se pudo actualizar la memoria de Batman: %s", exc)
+
+
 MODE_HANDLERS = {
     "dev": run_dev_mode,
     "post_reset": run_post_reset_mode,
@@ -231,6 +273,8 @@ async def main() -> None:
             report_body = handler(config, context)
         else:
             report_body = await handler(config, notifier)
+
+        update_batman_memory(mode, context, report_body)
 
         finished_at = datetime.now()
         duration = str(finished_at - started_at).split(".", maxsplit=1)[0]

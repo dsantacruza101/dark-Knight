@@ -6,6 +6,6 @@
     "service": "claude",
     "priority": "critical",
     "message": "claude caido, Lucius no pudo repararlo (prioridad critical).",
-    "read": false
+    "read": true
   }
 ]
