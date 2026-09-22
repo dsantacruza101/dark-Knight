@@ -49,7 +49,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -75,18 +75,24 @@ STOP_TIME = "22:00"  # 10 PM CST, hora en que Batman toma el relevo
 
 HTTP_ENDPOINTS = [
     "https://dsantacruz.dev",
-    "https://api.dsantacruz.com",
+    "https://api.dsantacruz.com/api/portfolio/contact-me",
     "https://webhook.dsantacruz.com",
 ]
 HTTP_TIMEOUT_SECONDS = 10
 HTTP_SLOW_THRESHOLD_MS = 3000
+# 403 es una respuesta valida para /api/portfolio/contact-me (exige POST;
+# GET responde 403), igual que en los pipelines de CI/CD.
+HTTP_ACCEPTED_STATUS_CODES = {403}
 
-SSH_HOST = "ssh.dsantacruz.com"
+# ssh.dsantacruz.com solo es accesible via Cloudflare Tunnel, que no
+# funciona desde dentro del propio servidor: se chequea localmente.
+SSH_HOST = "127.0.0.1"
 SSH_PORT = 2222
 SSH_TIMEOUT_SECONDS = 5
 
 NGINX_TAIL_LINES = 100
 GITHUB_ACTIONS_LOOKBACK_RUNS = 5
+GITHUB_ACTIONS_LOOKBACK_HOURS = 24
 
 OLLAMA_TIMEOUT = 120
 
@@ -240,7 +246,8 @@ def check_http_endpoints() -> tuple[list[dict], list[str]]:
             resp = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
             elapsed_ms = (time.monotonic() - start) * 1000
             summary_lines.append(f"{url}: {resp.status_code} ({elapsed_ms:.0f}ms)")
-            if resp.status_code >= 500:
+            is_accepted = resp.status_code < 400 or resp.status_code in HTTP_ACCEPTED_STATUS_CODES
+            if not is_accepted:
                 anomalies.append(
                     {
                         "type": "http_error",
@@ -284,6 +291,8 @@ def check_ssh_port() -> tuple[Optional[dict], str]:
             "details": {"error": str(exc)},
         }
         return anomaly, f"{target} inaccesible ({exc})"
+
+
 
 
 def check_resources(config: dict) -> tuple[list[dict], str]:
@@ -359,12 +368,15 @@ def check_github_actions(config: dict) -> list[dict]:
         return []
 
     anomalies: list[dict] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=GITHUB_ACTIONS_LOOKBACK_HOURS)
     gh = Github(token)
     for repo_name in config["github"]["repos"]:
         try:
             repo = gh.get_repo(repo_name)
             runs = repo.get_workflow_runs()
             for run in itertools.islice(runs, GITHUB_ACTIONS_LOOKBACK_RUNS):
+                if run.created_at < cutoff:
+                    continue
                 if run.conclusion == "failure":
                     anomalies.append(
                         {
