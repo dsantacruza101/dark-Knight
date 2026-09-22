@@ -1,0 +1,17 @@
+[Unit]
+Description=Signal (Duke Thomas) — vigilancia diurna de la Batifamilia
+After=network.target docker.service ollama.service
+
+[Service]
+Type=simple
+User=dsantacruz
+WorkingDirectory=/home/dsantacruz/projects/night-agent
+ExecStart=/home/dsantacruz/projects/night-agent/venv/bin/python3 signal_agent.py
+Restart=on-failure
+RestartSec=30
+EnvironmentFile=/etc/night-agent.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

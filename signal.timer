@@ -1,0 +1,9 @@
+[Unit]
+Description=Signal Timer — inicia a las 6 AM CST diariamente
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target
