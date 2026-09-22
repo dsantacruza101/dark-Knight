@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -64,6 +64,11 @@ CLAUDE_INSTALL_SCRIPT = (
 
 MAX_REPAIR_ATTEMPTS = 3
 REPAIR_RETRY_DELAY_SECONDS = 5
+
+# Signal es un vigilante diurno (6 AM-10 PM CST), no un servicio 24/7: fuera
+# de ese horario terminar es el comportamiento esperado, no una caida.
+SIGNAL_SERVICE_NAME = "signal.service"
+SIGNAL_OPERATING_HOURS_UTC = (12, 4)  # 6 AM-10 PM CST == 12:00-04:00 UTC (cruza medianoche)
 
 PRIORITIES = ("critical", "high", "medium", "low")
 
@@ -138,6 +143,13 @@ def _run(cmd: list[str], timeout: int = 30) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("Fallo ejecutando %s: %s", " ".join(cmd), exc)
         return ""
+
+
+def is_signal_operating_hours() -> bool:
+    """True si la hora actual esta dentro del horario diurno de Signal."""
+    hour = datetime.now(timezone.utc).hour
+    start, end = SIGNAL_OPERATING_HOURS_UTC
+    return hour >= start or hour < end
 
 
 def check_systemd(name: str) -> bool:
@@ -436,6 +448,10 @@ async def escalate(check: ServiceCheck, priority: str, who_to_notify: str, notif
 async def process_check(
     check: ServiceCheck, client: Optional[AsyncTypeSafeClient], notifier: TelegramNotifier
 ) -> Optional[str]:
+    if check.name == SIGNAL_SERVICE_NAME and not is_signal_operating_hours():
+        log.info("%s fuera de horario diurno (6 AM-10 PM CST), se omite el check", check.name)
+        return None
+
     if CHECK_FNS[check.kind](check.name):
         log.info("%s OK", check.name)
         return None
