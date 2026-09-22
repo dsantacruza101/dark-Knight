@@ -49,6 +49,8 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul
 
+from batcave import memory_store
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = Path("/etc/night-agent.env")
 LOG_PATH = BASE_DIR / "lucius_fox.log"
@@ -211,6 +213,34 @@ def append_comm(entry: dict) -> None:
     write_comms(entries)
 
 
+def update_memory(event: str, **kwargs) -> None:
+    """Actualiza batcave/memory/lucius.md segun el resultado de la ronda."""
+    try:
+        if event == "round_complete":
+            memory_store.touch_last_activity("lucius")
+            memory_store.bump_stat("lucius", "ciclos")
+        elif event == "repair_success":
+            memory_store.append_success(
+                "lucius",
+                problema=f"{kwargs['service']} caido",
+                como_se_resolvio=kwargs["solucion"],
+            )
+            memory_store.bump_stat("lucius", "errores")
+            memory_store.bump_stat("lucius", "reparaciones")
+        elif event == "repair_failed":
+            memory_store.append_error(
+                "lucius",
+                error=f"{kwargs['service']} caido",
+                causa=kwargs.get("causa", "desconocida"),
+                solucion=kwargs.get("solucion", "ninguna, se escalo"),
+                resultado=kwargs.get("resultado", "escalado"),
+            )
+            if kwargs.get("escalated_to_alfred"):
+                memory_store.bump_stat("lucius", "escalaciones")
+    except OSError as exc:
+        log.warning("No se pudo actualizar la memoria de Lucius: %s", exc)
+
+
 SELF_REPAIR_CRITERIA = {
     "can_repair": (
         "El error reportado por Signal puede resolverse de forma segura "
@@ -256,8 +286,21 @@ async def handle_signal_self_repair(
         msg = "🦊 Lucius reparó Signal"
         log.info(msg)
         await notifier.send(msg)
+        update_memory(
+            "repair_success",
+            service=service,
+            solucion=f"restart systemd a pedido de Signal ({error})",
+        )
     else:
         log.warning("Lucius intento reparar %s pero sigue caido", service)
+        update_memory(
+            "repair_failed",
+            service=service,
+            causa=error,
+            solucion="restart systemd a pedido de Signal",
+            resultado="sigue caido",
+            escalated_to_alfred=False,
+        )
 
 
 async def handle_pending_messages(
@@ -352,7 +395,7 @@ def normalize_priority(raw: str, fallback: str) -> str:
     return raw if raw in PRIORITIES else fallback
 
 
-async def escalate(check: ServiceCheck, priority: str, who_to_notify: str, notifier: TelegramNotifier) -> None:
+async def escalate(check: ServiceCheck, priority: str, who_to_notify: str, notifier: TelegramNotifier) -> set[str]:
     targets: set[str] = set()
     if priority == "critical":
         targets.add("alfred")
@@ -387,6 +430,8 @@ async def escalate(check: ServiceCheck, priority: str, who_to_notify: str, notif
     if not targets:
         log.info("%s caido, prioridad %s, solo se deja registro en el log", check.name, priority)
 
+    return targets
+
 
 async def process_check(
     check: ServiceCheck, client: Optional[AsyncTypeSafeClient], notifier: TelegramNotifier
@@ -403,10 +448,23 @@ async def process_check(
         msg = f"🦊 Lucius reparó: {check.name}"
         log.info(msg)
         await notifier.send(msg)
+        update_memory(
+            "repair_success",
+            service=check.name,
+            solucion=f"reparacion automatica ({check.kind})",
+        )
         return f"reparado: {check.name}"
 
     priority = normalize_priority(decision["priority"], check.baseline_priority)
-    await escalate(check, priority, decision.get("who_to_notify", "none"), notifier)
+    targets = await escalate(check, priority, decision.get("who_to_notify", "none"), notifier)
+    update_memory(
+        "repair_failed",
+        service=check.name,
+        causa=check.description,
+        solucion="auto-reparo no fue posible o TypeSafe lo desestimo",
+        resultado=f"escalado (prioridad {priority})" if targets else f"sin escalar (prioridad {priority})",
+        escalated_to_alfred="alfred" in targets,
+    )
     return f"sin reparar ({priority}): {check.name}"
 
 
@@ -445,6 +503,7 @@ async def main() -> None:
         log.info("Ronda de Lucius completada: %s", "; ".join(results))
     else:
         log.info("Ronda de Lucius completada: todos los servicios operativos")
+    update_memory("round_complete")
 
 
 if __name__ == "__main__":

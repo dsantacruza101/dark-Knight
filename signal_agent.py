@@ -63,6 +63,8 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 
+from batcave import memory_store
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = Path("/etc/night-agent.env")
 CONFIG_PATH = BASE_DIR / "config.yaml"
@@ -195,6 +197,35 @@ def append_comm(entry: dict) -> None:
     entries = read_comms()
     entries.append(entry)
     write_comms(entries)
+
+
+def update_memory(event: str, **kwargs) -> None:
+    """Actualiza batcave/memory/signal.md segun el resultado del ciclo."""
+    try:
+        if event == "cycle_complete":
+            memory_store.touch_last_activity("signal")
+            memory_store.bump_stat("signal", "ciclos")
+        elif event == "anomaly":
+            memory_store.append_error(
+                "signal",
+                error=kwargs["description"],
+                causa=kwargs.get("tipo", "anomalia detectada"),
+                solucion=kwargs.get("accion", "monitoreada"),
+                resultado=f"severidad {kwargs.get('severidad')}",
+            )
+            if kwargs.get("escalated_to_alfred"):
+                memory_store.bump_stat("signal", "escalaciones")
+        elif event == "self_report":
+            memory_store.append_error(
+                "signal",
+                error=str(kwargs.get("error")),
+                causa="excepcion no manejada",
+                solucion="se pidio auto-reparacion a Lucius",
+                resultado="pendiente de Lucius",
+            )
+            memory_store.bump_stat("signal", "escalaciones")
+    except OSError as exc:
+        log.warning("No se pudo actualizar la memoria de Signal: %s", exc)
 
 
 def check_messages_for_signal() -> list[dict]:
@@ -511,6 +542,14 @@ async def act_on_anomaly(anomaly: dict, notifier: TelegramNotifier, incidents: l
             "notified": sorted(targets),
         }
     )
+    update_memory(
+        "anomaly",
+        description=anomaly["description"],
+        tipo=anomaly["type"],
+        accion=anomaly.get("action"),
+        severidad=anomaly["severity_label"],
+        escalated_to_alfred="alfred" in targets,
+    )
 
 
 def run_ollama(model: str, prompt: str, timeout: int = OLLAMA_TIMEOUT) -> Optional[str]:
@@ -632,6 +671,7 @@ async def report_self_repair_needed(error: Exception, notifier: TelegramNotifier
             "read": False,
         }
     )
+    update_memory("self_report", error=error)
     await notifier.send("☀️ Signal encontró un error, pidiendo ayuda a Lucius")
 
 
@@ -677,6 +717,7 @@ async def run_signal(config: dict, notifier: TelegramNotifier) -> None:
             cycle_num += 1
             cycles.append(await run_hourly_cycle(config, client, notifier, cycle_num, incidents))
             write_daily_report(cycles)
+            update_memory("cycle_complete")
             if datetime.now() >= stop_at:
                 break
             await asyncio.sleep(3600)
