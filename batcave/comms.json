@@ -1,0 +1,11 @@
+[
+  {
+    "timestamp": "2026-09-22T02:18:13.769346",
+    "from": "lucius",
+    "to": "batman",
+    "service": "claude",
+    "priority": "critical",
+    "message": "claude caido, Lucius no pudo repararlo (prioridad critical).",
+    "read": false
+  }
+]

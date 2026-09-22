@@ -1,0 +1,12 @@
+[Unit]
+Description=Lucius Fox — guardian de infraestructura de la Batifamilia
+After=network.target docker.service ollama.service
+
+[Service]
+Type=oneshot
+User=dsantacruz
+WorkingDirectory=/home/dsantacruz/projects/night-agent
+ExecStart=/home/dsantacruz/projects/night-agent/venv/bin/python3 lucius_fox.py
+EnvironmentFile=/etc/night-agent.env
+StandardOutput=journal
+StandardError=journal
