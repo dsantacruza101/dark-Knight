@@ -22,7 +22,11 @@ a un modo fallback determinista basado en la prioridad base de cada
 servicio, avisando a Alfred del problema.
 
 Lucius tambien revisa batcave/comms.json al iniciar por si Batman le dejo
-algun mensaje (p. ej. una amenaza de seguridad detectada de noche).
+algun mensaje (p. ej. una amenaza de seguridad detectada de noche), o si
+Signal (el vigilante diurno) pidio auto-reparacion tras un error critico:
+en ese caso le pregunta a TypeSafe si puede reparar signal.service con un
+restart y, si TypeSafe lo aprueba (can_repair > 0.7), lo hace y avisa a
+Alfred.
 """
 
 from __future__ import annotations
@@ -82,6 +86,7 @@ CATALOG: list[ServiceCheck] = [
     ServiceCheck("cloudflared", "systemd", "critical", "Tunel de Cloudflare, unico acceso remoto al servidor"),
     ServiceCheck("night-agent.timer", "systemd", "high", "Timer que dispara a Batman cada noche a las 22:00"),
     ServiceCheck("webhook-portfolio", "systemd", "high", "Servidor de webhooks que dispara los deploys via Docker"),
+    ServiceCheck("signal.service", "systemd", "high", "Vigilante diurno Signal, complemento de Batman en horario diurno"),
     ServiceCheck("ollama", "systemd", "medium", "Motor de IA local usado por Batman en modo Desarrollo"),
     ServiceCheck("daniel-portfolio-app", "docker", "high", "Frontend del portafolio en produccion"),
     ServiceCheck("portfolioservicelauncher-client-gateway-1", "docker", "high", "API Gateway NestJS del backend"),
@@ -206,15 +211,72 @@ def append_comm(entry: dict) -> None:
     write_comms(entries)
 
 
-def check_messages_for_lucius() -> list[dict]:
-    """Lee mensajes que Batman haya dejado para Lucius y los marca como leidos."""
+SELF_REPAIR_CRITERIA = {
+    "can_repair": (
+        "El error reportado por Signal puede resolverse de forma segura "
+        "reiniciando signal.service con systemctl restart, sin intervencion humana."
+    )
+}
+
+
+async def evaluate_self_repair_with_typesafe(
+    client: AsyncTypeSafeClient, service: str, error: str
+) -> dict:
+    try:
+        response = await client.system_one(
+            state={"service_name": service, "error": error},
+            questions={"can_repair": Noul(instructions=SELF_REPAIR_CRITERIA["can_repair"])},
+        )
+    except Exception as exc:  # noqa: BLE001 - un fallo de TypeSafe no debe tumbar el ciclo
+        log.error("Fallo la evaluacion TypeSafe del auto-reparo de %s: %s", service, exc)
+        return {"can_repair": 1.0}
+    return {"can_repair": response.nouls["can_repair"].noul}
+
+
+async def handle_signal_self_repair(
+    entry: dict, client: Optional[AsyncTypeSafeClient], notifier: TelegramNotifier
+) -> None:
+    service = entry.get("service", "signal.service")
+    error = entry.get("error", "error desconocido")
+
+    decision = (
+        await evaluate_self_repair_with_typesafe(client, service, error)
+        if client is not None
+        else {"can_repair": 1.0}
+    )
+
+    if decision["can_repair"] <= 0.7:
+        log.info(
+            "TypeSafe decidio no auto-reparar %s (can_repair=%.2f)", service, decision["can_repair"]
+        )
+        return
+
+    log.info("Reparando %s a pedido de Signal: %s", service, error)
+    if restart_systemd(service):
+        msg = "🦊 Lucius reparó Signal"
+        log.info(msg)
+        await notifier.send(msg)
+    else:
+        log.warning("Lucius intento reparar %s pero sigue caido", service)
+
+
+async def handle_pending_messages(
+    client: Optional[AsyncTypeSafeClient], notifier: TelegramNotifier
+) -> None:
+    """Procesa mensajes dirigidos a Lucius (de Batman o Signal) y los marca como leidos."""
     entries = read_comms()
     pending = [e for e in entries if e.get("to") == "lucius" and not e.get("read", False)]
+
+    for entry in pending:
+        log.info(
+            "Mensaje de %s para Lucius: %s", entry.get("from"), entry.get("message") or entry.get("error")
+        )
+        if entry.get("from") == "signal" and entry.get("type") == "self_repair_needed":
+            await handle_signal_self_repair(entry, client, notifier)
+        entry["read"] = True
+
     if pending:
-        for entry in pending:
-            entry["read"] = True
         write_comms(entries)
-    return pending
 
 
 PRIORITY_CRITERIA = {
@@ -360,11 +422,13 @@ async def run_checks(catalog: list[ServiceCheck], notifier: TelegramNotifier) ->
     results: list[str] = []
     if typesafe_available:
         async with AsyncTypeSafeClient() as client:
+            await handle_pending_messages(client, notifier)
             for check in catalog:
                 result = await process_check(check, client, notifier)
                 if result:
                     results.append(result)
     else:
+        await handle_pending_messages(None, notifier)
         for check in catalog:
             result = await process_check(check, None, notifier)
             if result:
@@ -375,9 +439,6 @@ async def run_checks(catalog: list[ServiceCheck], notifier: TelegramNotifier) ->
 async def main() -> None:
     load_env()
     notifier = TelegramNotifier()
-
-    for message in check_messages_for_lucius():
-        log.info("Mensaje de Batman para Lucius: %s", message.get("message"))
 
     results = await run_checks(CATALOG, notifier)
     if results:

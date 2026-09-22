@@ -80,9 +80,15 @@ HTTP_ENDPOINTS = [
 ]
 HTTP_TIMEOUT_SECONDS = 10
 HTTP_SLOW_THRESHOLD_MS = 3000
-# 403 es una respuesta valida para /api/portfolio/contact-me (exige POST;
-# GET responde 403), igual que en los pipelines de CI/CD.
-HTTP_ACCEPTED_STATUS_CODES = {403}
+# Codigos adicionales validos por endpoint (ademas de cualquier 2xx/3xx):
+# - /api/portfolio/contact-me exige POST; un GET responde 403, igual que en
+#   los pipelines de CI/CD.
+# - webhook.dsantacruz.com solo acepta POST con firma HMAC; un GET simple
+#   siempre responde 404, no es una falla real.
+HTTP_ACCEPTED_STATUS_CODES = {
+    "https://api.dsantacruz.com/api/portfolio/contact-me": {403},
+    "https://webhook.dsantacruz.com": {404},
+}
 
 # ssh.dsantacruz.com solo es accesible via Cloudflare Tunnel, que no
 # funciona desde dentro del propio servidor: se chequea localmente.
@@ -246,7 +252,8 @@ def check_http_endpoints() -> tuple[list[dict], list[str]]:
             resp = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
             elapsed_ms = (time.monotonic() - start) * 1000
             summary_lines.append(f"{url}: {resp.status_code} ({elapsed_ms:.0f}ms)")
-            is_accepted = resp.status_code < 400 or resp.status_code in HTTP_ACCEPTED_STATUS_CODES
+            accepted_codes = HTTP_ACCEPTED_STATUS_CODES.get(url, set())
+            is_accepted = resp.status_code < 400 or resp.status_code in accepted_codes
             if not is_accepted:
                 anomalies.append(
                     {
@@ -612,6 +619,22 @@ def write_daily_report(cycles: list[str]) -> Path:
     return report_path
 
 
+async def report_self_repair_needed(error: Exception, notifier: TelegramNotifier) -> None:
+    """Pide ayuda a Lucius Fox ante una excepcion no manejada o error critico."""
+    append_comm(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "from": "signal",
+            "to": "lucius",
+            "type": "self_repair_needed",
+            "error": str(error),
+            "service": "signal.service",
+            "read": False,
+        }
+    )
+    await notifier.send("☀️ Signal encontró un error, pidiendo ayuda a Lucius")
+
+
 def write_daily_brief(incidents: list[dict], summary: str) -> None:
     append_comm(
         {
@@ -681,6 +704,7 @@ async def main() -> None:
     except (OSError, yaml.YAMLError) as exc:
         log.exception("No se pudo cargar config.yaml")
         await notifier.send(f"☀️ *Signal encontró un problema*: no pudo iniciar (error leyendo config.yaml)\n`{exc}`")
+        await report_self_repair_needed(exc, notifier)
         sys.exit(1)
 
     try:
@@ -688,6 +712,7 @@ async def main() -> None:
     except Exception as exc:  # noqa: BLE001 - notificar cualquier fallo antes de salir
         log.exception("Fallo Signal")
         await notifier.send(f"☀️ *Signal encontró un problema*\n`{type(exc).__name__}: {exc}`\nRevisa {LOG_PATH}")
+        await report_self_repair_needed(exc, notifier)
         sys.exit(1)
 
 
