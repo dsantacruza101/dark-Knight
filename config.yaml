@@ -5,7 +5,8 @@ schedule:
 
 models:
   claude: 'claude'
-  ollama: 'llama3.2'
+  ollama: 'mistral'
+  aider: 'ollama/mistral'
 
 thresholds:
   cpu_alert: 80

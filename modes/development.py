@@ -1,29 +1,33 @@
-"""Modo de Desarrollo Nocturno: Nightwing resuelve issues 'night-agent' usando SOLO Ollama.
+"""Modo de Desarrollo Nocturno: Nightwing resuelve issues 'night-agent' usando Aider.
 
 Claude (Batman) descansa en este modo. Cada issue etiquetado se resuelve localmente
-con el modelo definido en config.yaml (`models.ollama`). Flujo por issue:
+con Aider (`AIDER_BIN`), usando Ollama como backend (`models.aider` en config.yaml).
+Flujo por issue:
   1. Se lee el titulo y la descripcion del issue (y se identifica su repo,
      que ya viene dado por de donde se obtuvo el issue).
   2. Se lee el CLAUDE.md del repo local para dar contexto al modelo.
   3. Se buscan ejemplos relevantes en knowledge/ (coincidencia de palabras
      clave con el issue).
-  4. Se arma un prompt detallado y se ejecuta `ollama run <modelo>`.
-  5. La respuesta se parsea como bloques de archivo y se escribe en disco,
-     siempre sobre la rama de trabajo (`github.work_branch` en config.yaml).
-  6. Se comitea con el mensaje 'feat(nightwing): ...'.
+  4. Se arma un mensaje detallado y se pasa a Aider (`--message`), que edita
+     los archivos directamente en disco sobre la rama de trabajo
+     (`github.work_branch` en config.yaml).
+  5. Los cambios en rutas prohibidas quedan revertidos antes de comitear.
+  6. Nightwing comitea con el mensaje 'feat(nightwing): ...' y hace push.
 
 Restricciones duras (no configurables):
   - Nunca se toca ni se hace checkout de main/master; si el branch de trabajo
     configurado fuera main/master, el modo se niega a correr.
-  - Nunca se escriben archivos .env, docker-compose*, ni configuracion de
-    nginx/fail2ban/cloudflared/ssh (ver `is_forbidden_path`).
+  - Nunca se dejan cambios en archivos .env, docker-compose*, ni configuracion
+    de nginx/fail2ban/cloudflared/ssh (ver `is_forbidden_path`); Aider corre
+    con `--no-auto-commits` para que estos cambios se puedan revertir antes
+    de comitear.
   - Maximo `MAX_HOURS_PER_ISSUE` horas por issue; si se supera se aborta ese
     issue y se continua con el siguiente.
-  - Si Ollama no genera una solucion utilizable tras `MAX_OLLAMA_RETRIES`
+  - Si Aider no genera una solucion utilizable tras `MAX_AIDER_RETRIES`
     intentos, se comenta 'needs-review' en el issue y se continua.
 
 El progreso se reporta a Telegram cada `PROGRESS_INTERVAL` (30 min). Como las
-llamadas a git/ollama son bloqueantes, la notificacion se emite entre issues,
+llamadas a git/aider son bloqueantes, la notificacion se emite entre issues,
 no con un timer independiente.
 """
 
@@ -46,18 +50,16 @@ PROJECTS_DIR = Path.home() / "projects"
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
 REPORTS_DIR = BASE_DIR / "reports"
 
+AIDER_BIN = os.path.expanduser("~/.aider-venv/bin/aider")
+OLLAMA_API_BASE = "http://localhost:11434"
+
 MAX_HOURS_PER_ISSUE = 3
-MAX_OLLAMA_RETRIES = 3
-OLLAMA_TIMEOUT = 1800
+MAX_AIDER_RETRIES = 3
+AIDER_TIMEOUT = 1800
 PROGRESS_INTERVAL = timedelta(minutes=30)
 
 FORBIDDEN_NAME_SUBSTRINGS = (".env", "docker-compose")
 FORBIDDEN_PATH_SEGMENTS = ("nginx", "fail2ban", "cloudflared", ".cloudflared", ".ssh", "ufw")
-
-FILE_BLOCK_RE = re.compile(
-    r"###\s*FILE:\s*(?P<path>\S.*?)\s*\n(?P<content>.*?)\n###\s*END",
-    re.DOTALL,
-)
 
 log = logging.getLogger("night_agent.development")
 
@@ -150,57 +152,48 @@ def find_relevant_examples(issue: dict, limit: int = 3, max_chars: int = 1200) -
     ]
 
 
-def build_prompt(issue: dict, claude_md: str, examples: list[str]) -> str:
+def build_aider_message(issue: dict, claude_md: str, examples: list[str]) -> str:
     claude_context = claude_md[:4000] if claude_md else "(sin CLAUDE.md en el repositorio)"
     examples_context = "\n\n".join(examples) if examples else "(sin ejemplos relevantes en knowledge/)"
     return (
-        "Eres un desarrollador de software resolviendo un issue de GitHub en el "
-        f"repositorio {issue['repo']}. Trabajas SOLO sobre la rama de desarrollo, "
-        "nunca sobre main.\n\n"
+        f"Resuelve el issue #{issue['number']} del repositorio {issue['repo']}: "
+        f"{issue['title']}\n\n"
+        f"{issue['body'][:3000]}\n\n"
         f"## Contexto del repositorio (CLAUDE.md)\n{claude_context}\n\n"
         f"## Ejemplos de referencia\n{examples_context}\n\n"
-        f"## Issue #{issue['number']}: {issue['title']}\n{issue['body'][:3000]}\n\n"
-        "## Formato de salida (obligatorio)\n"
-        "Responde UNICAMENTE con uno o mas bloques con este formato exacto, sin "
-        "texto antes, entre medio ni despues de los bloques:\n\n"
-        "### FILE: ruta/relativa/al/archivo.ext\n"
-        "<contenido completo y final del archivo>\n"
-        "### END\n\n"
         "Reglas obligatorias:\n"
         "- Usa rutas relativas dentro del repositorio.\n"
-        "- NUNCA generes ni modifiques archivos .env, docker-compose*, ni "
+        "- NUNCA edites ni crees archivos .env, docker-compose*, ni "
         "configuracion de nginx, fail2ban, cloudflared o ssh.\n"
-        "- No incluyas comandos de git ni menciones la rama main.\n"
-        "- Si no puedes resolver el issue con la informacion disponible, "
-        "responde solo con la palabra NO_SOLUTION."
+        "- No ejecutes comandos de git ni toques la rama main."
     )
 
 
-def run_ollama(model: str, prompt: str, timeout: int = OLLAMA_TIMEOUT) -> Optional[str]:
+def run_aider(repo_path: Path, model: str, message: str, timeout: int = AIDER_TIMEOUT) -> bool:
+    """Ejecuta Aider sobre el repo; Aider edita los archivos directamente en disco."""
+    cmd = [
+        AIDER_BIN,
+        "--model", model,
+        "--message", message,
+        "--yes",
+        "--no-auto-commits",
+        "--env", f"OLLAMA_API_BASE={OLLAMA_API_BASE}",
+    ]
     try:
         proc = subprocess.run(
-            ["ollama", "run", model],
-            input=prompt,
+            cmd,
+            cwd=repo_path,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        log.error("Fallo ejecutando ollama: %s", exc)
-        return None
+        log.error("Fallo ejecutando aider: %s", exc)
+        return False
     if proc.returncode != 0:
-        log.error("ollama devolvio codigo %s: %s", proc.returncode, proc.stderr[-500:])
-        return None
-    return proc.stdout.strip() or None
-
-
-def parse_file_blocks(output: str) -> dict[str, str]:
-    files: dict[str, str] = {}
-    for match in FILE_BLOCK_RE.finditer(output):
-        path = match.group("path").strip()
-        if path:
-            files[path] = match.group("content")
-    return files
+        log.error("aider devolvio codigo %s: %s", proc.returncode, proc.stderr[-500:])
+        return False
+    return True
 
 
 def is_forbidden_path(rel_path: str) -> bool:
@@ -212,24 +205,28 @@ def is_forbidden_path(rel_path: str) -> bool:
     return any(seg in parts or seg in name for seg in FORBIDDEN_PATH_SEGMENTS)
 
 
-def apply_file_changes(repo_path: Path, files: dict[str, str]) -> list[str]:
-    repo_root = repo_path.resolve()
-    written: list[str] = []
-    for rel_path, content in files.items():
-        if is_forbidden_path(rel_path):
-            log.warning("Archivo omitido por politica de seguridad: %s", rel_path)
+def changed_files(repo_path: Path) -> list[str]:
+    status = run_cli(["git", "status", "--porcelain"], cwd=repo_path)
+    files: list[str] = []
+    for line in status.stdout.splitlines():
+        rel_path = line[3:].strip()
+        if " -> " in rel_path:
+            rel_path = rel_path.split(" -> ")[-1]
+        files.append(rel_path)
+    return files
+
+
+def revert_forbidden_changes(repo_path: Path) -> list[str]:
+    """Revierte cambios de Aider en rutas prohibidas antes de comitear."""
+    reverted: list[str] = []
+    for rel_path in changed_files(repo_path):
+        if not is_forbidden_path(rel_path):
             continue
-        target = (repo_root / rel_path).resolve()
-        if repo_root != target and repo_root not in target.parents:
-            log.warning("Ruta fuera del repositorio omitida: %s", rel_path)
-            continue
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content.rstrip("\n") + "\n", encoding="utf-8")
-            written.append(rel_path)
-        except OSError as exc:
-            log.error("No se pudo escribir %s: %s", rel_path, exc)
-    return written
+        log.warning("Cambio revertido por politica de seguridad: %s", rel_path)
+        run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
+        run_cli(["git", "clean", "-f", "--", rel_path], cwd=repo_path)
+        reverted.append(rel_path)
+    return reverted
 
 
 def run_cli(cmd: list[str], cwd: Optional[Path] = None, timeout: int = 600) -> subprocess.CompletedProcess:
@@ -296,7 +293,7 @@ def process_issue(config: dict, issue: dict) -> str:
     tag = f"{issue['repo']}#{issue['number']}"
     repo_path = repo_local_path(issue["repo"])
     branch = config["github"]["work_branch"]
-    ollama_model = config["models"]["ollama"]
+    aider_model = config["models"]["aider"]
 
     if not repo_path.exists():
         msg = f"⚠️ {tag}: repo no encontrado en {repo_path}"
@@ -315,38 +312,35 @@ def process_issue(config: dict, issue: dict) -> str:
 
     claude_md = read_repo_claude_md(repo_path)
     examples = find_relevant_examples(issue)
-    prompt = build_prompt(issue, claude_md, examples)
+    message = build_aider_message(issue, claude_md, examples)
 
     deadline = datetime.now() + timedelta(hours=MAX_HOURS_PER_ISSUE)
-    files: dict[str, str] = {}
+    written: list[str] = []
     attempts = 0
-    while attempts < MAX_OLLAMA_RETRIES:
+    while attempts < MAX_AIDER_RETRIES:
         if datetime.now() >= deadline:
             msg = f"⏱️ {tag}: se alcanzo el limite de {MAX_HOURS_PER_ISSUE}h, se pasa al siguiente issue"
             log.warning(msg)
             return msg
 
         attempts += 1
-        output = run_ollama(ollama_model, prompt)
-        files = parse_file_blocks(output) if output else {}
-        if files:
-            break
-        log.warning("%s: intento %d/%d con ollama sin resultado util", tag, attempts, MAX_OLLAMA_RETRIES)
+        if run_aider(repo_path, aider_model, message):
+            reverted = revert_forbidden_changes(repo_path)
+            if reverted:
+                log.warning("%s: aider toco rutas prohibidas, revertidas: %s", tag, ", ".join(reverted))
+            written = changed_files(repo_path)
+            if written:
+                break
+        log.warning("%s: intento %d/%d con aider sin resultado util", tag, attempts, MAX_AIDER_RETRIES)
 
-    if not files:
+    if not written:
         mark_needs_review(
             issue["repo_obj"],
             issue["issue_obj"],
-            f"Ollama ({ollama_model}) no genero una solucion utilizable tras {MAX_OLLAMA_RETRIES} intentos.",
+            f"Aider ({aider_model}) no genero una solucion utilizable tras {MAX_AIDER_RETRIES} intentos.",
         )
-        msg = f"🚫 {tag}: ollama fallo {MAX_OLLAMA_RETRIES} veces, marcado 'needs-review'"
+        msg = f"🚫 {tag}: aider fallo {MAX_AIDER_RETRIES} veces, marcado 'needs-review'"
         log.error(msg)
-        return msg
-
-    written = apply_file_changes(repo_path, files)
-    if not written:
-        msg = f"⚠️ {tag}: ollama respondio pero ningun archivo era valido para escribir"
-        log.warning(msg)
         return msg
 
     commit_msg = f"feat(nightwing): resuelve #{issue['number']} - {issue['title']}"
@@ -358,14 +352,14 @@ def process_issue(config: dict, issue: dict) -> str:
         log.info(msg)
         return msg
 
-    return f"ℹ️ {tag}: ollama respondio pero no genero cambios reales en el repo"
+    return f"ℹ️ {tag}: aider respondio pero no genero cambios reales en el repo"
 
 
 def write_development_report(started_at: datetime, results: list[str]) -> Path:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     date_str = started_at.strftime("%Y-%m-%d")
     report_path = REPORTS_DIR / f"development-{date_str}.md"
-    lines = [f"# Reporte de Modo Desarrollo (Ollama) - {date_str}", ""]
+    lines = [f"# Reporte de Modo Desarrollo (Aider) - {date_str}", ""]
     if results:
         lines.extend(f"- {line}" for line in results)
     else:
@@ -375,7 +369,7 @@ def write_development_report(started_at: datetime, results: list[str]) -> Path:
 
 
 async def run_development_mode(config: dict, notifier) -> str:
-    """Punto de entrada del modo Desarrollo: resuelve issues usando solo Ollama."""
+    """Punto de entrada del modo Desarrollo: resuelve issues usando Aider (backend Ollama)."""
     load_env()
     started_at = datetime.now()
 
@@ -387,7 +381,7 @@ async def run_development_mode(config: dict, notifier) -> str:
         return f"Sin issues con label '{config['github']['issue_label']}' pendientes. Reporte: {report_path}"
 
     await notifier.send(
-        f"🐦 *Nightwing — Modo Desarrollo (Ollama)*\n{len(issues)} issue(s) por resolver "
+        f"🐦 *Nightwing — Modo Desarrollo (Aider)*\n{len(issues)} issue(s) por resolver "
         f"con label `{config['github']['issue_label']}`"
     )
 
