@@ -1,0 +1,9 @@
+[Unit]
+Description=Red Hood Timer — corre diario a las 2 AM
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target

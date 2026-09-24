@@ -11,6 +11,7 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 | **Batman** | `night_agent.py` (`night-agent.timer`, corre 22:00 diario) | Orquestador nocturno. Decide modo (Desarrollo / Post-Reset / Monitoreo) segun `config.yaml` e issues abiertos, y lo ejecuta. |
 | **Alfred** | Bot de Telegram (`~/projects/telegram-bot`, `telegram-bot.service`) | Canal de comunicacion: recibe las notificaciones de Batman y Lucius, y responde preguntas usando `batcave/comms.json` como contexto. |
 | **Lucius Fox** | `lucius_fox.py` (`lucius-fox.service` + `lucius-fox.timer`, cada 30 min) | Guardian de infraestructura. Vigila servicios/containers/binarios criticos, usa TypeSafe (Jev) para decidir si auto-repararlos, y escala lo que no puede resolver. |
+| **Red Hood** | `red_hood.py` (`red-hood.service` + `red-hood.timer`, diario a las 02:00 America/El_Salvador) | QA brutal, sin piedad. Audita tests, cobertura, lint, vulnerabilidades y secretos hardcodeados en los repos locales, genera tests faltantes con Aider y reporta todo sin filtro. |
 
 ## Modos de Batman (`modes/`)
 
@@ -72,6 +73,46 @@ la prioridad sea media). Si `TYPESAFE_API_KEY` no esta definida, Lucius no
 puede consultar a Jev: usa un fallback determinista basado en la prioridad
 base del catalogo y avisa a Alfred del problema.
 
+## Red Hood: catalogo y flujo (`red_hood.py`)
+
+Audita los repos de `config.yaml` (`red_hood.local_repos`): `my_Portfolio_React_v2`,
+`portfolioServiceLauncher/client-gateway`, `portfolioServiceLauncher/nodeMailer-ms`,
+`telegram-bot` y el propio `night-agent`. Detecta el stack por archivos
+(`package.json` -> Node, `requirements.txt`/`*.py` -> Python).
+
+Por repo: `git fetch` + se posiciona en `dev` si existe (local u `origin/dev`);
+si no existe, audita `main` en modo solo-lectura (nunca comitea ahi). Compara
+el HEAD contra el ultimo hash auditado en
+`batcave/memory/red_hood_state.json`; sin commits nuevos, se omite.
+
+Corre tests con cobertura (`npm test -- --passWithNoTests --coverage` /
+`pytest` si existe `tests/`, timeout 10 min), lint, auditoria de dependencias
+(`npm audit` / `pip-audit`), `py_compile` en Python, y un escaneo de secretos
+hardcodeados (regex: `sk-ant-`, `ghp_`, `apikey_`, `bot<digitos>:AA`,
+passwords) que dispara alerta critica inmediata (los secretos nunca se
+muestran completos en logs ni Telegram, solo los primeros 6 caracteres + `***`).
+
+Cada hallazgo se evalua con TypeSafe (Jev): `severity` (Score), `category`
+(Choice: failing_test/missing_tests/vulnerability/hardcoded_secret/
+lint_error/low_coverage), `should_generate_tests` (Noul) y `who_to_notify`
+(Choice: alfred/nightwing/batman/none). Sin `TYPESAFE_API_KEY`, cae a un
+fallback deterministico (igual que Lucius Fox y Signal).
+
+Si `should_generate_tests > 0.7` y la cobertura esta bajo `red_hood.coverage_threshold`,
+genera tests para hasta `red_hood.max_tests_per_repo` archivos con Aider
+(backend Ollama). Solo se tocan archivos de test (`*.spec.ts`, `*.test.ts`,
+`test_*.py`, validado con `modes.development.is_forbidden_path`); si Aider
+toca algo mas o el test generado falla, se descarta con `git checkout` y se
+registra en memoria. Si pasa, se comitea (y pushea) a `dev`.
+
+Reporta hallazgos high/critical y tests fallidos como issues en GitHub
+(labels `red-hood` + `bug`, buscando duplicados antes; `night-agent` si
+Nightwing podria resolverlo), deja mensajes `qa_finding` en
+`batcave/comms.json` para Batman/Nightwing/Lucius (secretos siempre avisan
+a Lucius tambien), y notifica a Alfred por Telegram. Reporte diario en
+`reports/red-hood-YYYY-MM-DD.md`. Con `--dry-run` audita igual pero no
+genera tests, no crea issues, no comitea/pushea y no envia Telegram.
+
 ## Variables de entorno (`/etc/night-agent.env`)
 
 Nunca se edita este archivo desde el codigo (regla global: nunca tocar
@@ -88,9 +129,9 @@ Los `.service`/`.timer` viven en este repo pero se instalan a mano en
 `/etc/systemd/system/` (no se hace automaticamente desde el codigo):
 
 ```bash
-sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer /etc/systemd/system/
+sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer red-hood.service red-hood.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now night-agent.timer lucius-fox.timer
+sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer
 ```
 
 ## Convenciones

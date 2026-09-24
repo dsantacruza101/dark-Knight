@@ -26,3 +26,14 @@ knowledge_base:
   path: ~/projects/night-agent/knowledge
   max_examples: 1000
   min_quality_score: 0.8
+
+red_hood:
+  coverage_threshold: 60
+  max_tests_per_repo: 3
+  workspace_dir: ~/projects/.red-hood-workspace
+  local_repos:
+    - ~/projects/my_Portfolio_React_v2
+    - ~/projects/portfolioServiceLauncher/client-gateway
+    - ~/projects/portfolioServiceLauncher/nodeMailer-ms
+    - ~/projects/telegram-bot
+    - ~/projects/night-agent

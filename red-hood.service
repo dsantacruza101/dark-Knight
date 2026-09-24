@@ -1,0 +1,13 @@
+[Unit]
+Description=Red Hood (Jason Todd) — QA brutal de la Batifamilia
+After=network.target docker.service ollama.service
+
+[Service]
+Type=oneshot
+User=dsantacruz
+WorkingDirectory=/home/dsantacruz/projects/night-agent
+ExecStart=/home/dsantacruz/projects/night-agent/venv/bin/python3 red_hood.py
+Environment=PATH=/home/dsantacruz/.nvm/versions/node/v22.23.2/bin:/home/dsantacruz/.aider-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/etc/night-agent.env
+StandardOutput=journal
+StandardError=journal
