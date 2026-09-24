@@ -21,6 +21,12 @@ Respeta las mismas restricciones de seguridad que el modo Desarrollo: nunca se
 toca main/master y nunca se dejan cambios en .env/docker-compose/nginx/
 fail2ban/cloudflared/ssh, aunque vengan sugeridos por claude
 (ver `modes.development.is_forbidden_path`).
+
+Workspace aislado: al igual que el modo Desarrollo, Commissioner Gordon
+NUNCA hace checkout, pull, ni commits sobre los directorios de produccion.
+Cada repo se revisa sobre una copia clonada en
+`development.workspace_dir/<nombre-repo>` (ver
+`modes.development.setup_workspace_repo`).
 """
 
 from __future__ import annotations
@@ -38,12 +44,12 @@ from telegram.error import TelegramError
 
 from modes.development import (
     commit_and_push,
-    ensure_dev_branch,
+    get_workspace_dir,
     is_forbidden_path,
     load_env,
     repo_is_clean,
-    repo_local_path,
     run_cli,
+    setup_workspace_repo,
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -358,13 +364,11 @@ async def run_post_reset_mode(config: dict, notifier) -> str:
     review_results: list[dict] = []
     total_insertions, total_deletions = 0, 0
 
+    workspace_dir = get_workspace_dir(config)
     for repo_full_name in config["github"]["repos"]:
-        repo_path = repo_local_path(repo_full_name)
-        if not repo_path.exists():
-            log.warning("Repo no encontrado en %s, se omite", repo_path)
-            continue
-        if not ensure_dev_branch(repo_path, branch):
-            log.warning("No se pudo posicionar %s en '%s', se omite", repo_full_name, branch)
+        repo_path = setup_workspace_repo(repo_full_name, workspace_dir, branch)
+        if repo_path is None:
+            log.warning("No se pudo preparar el workspace aislado para %s, se omite", repo_full_name)
             continue
 
         commits = get_week_commits(repo_path)

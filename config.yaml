@@ -19,8 +19,22 @@ github:
     - dsantacruza101/portfolioServiceLauncher
     - dsantacruza101/dsantacruz-client-gateway
     - dsantacruza101/NodeMailer_MicroService
+    - dsantacruza101/dark-Knight
   issue_label: night-agent
   work_branch: dev
+
+# Mapeo repo remoto -> ruta local de produccion. SOLO se usa para leer el
+# CLAUDE.md de contexto (modo Desarrollo y Post-Reset); nunca para checkout,
+# pull ni commits: todo ese trabajo ocurre en development.workspace_dir.
+repo_paths:
+  dark-Knight: ~/projects/night-agent
+  NodeMailer_MicroService: ~/projects/portfolioServiceLauncher/nodeMailer-ms
+  dsantacruz-client-gateway: ~/projects/portfolioServiceLauncher/client-gateway
+  my_Portfolio_React_v2: ~/projects/my_Portfolio_React_v2
+  portfolioServiceLauncher: ~/projects/portfolioServiceLauncher
+
+development:
+  workspace_dir: ~/projects/.nightwing-workspace
 
 knowledge_base:
   path: ~/projects/night-agent/knowledge

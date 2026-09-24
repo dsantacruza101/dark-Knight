@@ -4,34 +4,37 @@
 Lee config.yaml, decide en que modo trabajar esta noche (Desarrollo,
 Post-Reset o Monitoreo), lo ejecuta y reporta el resultado a Telegram
 via el bot Alfred.
+
+Con `--dry-run` solo se imprime el modo que se seleccionaria y (en modo
+Desarrollo) los issues que se encontraron, sin clonar nada, sin ejecutar
+Aider/claude y sin enviar Telegram.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
 import re
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
-from github import Github, GithubException
 from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
 from batcave import memory_store
+from modes.development import get_github_client, get_open_issues, run_development_mode
 from modes.monitoring import run_monitor_mode
 from modes.post_reset import run_post_reset_mode
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 LOG_PATH = BASE_DIR / "night_agent.log"
-PROJECTS_DIR = Path.home() / "projects"
 
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
@@ -77,47 +80,6 @@ class TelegramNotifier:
             log.error("No se pudo enviar mensaje a Telegram: %s", exc)
 
 
-def run_cli(
-    cmd: list[str], cwd: Optional[Path] = None, timeout: int = 1800
-) -> subprocess.CompletedProcess:
-    log.info("Ejecutando: %s (cwd=%s)", " ".join(cmd), cwd)
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-
-
-def repo_local_path(repo_full_name: str) -> Path:
-    return PROJECTS_DIR / repo_full_name.split("/")[-1]
-
-
-def get_open_issues(config: dict) -> list[dict]:
-    """Devuelve los issues abiertos con el label configurado, en todos los repos."""
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        log.warning("GITHUB_TOKEN no esta definido, se omite la busqueda de issues")
-        return []
-
-    label = config["github"]["issue_label"]
-    gh = Github(token)
-    found: list[dict] = []
-    for repo_name in config["github"]["repos"]:
-        try:
-            repo = gh.get_repo(repo_name)
-            for issue in repo.get_issues(state="open", labels=[label]):
-                if issue.pull_request is not None:
-                    continue
-                found.append(
-                    {
-                        "repo": repo_name,
-                        "number": issue.number,
-                        "title": issue.title,
-                        "body": issue.body or "",
-                        "url": issue.html_url,
-                    }
-                )
-        except GithubException as exc:
-            log.error("Error consultando issues en %s: %s", repo_name, exc)
-    return found
-
-
 def parse_weekly_reset(spec: str) -> int:
     """Devuelve el indice de dia (lunes=0) del reset semanal, p.ej. 'Sun 23:00' -> 6."""
     day_str = spec.split()[0].strip().lower()[:3]
@@ -131,73 +93,17 @@ def is_post_reset_day(config: dict, now: datetime) -> bool:
 
 def determine_mode(config: dict, now: Optional[datetime] = None) -> tuple[str, Any]:
     now = now or datetime.now()
-    issues = get_open_issues(config)
+    try:
+        gh = get_github_client()
+        issues = get_open_issues(gh, config)
+    except RuntimeError as exc:
+        log.warning("No se pudo consultar GitHub para decidir el modo: %s", exc)
+        issues = []
     if issues:
         return "dev", issues
     if is_post_reset_day(config, now):
         return "post_reset", None
     return "monitor", None
-
-
-def run_dev_mode(config: dict, issues: list[dict]) -> str:
-    """Modo Desarrollo: usa claude para resolver los issues etiquetados."""
-    branch = config["github"]["work_branch"]
-    claude_bin = config["models"]["claude"]
-    results = []
-
-    for issue in issues:
-        repo_path = repo_local_path(issue["repo"])
-        tag = f"{issue['repo']}#{issue['number']}"
-
-        if not repo_path.exists():
-            msg = f"⚠️ {tag}: repo no encontrado en {repo_path}"
-            log.warning(msg)
-            results.append(msg)
-            continue
-
-        try:
-            run_cli(["git", "fetch", "origin"], cwd=repo_path)
-            run_cli(["git", "checkout", branch], cwd=repo_path)
-            run_cli(["git", "pull", "origin", branch], cwd=repo_path)
-
-            prompt = (
-                f"Resuelve el issue #{issue['number']} de este repositorio.\n"
-                f"Titulo: {issue['title']}\n\n"
-                f"Descripcion:\n{issue['body']}\n\n"
-                "Implementa el cambio y deja el working tree listo para revisar."
-            )
-            proc = run_cli(
-                [claude_bin, "-p", prompt, "--permission-mode", "acceptEdits"],
-                cwd=repo_path,
-                timeout=3600,
-            )
-
-            if proc.returncode != 0:
-                msg = f"❌ {tag}: claude fallo (codigo {proc.returncode})\n{proc.stderr[-500:]}"
-                log.error(msg)
-                results.append(msg)
-                continue
-
-            status = run_cli(["git", "status", "--porcelain"], cwd=repo_path)
-            if status.stdout.strip():
-                run_cli(["git", "add", "-A"], cwd=repo_path)
-                commit_msg = f"feat: resuelve #{issue['number']} - {issue['title']}"
-                run_cli(["git", "commit", "-m", commit_msg], cwd=repo_path)
-                run_cli(["git", "push", "origin", branch], cwd=repo_path)
-                results.append(f"✅ {tag} resuelto y pusheado a `{branch}`: {issue['url']}")
-            else:
-                results.append(f"ℹ️ {tag}: sin cambios generados")
-
-        except subprocess.TimeoutExpired:
-            msg = f"⏱️ {tag}: timeout ejecutando claude"
-            log.error(msg)
-            results.append(msg)
-        except OSError as exc:
-            msg = f"❌ {tag}: error inesperado: {exc}"
-            log.exception(msg)
-            results.append(msg)
-
-    return "\n".join(results) if results else "Sin resultados."
 
 
 def update_batman_memory(mode: str, context: Any, report_body: str) -> None:
@@ -213,13 +119,13 @@ def update_batman_memory(mode: str, context: Any, report_body: str) -> None:
                     memory_store.append_success(
                         "batman",
                         problema=f"Issue {tag}: {issue['title']}",
-                        como_se_resolvio="Resuelto por Claude en modo Desarrollo y pusheado a dev",
+                        como_se_resolvio="Resuelto por Nightwing (Aider) en modo Desarrollo y pusheado a dev",
                     )
                 else:
                     memory_store.append_error(
                         "batman",
                         error=f"Issue {tag}: {issue['title']}",
-                        causa="claude no genero cambios o fallo al resolverlo",
+                        causa="aider no genero cambios o fallo al resolverlo",
                         solucion="ninguna, requiere revision manual",
                         resultado="sin resolver",
                     )
@@ -241,22 +147,55 @@ def update_batman_memory(mode: str, context: Any, report_body: str) -> None:
 
 
 MODE_HANDLERS = {
-    "dev": run_dev_mode,
+    "dev": run_development_mode,
     "post_reset": run_post_reset_mode,
     "monitor": run_monitor_mode,
 }
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Batman: orquestador nocturno")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Solo imprime el modo que se seleccionaria y los issues encontrados, "
+        "sin clonar, sin ejecutar Aider/claude y sin enviar Telegram",
+    )
+    return parser.parse_args()
+
+
+def print_dry_run(config: dict, started_at: datetime) -> None:
+    mode, context = determine_mode(config, started_at)
+    print(f"[dry-run] Modo que se seleccionaria: {mode} ({MODE_LABELS[mode]})")
+    if mode == "dev":
+        issues = context or []
+        print(f"[dry-run] {len(issues)} issue(s) con label '{config['github']['issue_label']}' encontrados:")
+        for issue in issues:
+            print(f"[dry-run]   - {issue['repo']}#{issue['number']}: {issue['title']} ({issue['url']})")
+    else:
+        print("[dry-run] Sin issues pendientes; no se clona nada ni se ejecuta Aider/claude.")
+
+
 async def main() -> None:
+    args = parse_args()
     started_at = datetime.now()
-    notifier = TelegramNotifier()
 
     try:
         config = load_config()
     except (OSError, yaml.YAMLError) as exc:
         log.exception("No se pudo cargar config.yaml")
+        if args.dry_run:
+            print(f"[dry-run] No se pudo cargar config.yaml: {exc}")
+            sys.exit(1)
+        notifier = TelegramNotifier()
         await notifier.send(f"🦇 *Batman encontró un problema*: no pudo iniciar (error leyendo config.yaml)\n`{exc}`")
         sys.exit(1)
+
+    if args.dry_run:
+        print_dry_run(config, started_at)
+        return
+
+    notifier = TelegramNotifier()
 
     try:
         mode, context = determine_mode(config, started_at)
@@ -269,10 +208,7 @@ async def main() -> None:
         log.info("Modo seleccionado: %s", mode)
 
         handler = MODE_HANDLERS[mode]
-        if mode == "dev":
-            report_body = handler(config, context)
-        else:
-            report_body = await handler(config, notifier)
+        report_body = await handler(config, notifier)
 
         update_batman_memory(mode, context, report_body)
 
