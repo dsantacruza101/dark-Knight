@@ -6,7 +6,7 @@ schedule:
 models:
   claude: 'claude'
   ollama: 'mistral'
-  aider: 'ollama/mistral'
+  aider:  'ollama/qwen2.5-coder:3b'
 
 thresholds:
   cpu_alert: 80
