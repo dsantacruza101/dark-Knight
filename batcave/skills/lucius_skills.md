@@ -1,7 +1,7 @@
 # Lucius Fox — Skills
 
 ## Catalogo de reparacion (`ServiceCheck`)
-- **systemd**: `telegram-bot`, `cloudflared`, `night-agent.timer`, `webhook-portfolio`, `signal.service`, `ollama` → `systemctl is-active` / `systemctl restart`.
+- **systemd**: `telegram-bot`, `cloudflared`, `night-agent.timer`, `webhook-portfolio`, `signal.service`, `red-hood.timer`, `ollama` → `systemctl is-active` / `systemctl restart`.
 - **docker**: `daniel-portfolio-app`, `portfolioservicelauncher-client-gateway-1`, `portfolioservicelauncher-nodemailer-micro-service-1`, `portfolioservicelauncher-nats-server-1`, `sonarqube` → `docker inspect` / `docker start`.
 - **binary**: `claude` (`claude --version`) → reinstala con `node .../@anthropic-ai/claude-code/install.cjs`.
 

@@ -79,6 +79,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -99,11 +100,13 @@ from telegram.error import TelegramError
 from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 
 from batcave import memory_store
+from batcave.secrets import mask_secrets
 from modes.development import (
     AIDER_BIN,
     OLLAMA_API_BASE,
     changed_files,
     commit_and_push,
+    git_cmd,
     is_forbidden_path,
     read_repo_claude_md,
     repo_is_clean,
@@ -172,6 +175,9 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("red_hood")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @dataclass(frozen=True)
@@ -214,7 +220,7 @@ class TelegramNotifier:
     async def send(self, text: str) -> None:
         try:
             await self.bot.send_message(
-                chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN
+                chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML
             )
         except TelegramError as exc:
             log.error("No se pudo enviar mensaje a Telegram: %s", exc)
@@ -232,7 +238,7 @@ def _run(cmd: list[str], timeout: int = 30, cwd: Optional[Path] = None) -> str:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
         return proc.stdout.strip() or proc.stderr.strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
-        log.warning("Fallo ejecutando %s: %s", " ".join(cmd), exc)
+        log.warning("Fallo ejecutando %s: %s", mask_secrets(" ".join(cmd)), exc)
         return ""
 
 
@@ -388,12 +394,12 @@ def setup_workspace_repo(prod_repo_path: Path, workspace_dir: Path) -> tuple[Opt
             return None, "main", True
         workspace_dir.mkdir(parents=True, exist_ok=True)
         log.info("Clonando %s -> %s (workspace aislado)", origin_url, workspace_repo_path)
-        clone = run_cli(["git", "clone", origin_url, str(workspace_repo_path)], timeout=CLONE_TIMEOUT)
+        clone = run_cli(git_cmd(["clone", origin_url, str(workspace_repo_path)]), timeout=CLONE_TIMEOUT)
         if clone.returncode != 0:
-            log.error("Fallo el clone de %s: %s", origin_url, clone.stderr[-500:])
+            log.error("Fallo el clone de %s: %s", origin_url, mask_secrets(clone.stderr[-500:]))
             return None, "main", True
     else:
-        run_cli(["git", "fetch", "origin"], cwd=workspace_repo_path)
+        run_cli(git_cmd(["fetch", "origin"]), cwd=workspace_repo_path)
 
     if run_cli(["git", "checkout", "dev"], cwd=workspace_repo_path).returncode == 0:
         run_cli(["git", "reset", "--hard", "origin/dev"], cwd=workspace_repo_path)
@@ -1000,9 +1006,15 @@ async def handle_finding(
             )
 
     if severity == "critical":
-        await notifier.send(f"🔴🚨 Red Hood encontró: {finding.summary} en `{finding.repo}`")
+        await notifier.send(
+            f"🔴🚨 Red Hood encontró: {html.escape(finding.summary)} en "
+            f"<code>{html.escape(finding.repo)}</code>"
+        )
     elif who == "alfred":
-        await notifier.send(f"🔴 Red Hood: {finding.summary} en `{finding.repo}` (severidad {severity})")
+        await notifier.send(
+            f"🔴 Red Hood: {html.escape(finding.summary)} en "
+            f"<code>{html.escape(finding.repo)}</code> (severidad {severity})"
+        )
 
     if dry_run:
         log.info(
@@ -1045,7 +1057,7 @@ async def handle_finding(
 
 def format_repo_summary(summary: dict) -> str:
     if summary.get("skipped"):
-        return f"🔴 `{summary['repo']}`: sin commits nuevos, omitido"
+        return f"🔴 <code>{html.escape(summary['repo'])}</code>: sin commits nuevos, omitido"
 
     test_result = summary["test_result"]
     tests_icon = {"ok": "✅", "failing": "❌", "timeout": "⏱️"}.get(test_result["status"], "➖")
@@ -1056,11 +1068,11 @@ def format_repo_summary(summary: dict) -> str:
     read_only_tag = " (solo lectura, sin rama dev)" if summary["read_only"] else ""
 
     return (
-        f"🔴 *Red Hood* — `{summary['repo']}`{read_only_tag}\n"
+        f"🔴 <b>Red Hood</b> — <code>{html.escape(summary['repo'])}</code>{read_only_tag}\n"
         f"Tests: {tests_icon} ({test_result['passed']} ok / {test_result['failed']} fallando)\n"
         f"Cobertura: {coverage}\n"
-        f"Vulnerabilidades: {vulns}\n"
-        f"Tests generados: {generated_line}"
+        f"Vulnerabilidades: {html.escape(vulns)}\n"
+        f"Tests generados: {html.escape(generated_line)}"
     )
 
 
@@ -1186,7 +1198,10 @@ async def audit_repo(
     secrets = scan_for_secrets(repo_path)
     if secrets:
         redacted = ", ".join(f"{s['file']} ({s['kind']}: {s['sample']})" for s in secrets[:5])
-        await notifier.send(f"🔴🚨 Red Hood encontró: secretos hardcodeados en `{repo_name}`\n{redacted}")
+        await notifier.send(
+            f"🔴🚨 Red Hood encontró: secretos hardcodeados en <code>{html.escape(repo_name)}</code>\n"
+            f"{html.escape(redacted)}"
+        )
         findings.insert(
             0,
             Finding(
@@ -1268,11 +1283,11 @@ def build_final_summary(summaries: list[dict], report_path: Path) -> str:
     total_findings = sum(len(s.get("findings", [])) for s in audited)
     total_generated = sum(len(s.get("generated", [])) for s in audited)
     return (
-        "🔴 *Red Hood — auditoria completada*\n"
+        "🔴 <b>Red Hood — auditoria completada</b>\n"
         f"Repos auditados: {len(audited)} | omitidos (sin cambios): {len(skipped)}\n"
         f"Hallazgos totales: {total_findings}\n"
         f"Tests generados: {total_generated}\n"
-        f"Reporte: {report_path.name}"
+        f"Reporte: {html.escape(report_path.name)}"
     )
 
 
@@ -1339,7 +1354,10 @@ async def main() -> None:
         config = load_config()
     except (OSError, yaml.YAMLError) as exc:
         log.exception("No se pudo cargar config.yaml")
-        await notifier.send(f"🔴 *Red Hood encontró un problema*: no pudo iniciar (error leyendo config.yaml)\n`{exc}`")
+        await notifier.send(
+            f"🔴 <b>Red Hood encontró un problema</b>: no pudo iniciar (error leyendo config.yaml)\n"
+            f"<code>{html.escape(str(exc))}</code>"
+        )
         sys.exit(1)
 
     repo_paths = config.get("red_hood", {}).get("local_repos", [])

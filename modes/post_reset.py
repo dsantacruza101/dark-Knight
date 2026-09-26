@@ -66,6 +66,9 @@ SCORE_RE = re.compile(r"SCORE:\s*([01](?:\.\d+)?)", re.IGNORECASE)
 NOTES_RE = re.compile(r"NOTES:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 log = logging.getLogger("night_agent.post_reset")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def run_claude(

@@ -43,6 +43,9 @@ FAIL2BAN_STATE_PATH = BASE_DIR / ".fail2ban_seen_ips.json"
 SECURITY_SCAN_EVERY_N_CYCLES = 6
 
 log = logging.getLogger("night_agent.monitoring")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 LOG_LINE_RE = re.compile(r'^(?P<ip>\S+) \S+ \S+ \[[^\]]+\] "(?P<request>[^"]*)" (?P<status>\d{3})')
 SUSPICIOUS_REQUEST_RE = re.compile(

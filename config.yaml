@@ -35,6 +35,8 @@ repo_paths:
 
 development:
   workspace_dir: ~/projects/.nightwing-workspace
+  aider_timeout: 2700
+  aider_attempts: 2
 
 knowledge_base:
   path: ~/projects/night-agent/knowledge

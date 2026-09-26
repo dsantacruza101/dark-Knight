@@ -46,18 +46,50 @@ escribe en ella). Es una lista de mensajes:
   procesa; el archivo nunca se vacia, solo crece (es historial + inbox).
 - Arranca vacio (`[]`).
 
+## Modo mantenimiento: `batcave/maintenance.json`
+
+Lista de servicios que Lucius Fox debe omitir por completo (sin chequear,
+reparar ni alertar) mientras esten en mantenimiento:
+
+```json
+{
+  "paused": [
+    {
+      "service": "red-hood.timer",
+      "reason": "actualizando dependencias de Aider",
+      "until": "2026-09-27T00:00:00+00:00",
+      "by": "daniel"
+    }
+  ]
+}
+```
+
+- `until` puede ser `null` (mantenimiento indefinido) o una fecha ISO 8601
+  futura. Mientras este vigente, Lucius solo loguea
+  `"en mantenimiento: <razon>"` y sigue con el resto del catalogo.
+- Si `until` ya paso, Lucius elimina la entrada automaticamente al arrancar
+  cada ronda y vuelve a vigilar ese servicio con normalidad.
+- Arranca vacio (`{"paused": []}`). Se edita a mano (o via Alfred a futuro),
+  no lo escribe ningun agente todavia.
+
 ## Lucius Fox: catalogo y flujo (`lucius_fox.py`)
 
 Catalogo de `ServiceCheck` (`kind` → chequeo/reparacion):
 
 - **systemd**: `telegram-bot`, `cloudflared`, `night-agent.timer`,
-  `webhook-portfolio`, `ollama` → `systemctl is-active` / `systemctl restart`.
+  `webhook-portfolio`, `ollama` → `systemctl is-active` / `systemctl restart`
+  (para `*.timer`, `systemctl enable --now` en vez de solo `restart`, para
+  que la reparacion sobreviva reinicios del servidor).
 - **docker**: `daniel-portfolio-app`, `portfolioservicelauncher-client-gateway-1`,
   `portfolioservicelauncher-nodemailer-micro-service-1`,
   `portfolioservicelauncher-nats-server-1`, `sonarqube` → `docker inspect` /
   `docker start`.
 - **binary**: `claude` (`claude --version`) → reinstala con
   `node .../@anthropic-ai/claude-code/install.cjs`.
+
+Antes de chequear un servicio, Lucius revisa si esta en
+`batcave/maintenance.json`: si esta en mantenimiento vigente, se omite por
+completo (ver arriba).
 
 Por cada servicio caido, Lucius le pregunta a TypeSafe (Jev) `can_self_repair`
 (Noul), `priority` (Choice: critical/high/medium/low) y `who_to_notify`
@@ -141,4 +173,12 @@ sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer
 - Un fallo de TypeSafe (o de Telegram) nunca debe tumbar el ciclo completo: se
   loguea y se sigue (ver `except Exception` en `modes/monitoring.py` y
   `lucius_fox.py`).
+- Telegram: los tres agentes que notifican por Telegram (`lucius_fox.py`,
+  `signal_agent.py`, `red_hood.py`) usan `parse_mode=ParseMode.HTML`, nunca
+  Markdown. Todo contenido dinamico (nombres de archivo, repos, ramas,
+  errores) va siempre por `html.escape()` antes de interpolarse en el
+  mensaje; negritas con `<b>` y monoespaciado con `<code>`. Markdown se
+  rompe con `Can't parse entities` en cuanto un nombre de archivo trae `_`
+  o `*` (comun en `*.spec.ts`, `test_*.py`), HTML no tiene ese problema una
+  vez escapado.
 - `knowledge/` y `reports/` son generados, no se versionan (`.gitignore`).

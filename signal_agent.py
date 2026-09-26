@@ -39,6 +39,7 @@ reporte en reports/signal-YYYY-MM-DD.md.
 from __future__ import annotations
 
 import asyncio
+import html
 import itertools
 import json
 import logging
@@ -142,6 +143,9 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("signal_agent")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def load_env() -> None:
@@ -175,7 +179,7 @@ class TelegramNotifier:
     async def send(self, text: str) -> None:
         try:
             await self.bot.send_message(
-                chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN
+                chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML
             )
         except TelegramError as exc:
             log.error("No se pudo enviar mensaje a Telegram: %s", exc)
@@ -515,7 +519,7 @@ async def act_on_anomaly(anomaly: dict, notifier: TelegramNotifier, incidents: l
 
     if "alfred" in targets:
         await notifier.send(
-            f"☀️ *Signal*\n{anomaly['description']}\n"
+            f"☀️ <b>Signal</b>\n{html.escape(anomaly['description'])}\n"
             f"Severidad: {anomaly['severity_label']} ({anomaly['severity_score']:.2f})"
         )
     if "batman" in targets:
@@ -701,7 +705,7 @@ async def run_signal(config: dict, notifier: TelegramNotifier) -> None:
     start = datetime.now()
     stop_at = _stop_datetime(start)
     log.info("Signal: vigilancia diurna activa hasta %s", stop_at)
-    await notifier.send("☀️ *Signal iniciado* — Vigilancia diurna activa")
+    await notifier.send("☀️ <b>Signal iniciado</b> — Vigilancia diurna activa")
 
     typesafe_available = bool(os.environ.get("TYPESAFE_API_KEY"))
     if not typesafe_available:
@@ -733,7 +737,7 @@ async def run_signal(config: dict, notifier: TelegramNotifier) -> None:
     write_daily_brief(incidents, summary)
 
     log.info("Signal: vigilancia diurna completada (%d ciclos, %d incidentes)", cycle_num, len(incidents))
-    await notifier.send("☀️ *Signal completado* — Batman toma el relevo")
+    await notifier.send("☀️ <b>Signal completado</b> — Batman toma el relevo")
 
 
 async def main() -> None:
@@ -744,7 +748,10 @@ async def main() -> None:
         config = load_config()
     except (OSError, yaml.YAMLError) as exc:
         log.exception("No se pudo cargar config.yaml")
-        await notifier.send(f"☀️ *Signal encontró un problema*: no pudo iniciar (error leyendo config.yaml)\n`{exc}`")
+        await notifier.send(
+            f"☀️ <b>Signal encontró un problema</b>: no pudo iniciar (error leyendo config.yaml)\n"
+            f"<code>{html.escape(str(exc))}</code>"
+        )
         await report_self_repair_needed(exc, notifier)
         sys.exit(1)
 
@@ -752,7 +759,11 @@ async def main() -> None:
         await run_signal(config, notifier)
     except Exception as exc:  # noqa: BLE001 - notificar cualquier fallo antes de salir
         log.exception("Fallo Signal")
-        await notifier.send(f"☀️ *Signal encontró un problema*\n`{type(exc).__name__}: {exc}`\nRevisa {LOG_PATH}")
+        await notifier.send(
+            f"☀️ <b>Signal encontró un problema</b>\n"
+            f"<code>{html.escape(type(exc).__name__)}: {html.escape(str(exc))}</code>\n"
+            f"Revisa {LOG_PATH}"
+        )
         await report_self_repair_needed(exc, notifier)
         sys.exit(1)
 

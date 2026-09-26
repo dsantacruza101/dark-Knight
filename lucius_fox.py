@@ -27,11 +27,21 @@ Signal (el vigilante diurno) pidio auto-reparacion tras un error critico:
 en ese caso le pregunta a TypeSafe si puede reparar signal.service con un
 restart y, si TypeSafe lo aprueba (can_repair > 0.7), lo hace y avisa a
 Alfred.
+
+Ademas, al iniciar cada ronda, Lucius vigila que los directorios de
+produccion (`PRODUCTION_REPOS`) esten en `PRODUCTION_BRANCH` ('main') y sin
+cambios locales (ignorando `batcave/`/`reports/` en night-agent, que son
+generados por la operacion normal del propio night-agent). Esto es de solo
+lectura: si un repo esta en otra rama o tiene cambios, Lucius NUNCA lo
+repara automaticamente (podria pisar trabajo en progreso); solo alerta a
+Alfred con prioridad alta y deja un mensaje para Batman en
+batcave/comms.json con el repo, la rama actual y los archivos modificados.
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -55,6 +65,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = Path("/etc/night-agent.env")
 LOG_PATH = BASE_DIR / "lucius_fox.log"
 COMMS_PATH = BASE_DIR / "batcave" / "comms.json"
+MAINTENANCE_PATH = BASE_DIR / "batcave" / "maintenance.json"
 
 CLAUDE_NODE_BIN = "/home/dsantacruz/.nvm/versions/node/v22.23.2/bin/node"
 CLAUDE_INSTALL_SCRIPT = (
@@ -78,6 +89,9 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("lucius_fox")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @dataclass(frozen=True)
@@ -103,6 +117,22 @@ CATALOG: list[ServiceCheck] = [
     ServiceCheck("sonarqube", "docker", "medium", "Analisis estatico de codigo, no forma parte del trafico de produccion"),
     ServiceCheck("claude", "binary", "critical", "Binario de Claude Code usado por Batman para resolver issues"),
 ]
+
+# Directorios de produccion que SIEMPRE deben estar en PRODUCTION_BRANCH y sin
+# cambios locales. Nunca se auto-reparan (checkout/reset/commit): un desvio
+# aqui solo se reporta, para que un humano decida.
+PRODUCTION_REPOS = (
+    "~/projects/my_Portfolio_React_v2",
+    "~/projects/portfolioServiceLauncher",
+    "~/projects/portfolioServiceLauncher/client-gateway",
+    "~/projects/portfolioServiceLauncher/nodeMailer-ms",
+    "~/projects/telegram-bot",
+    "~/projects/night-agent",
+)
+PRODUCTION_BRANCH = "main"
+# night-agent escribe batcave/ y reports/ como parte de su operacion normal;
+# esos cambios no son un desvio de produccion.
+PRODUCTION_IGNORED_PREFIXES = {"night-agent": ("batcave/", "reports/")}
 
 
 def load_env() -> None:
@@ -131,7 +161,7 @@ class TelegramNotifier:
     async def send(self, text: str) -> None:
         try:
             await self.bot.send_message(
-                chat_id=self.chat_id, text=text, parse_mode=ParseMode.MARKDOWN
+                chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML
             )
         except TelegramError as exc:
             log.error("No se pudo enviar mensaje a Telegram: %s", exc)
@@ -146,6 +176,18 @@ def _run(cmd: list[str], timeout: int = 30) -> str:
         return ""
 
 
+def _run_lines(cmd: list[str], timeout: int = 30) -> list[str]:
+    """Como `_run`, pero preserva las lineas tal cual (sin strip() global, que
+    se comeria el espacio inicial de `git status --porcelain` en la primera
+    linea); solo se recorta el salto de linea final de cada una."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return proc.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Fallo ejecutando %s: %s", " ".join(cmd), exc)
+        return []
+
+
 def is_signal_operating_hours() -> bool:
     """True si la hora actual esta dentro del horario diurno de Signal."""
     hour = datetime.now(timezone.utc).hour
@@ -158,7 +200,11 @@ def check_systemd(name: str) -> bool:
 
 
 def restart_systemd(name: str) -> bool:
-    _run(["sudo", "systemctl", "restart", name])
+    if name.endswith(".timer"):
+        # enable --now (no solo restart) para que el timer sobreviva reinicios del servidor.
+        _run(["sudo", "systemctl", "enable", "--now", name])
+    else:
+        _run(["sudo", "systemctl", "restart", name])
     time.sleep(REPAIR_RETRY_DELAY_SECONDS)
     return check_systemd(name)
 
@@ -224,6 +270,58 @@ def append_comm(entry: dict) -> None:
     entries = read_comms()
     entries.append(entry)
     write_comms(entries)
+
+
+def read_maintenance() -> list[dict]:
+    try:
+        data = json.loads(MAINTENANCE_PATH.read_text(encoding="utf-8"))
+        return data.get("paused", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def write_maintenance(paused: list[dict]) -> None:
+    MAINTENANCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MAINTENANCE_PATH.write_text(
+        json.dumps({"paused": paused}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def prune_expired_maintenance(paused: list[dict]) -> tuple[list[dict], bool]:
+    """Separa las entradas cuyo 'until' ya paso; devuelve las vigentes y si
+    hubo alguna expirada (para saber si hay que reescribir el archivo)."""
+    now = datetime.now(timezone.utc)
+    active: list[dict] = []
+    changed = False
+    for entry in paused:
+        until = entry.get("until")
+        if until:
+            try:
+                until_dt = datetime.fromisoformat(until)
+                if until_dt.tzinfo is None:
+                    until_dt = until_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                active.append(entry)
+                continue
+            if until_dt <= now:
+                changed = True
+                continue
+        active.append(entry)
+    return active, changed
+
+
+def get_active_maintenance(service_name: str) -> Optional[dict]:
+    """Lee batcave/maintenance.json, elimina automaticamente las entradas
+    cuyo 'until' ya paso (vuelven a vigilarse) y devuelve la entrada activa
+    para service_name si existe (until es null o futuro)."""
+    paused = read_maintenance()
+    active, changed = prune_expired_maintenance(paused)
+    if changed:
+        write_maintenance(active)
+    for entry in active:
+        if entry.get("service") == service_name:
+            return entry
+    return None
 
 
 def update_memory(event: str, **kwargs) -> None:
@@ -425,8 +523,8 @@ async def escalate(check: ServiceCheck, priority: str, who_to_notify: str, notif
     if "alfred" in targets:
         emoji = "🚨" if priority == "critical" else "⚠️"
         await notifier.send(
-            f"{emoji} *Lucius Fox*\n`{check.name}` caido, no se pudo auto-reparar.\n"
-            f"Prioridad: {priority}\n{check.description}"
+            f"{emoji} <b>Lucius Fox</b>\n<code>{html.escape(check.name)}</code> caido, no se pudo auto-reparar.\n"
+            f"Prioridad: {html.escape(priority)}\n{html.escape(check.description)}"
         )
     if "batman" in targets:
         append_comm(
@@ -449,6 +547,13 @@ async def escalate(check: ServiceCheck, priority: str, who_to_notify: str, notif
 async def process_check(
     check: ServiceCheck, client: Optional[AsyncTypeSafeClient], notifier: TelegramNotifier
 ) -> Optional[str]:
+    maintenance = get_active_maintenance(check.name)
+    if maintenance:
+        log.info(
+            "%s en mantenimiento: %s", check.name, maintenance.get("reason", "sin razon especificada")
+        )
+        return None
+
     if check.name == SIGNAL_SERVICE_NAME and not is_signal_operating_hours():
         log.info("%s fuera de horario diurno (6 AM-10 PM CST), se omite el check", check.name)
         return None
@@ -462,9 +567,8 @@ async def process_check(
 
     repaired = decision["can_self_repair"] and attempt_repair(check)
     if repaired:
-        msg = f"🦊 Lucius reparó: {check.name}"
-        log.info(msg)
-        await notifier.send(msg)
+        log.info("🦊 Lucius reparó: %s", check.name)
+        await notifier.send(f"🦊 Lucius reparó: <code>{html.escape(check.name)}</code>")
         update_memory(
             "repair_success",
             service=check.name,
@@ -490,7 +594,7 @@ async def run_checks(catalog: list[ServiceCheck], notifier: TelegramNotifier) ->
     if not typesafe_available:
         log.error("TYPESAFE_API_KEY no esta definida, Lucius opera en modo fallback (sin Jev)")
         await notifier.send(
-            "🚨 *Lucius Fox*: `TYPESAFE_API_KEY` no esta definida en el entorno. "
+            "🚨 <b>Lucius Fox</b>: <code>TYPESAFE_API_KEY</code> no esta definida en el entorno. "
             "Decisiones de reparacion en modo fallback, sin TypeSafe/Jev."
         )
 
@@ -511,9 +615,72 @@ async def run_checks(catalog: list[ServiceCheck], notifier: TelegramNotifier) ->
     return results
 
 
+def check_production_repo(repo_path: Path) -> Optional[dict]:
+    """Verifica de solo lectura que `repo_path` este en PRODUCTION_BRANCH y sin
+    cambios locales (ignorando los prefijos de PRODUCTION_IGNORED_PREFIXES).
+    Nunca hace checkout, reset ni commit sobre produccion. Devuelve None si
+    esta en el estado esperado."""
+    if not repo_path.exists():
+        return None
+
+    branch = _run(["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"])
+    status_lines = _run_lines(["git", "-C", str(repo_path), "status", "--porcelain"])
+
+    ignored_prefixes = PRODUCTION_IGNORED_PREFIXES.get(repo_path.name, ())
+    modified_files = [
+        line[3:].strip()
+        for line in status_lines
+        if line.strip() and not line[3:].strip().startswith(ignored_prefixes)
+    ]
+
+    if branch == PRODUCTION_BRANCH and not modified_files:
+        return None
+    return {"repo": repo_path.name, "branch": branch or "desconocida", "modified_files": modified_files}
+
+
+async def check_production_integrity(notifier: TelegramNotifier) -> None:
+    """Vigila que los directorios de produccion sigan en PRODUCTION_BRANCH y
+    sin cambios locales. Si alguno se desvio, NO se auto-repara: se alerta a
+    Alfred con prioridad alta y se deja mensaje para Batman en comms.json."""
+    for raw_path in PRODUCTION_REPOS:
+        repo_path = Path(raw_path).expanduser()
+        issue = check_production_repo(repo_path)
+        if issue is None:
+            continue
+
+        log.warning(
+            "%s fuera de estado esperado (rama %s, %d archivo(s) modificado(s)), no se repara automaticamente",
+            issue["repo"], issue["branch"], len(issue["modified_files"]),
+        )
+        modified_summary = ", ".join(issue["modified_files"]) or "ninguno"
+        await notifier.send(
+            f"⚠️ <b>Lucius Fox</b> — Produccion fuera de estado\n"
+            f"Repo: <code>{html.escape(issue['repo'])}</code>\n"
+            f"Rama actual: <code>{html.escape(issue['branch'])}</code> (esperada: <code>{PRODUCTION_BRANCH}</code>)\n"
+            f"Archivos modificados: {html.escape(modified_summary)}\n"
+            "No se repara automaticamente: requiere revision manual."
+        )
+        append_comm(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "from": "lucius",
+                "to": "batman",
+                "service": issue["repo"],
+                "priority": "high",
+                "message": (
+                    f"{issue['repo']} esta en rama '{issue['branch']}' (esperada '{PRODUCTION_BRANCH}') "
+                    f"o tiene cambios locales: {modified_summary}."
+                ),
+                "read": False,
+            }
+        )
+
+
 async def main() -> None:
     load_env()
     notifier = TelegramNotifier()
+
+    await check_production_integrity(notifier)
 
     results = await run_checks(CATALOG, notifier)
     if results:
