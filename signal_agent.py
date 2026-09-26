@@ -427,6 +427,10 @@ def check_github_actions(config: dict) -> list[dict]:
                             "description": (
                                 f"Pipeline fallido en {repo_name}: {run.name} (run #{run.run_number})"
                             ),
+                            "html_description": (
+                                f"Pipeline fallido en <code>{html.escape(repo_name)}</code>: "
+                                f"{html.escape(run.name)} (run #{run.run_number})"
+                            ),
                             "details": {
                                 "repo": repo_name,
                                 "workflow": run.name,
@@ -518,8 +522,9 @@ async def act_on_anomaly(anomaly: dict, notifier: TelegramNotifier, incidents: l
         targets.update({"alfred", "batman"})
 
     if "alfred" in targets:
+        description = anomaly.get("html_description") or html.escape(anomaly["description"])
         await notifier.send(
-            f"☀️ <b>Signal</b>\n{html.escape(anomaly['description'])}\n"
+            f"☀️ <b>Signal</b>\n{description}\n"
             f"Severidad: {anomaly['severity_label']} ({anomaly['severity_score']:.2f})"
         )
     if "batman" in targets:

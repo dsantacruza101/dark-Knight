@@ -652,12 +652,15 @@ async def check_production_integrity(notifier: TelegramNotifier) -> None:
             "%s fuera de estado esperado (rama %s, %d archivo(s) modificado(s)), no se repara automaticamente",
             issue["repo"], issue["branch"], len(issue["modified_files"]),
         )
-        modified_summary = ", ".join(issue["modified_files"]) or "ninguno"
+        modified_summary = (
+            ", ".join(f"<code>{html.escape(f)}</code>" for f in issue["modified_files"])
+            or "ninguno"
+        )
         await notifier.send(
             f"⚠️ <b>Lucius Fox</b> — Produccion fuera de estado\n"
             f"Repo: <code>{html.escape(issue['repo'])}</code>\n"
             f"Rama actual: <code>{html.escape(issue['branch'])}</code> (esperada: <code>{PRODUCTION_BRANCH}</code>)\n"
-            f"Archivos modificados: {html.escape(modified_summary)}\n"
+            f"Archivos modificados: {modified_summary}\n"
             "No se repara automaticamente: requiere revision manual."
         )
         append_comm(

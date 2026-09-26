@@ -1064,7 +1064,11 @@ def format_repo_summary(summary: dict) -> str:
     coverage = f"{test_result['coverage_pct']:.1f}%" if test_result.get("coverage_pct") is not None else "N/D"
     vulns = summarize_vulnerabilities(summary["vulnerabilities"], summary["stack"]) or "ninguna"
     generated = summary["generated"]
-    generated_line = ", ".join(f"{g['file']} ({g['status']})" for g in generated) if generated else "ninguno"
+    generated_line = (
+        ", ".join(f"<code>{html.escape(g['file'])}</code> ({html.escape(g['status'])})" for g in generated)
+        if generated
+        else "ninguno"
+    )
     read_only_tag = " (solo lectura, sin rama dev)" if summary["read_only"] else ""
 
     return (
@@ -1072,7 +1076,7 @@ def format_repo_summary(summary: dict) -> str:
         f"Tests: {tests_icon} ({test_result['passed']} ok / {test_result['failed']} fallando)\n"
         f"Cobertura: {coverage}\n"
         f"Vulnerabilidades: {html.escape(vulns)}\n"
-        f"Tests generados: {html.escape(generated_line)}"
+        f"Tests generados: {generated_line}"
     )
 
 
@@ -1197,10 +1201,13 @@ async def audit_repo(
 
     secrets = scan_for_secrets(repo_path)
     if secrets:
-        redacted = ", ".join(f"{s['file']} ({s['kind']}: {s['sample']})" for s in secrets[:5])
+        redacted = ", ".join(
+            f"<code>{html.escape(s['file'])}</code> ({html.escape(s['kind'])}: {html.escape(s['sample'])})"
+            for s in secrets[:5]
+        )
         await notifier.send(
             f"🔴🚨 Red Hood encontró: secretos hardcodeados en <code>{html.escape(repo_name)}</code>\n"
-            f"{html.escape(redacted)}"
+            f"{redacted}"
         )
         findings.insert(
             0,
@@ -1287,7 +1294,7 @@ def build_final_summary(summaries: list[dict], report_path: Path) -> str:
         f"Repos auditados: {len(audited)} | omitidos (sin cambios): {len(skipped)}\n"
         f"Hallazgos totales: {total_findings}\n"
         f"Tests generados: {total_generated}\n"
-        f"Reporte: {html.escape(report_path.name)}"
+        f"Reporte: <code>{html.escape(report_path.name)}</code>"
     )
 
 
