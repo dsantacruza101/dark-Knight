@@ -10,7 +10,8 @@ Cada ciclo (1h):
   - Se revisan containers, RAM, disco y fail2ban; cualquier umbral superado
     dispara una alerta inmediata por Telegram.
 
-Cada 6 ciclos se corre ademas un escaneo antivirus (clamscan).
+Cada 6 ciclos se revisa ademas el resumen del escaneo antivirus diario de
+ClamAV (/var/log/clamav-daily.log, generado por el cron que corre como root).
 
 Al terminar la noche (hora de `schedule.stop` en config.yaml) se deja un
 reporte consolidado en reports/YYYY-MM-DD.md.
@@ -36,6 +37,7 @@ from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = Path("/etc/night-agent.env")
 NGINX_LOG = Path("/var/log/nginx/access.log")
+CLAMAV_LOG = Path("/var/log/clamav-daily.log")
 NGINX_TAIL_LINES = 1000
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
 REPORTS_DIR = BASE_DIR / "reports"
@@ -336,17 +338,51 @@ async def run_shared_checks(config: dict, notifier) -> str:
     )
 
 
-async def run_security_scan(config: dict, notifier) -> str:
-    log.info("Iniciando escaneo de seguridad (clamscan)")
-    output = _run(["sudo", "clamscan", "-r", "/home", "/var/www", "--infected"], timeout=3600)
-    infected = [line for line in output.splitlines() if "FOUND" in line]
+def _parse_clamav_summary(text: str) -> Optional[dict[str, str]]:
+    """Extrae los campos del ultimo bloque SCAN SUMMARY de un log de ClamAV."""
+    blocks = text.split("SCAN SUMMARY")
+    if len(blocks) < 2:
+        return None
+    last_block = blocks[-1]
 
-    header = "### 🛡️ Escaneo de seguridad (clamscan)"
-    if infected:
-        body = f"🚨 {len(infected)} archivo(s) infectado(s):\n" + "\n".join(infected)
+    fields = {}
+    for key in ("Infected files", "Scanned files", "Start Date", "End Date"):
+        match = re.search(rf"^{re.escape(key)}:\s*(.+)$", last_block, re.MULTILINE)
+        if match:
+            fields[key] = match.group(1).strip()
+
+    if "Infected files" not in fields:
+        return None
+    return fields
+
+
+async def run_security_scan(config: dict, notifier) -> str:
+    log.info("Leyendo resumen de ClamAV (%s)", CLAMAV_LOG)
+    header = "### 🛡️ Escaneo de seguridad (ClamAV)"
+
+    try:
+        text = CLAMAV_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log.info("No se pudo leer %s: %s", CLAMAV_LOG, exc)
+        return f"{header}\nℹ️ No se pudo leer {CLAMAV_LOG} ({exc})."
+
+    summary = _parse_clamav_summary(text)
+    if summary is None:
+        log.info("No se encontro SCAN SUMMARY en %s", CLAMAV_LOG)
+        return f"{header}\nℹ️ El log no contiene un SCAN SUMMARY todavia."
+
+    infected_count = int(re.search(r"\d+", summary["Infected files"]).group())
+    date = summary.get("End Date") or summary.get("Start Date") or "desconocida"
+    scanned = summary.get("Scanned files", "?")
+
+    if infected_count > 0:
+        body = (
+            f"🚨 {infected_count} archivo(s) infectado(s) (escaneado: {date}, "
+            f"{scanned} archivo(s) escaneado(s))"
+        )
         await notifier.send(f"🚨 *Alerta de Batman:*\n\n{body}")
     else:
-        body = "Sin hallazgos. Todo limpio."
+        body = f"Sin hallazgos. Todo limpio (escaneado: {date}, {scanned} archivo(s) escaneado(s))."
 
     return f"{header}\n{body}"
 
