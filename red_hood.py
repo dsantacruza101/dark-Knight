@@ -187,6 +187,7 @@ class Finding:
     detail: str
     baseline_severity: str
     repo: str
+    files: tuple[str, ...] = ()
 
 
 def load_env() -> None:
@@ -781,6 +782,52 @@ def find_untested_python_files(repo_path: Path, limit: int) -> list[str]:
     return candidates
 
 
+NODE_SOURCE_EXTS = (".ts", ".tsx", ".js", ".jsx")
+NODE_SKIP_DIRS = {"node_modules", "dist", "build", "coverage"}
+
+
+def find_untested_node_files(repo_path: Path, limit: int) -> list[str]:
+    search_root = repo_path / "src" if (repo_path / "src").exists() else repo_path
+
+    candidates: list[str] = []
+    for source_file in sorted(search_root.rglob("*")):
+        if not source_file.is_file() or source_file.suffix not in NODE_SOURCE_EXTS:
+            continue
+        if NODE_SKIP_DIRS & set(source_file.parts):
+            continue
+        if re.search(r"\.(spec|test)\.", source_file.name):
+            continue
+        source_rel = str(source_file.relative_to(repo_path))
+        if (repo_path / guess_node_test_path(repo_path, source_rel)).exists():
+            continue
+        candidates.append(source_rel)
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+ESLINT_FILE_LINE_RE = re.compile(r"^(\S+\.(?:[jt]sx?|mjs|cjs))$")
+
+
+def extract_lint_files(lint_output: str, repo_path: Path, limit: int) -> list[str]:
+    """Rutas (relativas a repo_path) de los archivos mencionados en la salida de eslint."""
+    found: list[str] = []
+    for line in lint_output.splitlines():
+        match = ESLINT_FILE_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        raw_path = Path(match.group(1))
+        try:
+            rel = str(raw_path.relative_to(repo_path)) if raw_path.is_absolute() else str(raw_path)
+        except ValueError:
+            continue
+        if rel not in found:
+            found.append(rel)
+        if len(found) >= limit:
+            break
+    return found
+
+
 def build_aider_test_message(source_rel: str, test_rel: str, framework: str, claude_md: str) -> str:
     context = claude_md[:3000] if claude_md else "(sin CLAUDE.md en el repositorio)"
     return (
@@ -889,6 +936,7 @@ def generate_tests_for_repo(
 
 def build_findings(
     repo_name: str,
+    repo_path: Path,
     test_result: dict,
     lint_output: str,
     py_compile_errors: list[str],
@@ -919,6 +967,14 @@ def build_findings(
             )
         )
     elif test_result["status"] == "sin_tests":
+        if stack == "node":
+            untested = find_untested_node_files(repo_path, DEFAULT_MAX_TESTS_PER_REPO)
+            missing_test_files = [guess_node_test_path(repo_path, f) for f in untested]
+        elif stack == "python":
+            untested = find_untested_python_files(repo_path, DEFAULT_MAX_TESTS_PER_REPO)
+            missing_test_files = [guess_python_test_path(f) for f in untested]
+        else:
+            missing_test_files = []
         findings.append(
             Finding(
                 category="missing_tests",
@@ -926,11 +982,16 @@ def build_findings(
                 detail="Sin script de test en package.json, o sin directorio tests/.",
                 baseline_severity="medium",
                 repo=repo_name,
+                files=tuple(missing_test_files),
             )
         )
 
     coverage_pct = test_result.get("coverage_pct")
     if coverage_pct is not None and coverage_pct < coverage_threshold:
+        lowest_coverage_file = find_low_coverage_files(test_result["output"], 1)
+        coverage_test_files = (
+            [guess_node_test_path(repo_path, lowest_coverage_file[0])] if lowest_coverage_file else []
+        )
         findings.append(
             Finding(
                 category="low_coverage",
@@ -938,6 +999,7 @@ def build_findings(
                 detail=test_result["output"][-1500:],
                 baseline_severity="medium",
                 repo=repo_name,
+                files=tuple(coverage_test_files),
             )
         )
 
@@ -949,10 +1011,16 @@ def build_findings(
                 detail=lint_output[-1500:],
                 baseline_severity="low",
                 repo=repo_name,
+                files=tuple(extract_lint_files(lint_output, repo_path, DEFAULT_MAX_TESTS_PER_REPO)),
             )
         )
 
     if py_compile_errors:
+        compile_files: list[str] = []
+        for error in py_compile_errors:
+            path = error.split(":", 1)[0].strip()
+            if path not in compile_files:
+                compile_files.append(path)
         findings.append(
             Finding(
                 category="lint_error",
@@ -960,6 +1028,7 @@ def build_findings(
                 detail="\n".join(py_compile_errors)[-1500:],
                 baseline_severity="high",
                 repo=repo_name,
+                files=tuple(compile_files),
             )
         )
 
@@ -1046,8 +1115,18 @@ async def handle_finding(
     if severity in ("high", "critical") and gh is not None and github_repo:
         arreglable = finding.category in ("missing_tests", "low_coverage", "lint_error")
         extra_labels = ["night-agent"] if who == "nightwing" and arreglable else []
-        title = f"[Red Hood] {finding.category}: {finding.summary}"[:250]
-        url = create_qa_issue(gh, github_repo, title, finding.detail, extra_labels)
+
+        # El nombre del repo GitHub (p.ej. "dsantacruz-client-gateway") difiere de
+        # finding.repo, que usa la ruta local (p.ej. "portfolioServiceLauncher/client-gateway").
+        github_display = github_repo.split("/")[-1]
+        title_summary = finding.summary.replace(finding.repo, github_display)
+        title = f"[Red Hood] {finding.category}: {title_summary}"[:250]
+
+        body = finding.detail
+        if "night-agent" in extra_labels and finding.files:
+            body = f"{body}\n\nArchivos:\n" + "\n".join(finding.files)
+
+        url = create_qa_issue(gh, github_repo, title, body, extra_labels)
         if url:
             log.info("Issue de QA para %s: %s", finding.repo, url)
 
@@ -1197,7 +1276,9 @@ async def audit_repo(
         log.warning("%s: stack no reconocido (sin package.json, requirements.txt ni *.py)", repo_name)
 
     coverage_threshold = config.get("red_hood", {}).get("coverage_threshold", DEFAULT_COVERAGE_THRESHOLD)
-    findings = build_findings(repo_name, test_result, lint_output, py_compile_errors, audit_vulns, stack, coverage_threshold)
+    findings = build_findings(
+        repo_name, repo_path, test_result, lint_output, py_compile_errors, audit_vulns, stack, coverage_threshold
+    )
 
     secrets = scan_for_secrets(repo_path)
     if secrets:
