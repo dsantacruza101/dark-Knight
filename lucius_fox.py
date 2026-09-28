@@ -36,11 +36,23 @@ lectura: si un repo esta en otra rama o tiene cambios, Lucius NUNCA lo
 repara automaticamente (podria pisar trabajo en progreso); solo alerta a
 Alfred con prioridad alta y deja un mensaje para Batman en
 batcave/comms.json con el repo, la rama actual y los archivos modificados.
+
+Para evitar spamear a Alfred, tanto las alertas de "Produccion fuera de
+estado" como las de servicios caidos sin poder repararse llevan un control
+de deduplicacion en batcave/memory/lucius_alert_state.json: por cada
+repo/servicio se guarda un hash del contenido de la ultima alerta enviada
+y su timestamp. Solo se vuelve a notificar a Alfred si el contenido cambio
+o si pasaron mas de 6 horas desde la ultima notificacion identica (el
+mensaje para Batman en comms.json y el registro en el log no se ven
+afectados, siguen en cada ronda). Cuando el repo/servicio vuelve a estar
+bien, se envia una unica vez "✅ Lucius: <nombre> volvio a la normalidad"
+y se limpia su entrada.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -49,7 +61,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +78,8 @@ ENV_PATH = Path("/etc/night-agent.env")
 LOG_PATH = BASE_DIR / "lucius_fox.log"
 COMMS_PATH = BASE_DIR / "batcave" / "comms.json"
 MAINTENANCE_PATH = BASE_DIR / "batcave" / "maintenance.json"
+ALERT_STATE_PATH = BASE_DIR / "batcave" / "memory" / "lucius_alert_state.json"
+ALERT_REPEAT_COOLDOWN = timedelta(hours=6)
 
 CLAUDE_NODE_BIN = "/home/dsantacruz/.nvm/versions/node/v22.23.2/bin/node"
 CLAUDE_INSTALL_SCRIPT = (
@@ -324,6 +338,58 @@ def get_active_maintenance(service_name: str) -> Optional[dict]:
     return None
 
 
+def read_alert_state() -> dict:
+    try:
+        return json.loads(ALERT_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_alert_state(state: dict) -> None:
+    ALERT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ALERT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _hash_alert_content(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def should_send_alert(key: str, content: str) -> bool:
+    """True si hay que notificar a Alfred: el contenido de la alerta cambio
+    respecto a la ultima enviada para `key`, o paso mas de
+    ALERT_REPEAT_COOLDOWN desde la ultima notificacion identica."""
+    entry = read_alert_state().get(key)
+    if entry is None:
+        return True
+    if entry.get("hash") != _hash_alert_content(content):
+        return True
+    try:
+        last_sent = datetime.fromisoformat(entry["timestamp"])
+    except (KeyError, ValueError):
+        return True
+    return datetime.now(timezone.utc) - last_sent > ALERT_REPEAT_COOLDOWN
+
+
+def record_alert(key: str, content: str) -> None:
+    state = read_alert_state()
+    state[key] = {
+        "hash": _hash_alert_content(content),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    write_alert_state(state)
+
+
+def clear_alert(key: str) -> bool:
+    """Borra la entrada de `key` si existia. Devuelve True si habia una
+    alerta activa (para que el caller avise que volvio a la normalidad)."""
+    state = read_alert_state()
+    if key not in state:
+        return False
+    del state[key]
+    write_alert_state(state)
+    return True
+
+
 def update_memory(event: str, **kwargs) -> None:
     """Actualiza batcave/memory/lucius.md segun el resultado de la ronda."""
     try:
@@ -521,11 +587,19 @@ async def escalate(check: ServiceCheck, priority: str, who_to_notify: str, notif
         targets.update({"alfred", "batman"})
 
     if "alfred" in targets:
-        emoji = "🚨" if priority == "critical" else "⚠️"
-        await notifier.send(
-            f"{emoji} <b>Lucius Fox</b>\n<code>{html.escape(check.name)}</code> caido, no se pudo auto-reparar.\n"
-            f"Prioridad: {html.escape(priority)}\n{html.escape(check.description)}"
-        )
+        alert_content = f"{priority}|{check.description}"
+        if should_send_alert(check.name, alert_content):
+            emoji = "🚨" if priority == "critical" else "⚠️"
+            await notifier.send(
+                f"{emoji} <b>Lucius Fox</b>\n<code>{html.escape(check.name)}</code> caido, no se pudo auto-reparar.\n"
+                f"Prioridad: {html.escape(priority)}\n{html.escape(check.description)}"
+            )
+            record_alert(check.name, alert_content)
+        else:
+            log.info(
+                "%s sigue caido (misma alerta, dentro del cooldown de %s), no se reenvia a Alfred",
+                check.name, ALERT_REPEAT_COOLDOWN,
+            )
     if "batman" in targets:
         append_comm(
             {
@@ -560,6 +634,8 @@ async def process_check(
 
     if CHECK_FNS[check.kind](check.name):
         log.info("%s OK", check.name)
+        if clear_alert(check.name):
+            await notifier.send(f"✅ Lucius: {html.escape(check.name)} volvio a la normalidad")
         return None
 
     log.warning("%s caido", check.name)
@@ -569,6 +645,7 @@ async def process_check(
     if repaired:
         log.info("🦊 Lucius reparó: %s", check.name)
         await notifier.send(f"🦊 Lucius reparó: <code>{html.escape(check.name)}</code>")
+        clear_alert(check.name)
         update_memory(
             "repair_success",
             service=check.name,
@@ -646,6 +723,8 @@ async def check_production_integrity(notifier: TelegramNotifier) -> None:
         repo_path = Path(raw_path).expanduser()
         issue = check_production_repo(repo_path)
         if issue is None:
+            if clear_alert(repo_path.name):
+                await notifier.send(f"✅ Lucius: {html.escape(repo_path.name)} volvio a la normalidad")
             continue
 
         log.warning(
@@ -656,13 +735,21 @@ async def check_production_integrity(notifier: TelegramNotifier) -> None:
             ", ".join(f"<code>{html.escape(f)}</code>" for f in issue["modified_files"])
             or "ninguno"
         )
-        await notifier.send(
-            f"⚠️ <b>Lucius Fox</b> — Produccion fuera de estado\n"
-            f"Repo: <code>{html.escape(issue['repo'])}</code>\n"
-            f"Rama actual: <code>{html.escape(issue['branch'])}</code> (esperada: <code>{PRODUCTION_BRANCH}</code>)\n"
-            f"Archivos modificados: {modified_summary}\n"
-            "No se repara automaticamente: requiere revision manual."
-        )
+        alert_content = f"{issue['branch']}|{','.join(issue['modified_files'])}"
+        if should_send_alert(issue["repo"], alert_content):
+            await notifier.send(
+                f"⚠️ <b>Lucius Fox</b> — Produccion fuera de estado\n"
+                f"Repo: <code>{html.escape(issue['repo'])}</code>\n"
+                f"Rama actual: <code>{html.escape(issue['branch'])}</code> (esperada: <code>{PRODUCTION_BRANCH}</code>)\n"
+                f"Archivos modificados: {modified_summary}\n"
+                "No se repara automaticamente: requiere revision manual."
+            )
+            record_alert(issue["repo"], alert_content)
+        else:
+            log.info(
+                "%s sigue fuera de estado (misma alerta, dentro del cooldown de %s), no se reenvia a Alfred",
+                issue["repo"], ALERT_REPEAT_COOLDOWN,
+            )
         append_comm(
             {
                 "timestamp": datetime.now().isoformat(),
