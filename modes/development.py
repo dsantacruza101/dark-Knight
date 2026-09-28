@@ -29,15 +29,31 @@ Flujo por issue:
   3. Se lee el CLAUDE.md del repo, pero SOLO desde el directorio de
      produccion mapeado en `config.yaml` (`repo_paths`) -- nunca desde el
      workspace -- y se recortan sus primeras 40 lineas como contexto minimo.
-  4. Se extraen del cuerpo del issue los nombres de archivo mencionados
-     (`*.py`, `*.ts`, `*.service`, `*.timer`, `*.md`, `*.yaml`) para
-     pasarselos a Aider como argumentos posicionales.
+  4. Se calcula la lista de archivos permitidos (`extract_allowed_files`):
+     si el issue tiene una seccion `Archivos:` (una ruta por linea), se usa
+     esa lista tal cual; si no, se cae a la extraccion por mencion de
+     nombre de archivo (`*.py`, `*.ts`, `*.service`, `*.timer`, `*.md`,
+     `*.yaml`), excluyendo los que aparecen en lineas de verificacion de
+     servicios (`systemctl`, `is-active`, `docker`). Esa lista se pasa a
+     Aider como argumentos posicionales.
   5. Se arma un mensaje minimo (sin ejemplos de knowledge/) y se pasa a
-     Aider (`--message`), que edita los archivos directamente en disco sobre
-     el workspace aislado. El stdout/stderr de cada intento (con secretos
-     enmascarados) se guarda en `reports/aider-<repo>-<issue>-<intento>.log`.
-  6. Los cambios en rutas prohibidas quedan revertidos antes de comitear.
-  7. Nightwing comitea con el mensaje 'feat(nightwing): ...' y hace push
+     Aider (`--message`, stdin en `/dev/null`), que edita los archivos
+     directamente en disco sobre el workspace aislado. El stdout/stderr de
+     cada intento se escribe en vivo (no se captura en memoria) en
+     `reports/aider-<repo>-<issue>-<intento>.log`, y se enmascaran los
+     secretos al terminar el proceso (incluso si hubo timeout, queda la
+     salida parcial).
+  6. Candado: los cambios en rutas prohibidas se revierten
+     (`revert_forbidden_changes`), y cualquier archivo modificado o creado
+     que no este en la lista de archivos permitidos tambien se revierte
+     (`revert_unlisted_changes`), ambos antes de verificar o comitear.
+  7. Verificacion antes de comitear (`verify_changes`): `py_compile` sobre
+     los `.py` permitidos; si el repo es Node, `npm run build` y
+     `npm test -- --passWithNoTests --watchAll=false`; si hay archivos de
+     test entre los permitidos, se confirma que jest/vitest o pytest los
+     detecta (conteo de tests > 0). Si falla, el intento cuenta como
+     fallido (se descartan los cambios con `discard_changes`) y se reintenta.
+  8. Nightwing comitea con el mensaje 'feat(nightwing): ...' y hace push
      (contra el remoto de GitHub, no contra el directorio de produccion).
 
 Restricciones duras (no configurables):
@@ -64,10 +80,12 @@ no con un timer independiente.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -96,6 +114,11 @@ FORBIDDEN_NAME_SUBSTRINGS = (".env", "docker-compose")
 FORBIDDEN_PATH_SEGMENTS = ("nginx", "fail2ban", "cloudflared", ".cloudflared", ".ssh", "ufw")
 
 FILE_MENTION_RE = re.compile(r"(?<![\w/])[\w./\-]+\.(?:py|ts|service|timer|md|yaml)(?![\w])")
+FILES_SECTION_HEADER_RE = re.compile(r"^\s*archivos\s*:\s*$", re.IGNORECASE)
+SERVICE_CHECK_LINE_RE = re.compile(r"systemctl|is-active|docker", re.IGNORECASE)
+TEST_FILE_NAME_RE = re.compile(r"^test_.+\.py$|.+\.(?:spec|test)\.[jt]sx?$")
+NODE_TEST_COUNT_RE = re.compile(r"Tests:\s*(?:(\d+) failed,\s*)?(?:(\d+) skipped,\s*)?(\d+) passed")
+PYTEST_COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 
 log = logging.getLogger("night_agent.development")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -238,6 +261,51 @@ def extract_mentioned_files(text: str) -> list[str]:
     return seen
 
 
+def extract_allowed_files_from_section(text: str) -> list[str]:
+    """Extrae rutas de una seccion 'Archivos:' del issue (una ruta por
+    linea, relativa al repo). Si no hay tal seccion, devuelve []."""
+    collecting = False
+    files: list[str] = []
+    for line in text.splitlines():
+        if not collecting:
+            if FILES_SECTION_HEADER_RE.match(line):
+                collecting = True
+            continue
+        stripped = line.strip()
+        if not stripped:
+            break
+        if stripped.endswith(":") and "." not in stripped and "/" not in stripped:
+            break
+        cleaned = stripped.lstrip("-*• ").strip().strip("`")
+        if cleaned and cleaned not in files:
+            files.append(cleaned)
+    return files
+
+
+def extract_mentioned_files_excluding_service_lines(text: str) -> list[str]:
+    """Extraccion actual por mencion de archivo, excluyendo nombres que
+    aparecen en lineas de verificacion de servicios (systemctl, is-active,
+    docker), que suelen nombrar unidades systemd o containers y no archivos
+    a editar."""
+    service_mentions: set[str] = set()
+    for line in text.splitlines():
+        if SERVICE_CHECK_LINE_RE.search(line):
+            service_mentions.update(FILE_MENTION_RE.findall(line))
+    return [f for f in extract_mentioned_files(text) if f not in service_mentions]
+
+
+def extract_allowed_files(text: str) -> list[str]:
+    """Archivos que Aider tiene permitido tocar: SOLO los listados bajo una
+    seccion 'Archivos:' del issue si existe; si no, la extraccion por
+    mencion de nombre de archivo, excluyendo lineas de verificacion de
+    servicios. Esta lista es el candado que se aplica despues de cada
+    intento de Aider (ver `revert_unlisted_changes`)."""
+    section_files = extract_allowed_files_from_section(text)
+    if section_files:
+        return section_files
+    return extract_mentioned_files_excluding_service_lines(text)
+
+
 def build_aider_message(issue: dict, body: str, claude_md: str) -> str:
     claude_context = "\n".join(claude_md.splitlines()[:40]) if claude_md else "(sin CLAUDE.md en el repositorio)"
     return (
@@ -253,10 +321,18 @@ def build_aider_message(issue: dict, body: str, claude_md: str) -> str:
     )
 
 
-def write_aider_log(log_path: Path, stdout: str, stderr: str) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    content = f"## stdout\n{stdout}\n\n## stderr\n{stderr}\n"
+def mask_log_file(log_path: Path) -> None:
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
     log_path.write_text(mask_secrets(content), encoding="utf-8")
+
+
+def append_to_log(log_path: Path, title: str, body: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(f"\n## {title}\n{mask_secrets(body)}\n")
 
 
 def run_aider(
@@ -267,7 +343,13 @@ def run_aider(
     timeout: int,
     log_path: Path,
 ) -> bool:
-    """Ejecuta Aider sobre el repo; Aider edita los archivos directamente en disco."""
+    """Ejecuta Aider sobre el repo; Aider edita los archivos directamente en disco.
+
+    stdin va a /dev/null (Aider nunca debe quedar esperando input interactivo).
+    stdout/stderr se escriben directamente a `log_path` mientras el proceso
+    corre (no se capturan en memoria), para que un timeout deje la salida
+    parcial disponible para diagnostico; los secretos se enmascaran al final,
+    una vez el proceso termina."""
     cmd = [
         AIDER_BIN,
         "--model", model,
@@ -282,22 +364,40 @@ def run_aider(
         *files,
     ]
     env = {**os.environ, "OLLAMA_API_BASE": OLLAMA_API_BASE}
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    timed_out = False
+    returncode: Optional[int] = None
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo_path,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                timed_out = True
+    except OSError as exc:
         log.error("Fallo ejecutando aider: %s", exc)
-        write_aider_log(log_path, "", str(exc))
+        append_to_log(log_path, "error", str(exc))
+        mask_log_file(log_path)
         return False
-    write_aider_log(log_path, proc.stdout, proc.stderr)
-    if proc.returncode != 0:
-        log.error("aider devolvio codigo %s: %s", proc.returncode, mask_secrets(proc.stderr[-500:]))
+
+    mask_log_file(log_path)
+    if timed_out:
+        log.error("aider excedio el timeout de %ss", timeout)
+        append_to_log(log_path, "timeout", f"aider excedio el timeout de {timeout}s, queda la salida parcial arriba")
+        return False
+    if returncode != 0:
+        log.error("aider devolvio codigo %s (ver %s)", returncode, log_path)
         return False
     return True
 
@@ -333,6 +433,32 @@ def revert_forbidden_changes(repo_path: Path) -> list[str]:
         run_cli(["git", "clean", "-f", "--", rel_path], cwd=repo_path)
         reverted.append(rel_path)
     return reverted
+
+
+def revert_unlisted_changes(repo_path: Path, allowed_files: list[str], log_path: Path) -> list[str]:
+    """Candado: revierte (git checkout -- y git clean) cualquier archivo
+    modificado o creado que no este en `allowed_files`. Se registra en
+    `log_path` para que quede rastro de lo que Aider intento tocar de mas."""
+    allowed = {f.strip().lstrip("./") for f in allowed_files}
+    reverted: list[str] = []
+    for rel_path in changed_files(repo_path):
+        if rel_path.strip().lstrip("./") in allowed:
+            continue
+        run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
+        run_cli(["git", "clean", "-fd", "--", rel_path], cwd=repo_path)
+        reverted.append(rel_path)
+    if reverted:
+        append_to_log(log_path, "candado (fuera de la lista permitida, revertidos)", "\n".join(reverted))
+    return reverted
+
+
+def discard_changes(repo_path: Path) -> None:
+    """Descarta todos los cambios sin commitear del workspace (usado cuando
+    un intento de Aider falla la verificacion, para dejar el repo limpio
+    antes del siguiente intento)."""
+    for rel_path in changed_files(repo_path):
+        run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
+        run_cli(["git", "clean", "-fd", "--", rel_path], cwd=repo_path)
 
 
 def run_cli(cmd: list[str], cwd: Optional[Path] = None, timeout: int = 600) -> subprocess.CompletedProcess:
@@ -383,11 +509,13 @@ def setup_workspace_repo(repo_full_name: str, workspace_dir: Path, branch: str) 
         if run_cli(["git", "checkout", branch], cwd=workspace_repo_path).returncode != 0:
             run_cli(["git", "checkout", "-b", branch, f"origin/{branch}"], cwd=workspace_repo_path)
         run_cli(["git", "reset", "--hard", f"origin/{branch}"], cwd=workspace_repo_path)
+        run_cli(["git", "clean", "-fd"], cwd=workspace_repo_path)
     else:
         log.warning("%s: origin no tiene la rama '%s', se crea desde origin/main", repo_full_name, branch)
         if run_cli(["git", "checkout", "main"], cwd=workspace_repo_path).returncode != 0:
             run_cli(["git", "checkout", "-b", "main", "origin/main"], cwd=workspace_repo_path)
         run_cli(["git", "reset", "--hard", "origin/main"], cwd=workspace_repo_path)
+        run_cli(["git", "clean", "-fd"], cwd=workspace_repo_path)
         if run_cli(["git", "checkout", "-b", branch], cwd=workspace_repo_path).returncode != 0:
             log.error("%s: no se pudo crear la rama '%s' en el workspace", repo_full_name, branch)
             return None
@@ -420,6 +548,110 @@ def commit_and_push(repo_path: Path, branch: str, message: str) -> bool:
     if push.returncode != 0:
         log.error("Fallo el push a %s: %s", branch, mask_secrets(push.stderr[-500:]))
     return True
+
+
+def count_node_tests_detected(output: str) -> int:
+    match = NODE_TEST_COUNT_RE.search(output)
+    if not match:
+        return 0
+    return int(match.group(1) or 0) + int(match.group(3) or 0)
+
+
+def count_pytest_collected(output: str) -> int:
+    match = PYTEST_COLLECTED_RE.search(output)
+    return int(match.group(1)) if match else 0
+
+
+def node_has_script(repo_path: Path, script: str) -> bool:
+    package_json = repo_path / "package.json"
+    if not package_json.exists():
+        return False
+    try:
+        pkg = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return script in pkg.get("scripts", {})
+
+
+def verify_python_files(repo_path: Path, py_files: list[str]) -> list[str]:
+    """py_compile sobre los .py permitidos que Aider efectivamente dejo en disco."""
+    errors: list[str] = []
+    for rel in py_files:
+        full = repo_path / rel
+        if not full.exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(full)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"py_compile fallo ejecutando en {rel}: {exc}")
+            continue
+        if proc.returncode != 0:
+            errors.append(f"py_compile fallo en {rel}: {proc.stderr.strip()[-500:]}")
+    return errors
+
+
+def verify_node_repo(repo_path: Path, test_files: list[str]) -> list[str]:
+    """Para repos Node: build + test suite; si hay archivos de test entre los
+    permitidos, confirma que jest/vitest detecto al menos un test."""
+    errors: list[str] = []
+    if node_has_script(repo_path, "build"):
+        build = run_cli(["npm", "run", "build"], cwd=repo_path, timeout=600)
+        if build.returncode != 0:
+            errors.append(f"npm run build fallo: {mask_secrets(build.stderr[-500:])}")
+
+    if node_has_script(repo_path, "test"):
+        test = run_cli(
+            ["npm", "test", "--", "--passWithNoTests", "--watchAll=false"], cwd=repo_path, timeout=600
+        )
+        if test.returncode != 0:
+            errors.append(f"npm test fallo: {mask_secrets(test.stderr[-500:])}")
+        if test_files:
+            detected = count_node_tests_detected(test.stdout + test.stderr)
+            if detected == 0:
+                errors.append("Los archivos de test no fueron detectados por jest/vitest (0 tests encontrados)")
+    return errors
+
+
+def verify_python_test_files(repo_path: Path, test_files: list[str]) -> list[str]:
+    """Para archivos de test Python entre los permitidos, confirma que
+    pytest los detecta (conteo de tests recolectados > 0)."""
+    if not test_files:
+        return []
+    proc = run_cli(
+        ["python3", "-m", "pytest", *test_files, "--collect-only", "-q"], cwd=repo_path, timeout=120
+    )
+    detected = count_pytest_collected(proc.stdout + proc.stderr)
+    if detected == 0:
+        return ["Los archivos de test no fueron detectados por pytest (0 tests recolectados)"]
+    return []
+
+
+def verify_changes(repo_path: Path, allowed_files: list[str], log_path: Path) -> tuple[bool, str]:
+    """Verificacion antes de comitear: py_compile en los .py permitidos; si
+    el repo es Node, npm run build + npm test; y para archivos de test
+    (permitidos), confirma que el framework correspondiente los detecta.
+    Si falla, el intento cuenta como fallido y el error queda en el log."""
+    py_files = [f for f in allowed_files if f.endswith(".py")]
+    test_files = [f for f in allowed_files if TEST_FILE_NAME_RE.match(Path(f).name)]
+
+    errors = verify_python_files(repo_path, py_files)
+
+    if (repo_path / "package.json").exists():
+        node_test_files = [f for f in test_files if Path(f).suffix in (".js", ".jsx", ".ts", ".tsx")]
+        errors.extend(verify_node_repo(repo_path, node_test_files))
+    else:
+        python_test_files = [f for f in test_files if f.endswith(".py")]
+        errors.extend(verify_python_test_files(repo_path, python_test_files))
+
+    if errors:
+        append_to_log(log_path, "verificacion fallida", "\n".join(errors))
+        return False, "; ".join(errors)
+    return True, ""
 
 
 def mark_needs_review(repo_obj, issue_obj, reason: str) -> None:
@@ -458,7 +690,7 @@ def process_issue(config: dict, issue: dict) -> str:
 
     claude_md = read_claude_md_for_repo(config, issue["repo"])
     body = relativize_paths_in_body(issue["body"], config, issue["repo"])
-    files = extract_mentioned_files(body)
+    allowed_files = extract_allowed_files(body)
     message = build_aider_message(issue, body, claude_md)
 
     deadline = datetime.now() + timedelta(hours=MAX_HOURS_PER_ISSUE)
@@ -472,13 +704,27 @@ def process_issue(config: dict, issue: dict) -> str:
 
         attempts += 1
         aider_log_path = REPORTS_DIR / f"aider-{repo_short_name}-{issue['number']}-{attempts}.log"
-        if run_aider(repo_path, aider_model, message, files, aider_timeout, aider_log_path):
+        if run_aider(repo_path, aider_model, message, allowed_files, aider_timeout, aider_log_path):
             reverted = revert_forbidden_changes(repo_path)
             if reverted:
                 log.warning("%s: aider toco rutas prohibidas, revertidas: %s", tag, ", ".join(reverted))
+
+            if allowed_files:
+                unlisted = revert_unlisted_changes(repo_path, allowed_files, aider_log_path)
+                if unlisted:
+                    log.warning(
+                        "%s: aider toco archivos fuera de la lista permitida, revertidos: %s",
+                        tag, ", ".join(unlisted),
+                    )
+
             written = changed_files(repo_path)
             if written:
-                break
+                ok, error = verify_changes(repo_path, allowed_files, aider_log_path)
+                if ok:
+                    break
+                log.warning("%s: intento %d/%d fallo la verificacion: %s", tag, attempts, aider_attempts, error)
+                discard_changes(repo_path)
+                written = []
         log.warning("%s: intento %d/%d con aider sin resultado util", tag, attempts, aider_attempts)
 
     if not written:

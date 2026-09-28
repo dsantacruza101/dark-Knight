@@ -15,9 +15,9 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 
 ## Modos de Batman (`modes/`)
 
-- `modes/development.py` — modo Desarrollo: resuelve issues etiquetados `night-agent` en los repos de `config.yaml` usando `claude -p`, respetando rutas prohibidas (nunca `.env`, `docker-compose`, `nginx`, `fail2ban`, `cloudflared`, `ssh`, ni la rama `main`/`master`).
+- `modes/development.py` — modo Desarrollo: resuelve issues etiquetados `night-agent` en los repos de `config.yaml` usando Aider (`models.aider`, `ollama/qwen2.5-coder:3b`) sobre un workspace aislado, respetando rutas prohibidas (nunca `.env`, `docker-compose`, `nginx`, `fail2ban`, `cloudflared`, `ssh`, ni la rama `main`/`master`) y una lista de archivos permitidos (seccion `Archivos:` del issue, o extraccion por mencion excluyendo lineas de verificacion de servicios); antes de comitear corre `py_compile`/`npm run build`+`npm test` como verificacion.
 - `modes/post_reset.py` — modo Post-Reset: corre el lunes tras el reset semanal de tokens; usa Claude (fresco) para auditar los commits de la semana hechos con Ollama, y genera el reporte semanal.
-- `modes/monitoring.py` — modo Monitoreo: ciclo horario que analiza `access.log` de Nginx con TypeSafe (Jev: `is_attack`, `attack_type`, `severity`, `should_block`), revisa containers/RAM/disco/fail2ban, y cada 6 ciclos corre `clamscan`.
+- `modes/monitoring.py` — modo Monitoreo: ciclo horario que analiza `access.log` de Nginx con TypeSafe (Jev: `is_attack`, `attack_type`, `severity`, `should_block`), revisa containers/RAM/disco/fail2ban, y cada 6 ciclos lee el resumen del log diario de ClamAV (`/var/log/clamav-daily.log`, generado por el cron que corre como root) en vez de correr `clamscan` directamente.
 
 ## Comunicacion: `batcave/comms.json`
 
