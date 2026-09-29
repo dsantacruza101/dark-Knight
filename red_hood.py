@@ -50,10 +50,12 @@ Por repo (fuera de `--dry-run`):
      registra en memoria. Si pasa, se comitea y se pushea a `dev` (contra
      el remoto de GitHub, no contra el directorio de produccion).
   6. Reporta: issues en GitHub (labels `red-hood` + `bug`, buscando
-     duplicados primero; `night-agent` si Nightwing podria resolverlo),
-     mensajes en `batcave/comms.json` (`type: qa_finding`) y notificaciones
-     por Telegram via Alfred. Reporte consolidado en
-     `reports/red-hood-YYYY-MM-DD.md`.
+     duplicados primero -- por un marcador oculto `<!-- red-hood:<categoria>:
+     <repo> -->` embebido en el cuerpo, no por el titulo, que varia entre
+     corridas -- entre issues abiertos con label `red-hood`; `night-agent`
+     si Nightwing podria resolverlo), mensajes en `batcave/comms.json`
+     (`type: qa_finding`) y notificaciones por Telegram via Alfred. Reporte
+     consolidado en `reports/red-hood-YYYY-MM-DD.md`.
 
 Restricciones duras (no configurables):
   - Nunca comitea ni pushea a main/master.
@@ -716,31 +718,42 @@ def fallback_decision(finding: Finding) -> dict:
 # --- GitHub: issues de QA -------------------------------------------------------
 
 
+def qa_issue_marker(category: str, repo: str) -> str:
+    """Marcador oculto que identifica de forma estable un hallazgo (categoria +
+    repo local), embebido en el cuerpo del issue para deduplicar sin depender
+    del titulo (que incluye el resumen y puede variar entre corridas)."""
+    return f"<!-- red-hood:{category}:{repo} -->"
+
+
 def find_duplicate_issue(repo_obj, marker: str):
     try:
         for issue in repo_obj.get_issues(state="open", labels=["red-hood"]):
-            if marker in (issue.title or ""):
+            if marker in (issue.body or ""):
                 return issue
     except GithubException as exc:
         log.error("Error buscando issues duplicados en %s: %s", repo_obj.full_name, exc)
     return None
 
 
-def create_qa_issue(gh: Github, github_repo: str, title: str, body: str, extra_labels: list[str]) -> Optional[str]:
+def create_qa_issue(
+    gh: Github, github_repo: str, title: str, body: str, extra_labels: list[str], marker: str
+) -> Optional[str]:
     try:
         repo_obj = gh.get_repo(github_repo)
     except GithubException as exc:
         log.error("No se pudo abrir el repo de GitHub %s: %s", github_repo, exc)
         return None
 
-    existing = find_duplicate_issue(repo_obj, title)
+    existing = find_duplicate_issue(repo_obj, marker)
     if existing:
         log.info("Issue de QA duplicado ya existe en %s: #%s", github_repo, existing.number)
         return existing.html_url
 
     labels = sorted({"red-hood", "bug", *extra_labels})
+    marker_suffix = f"\n\n{marker}"
+    body_with_marker = f"{body[:4000 - len(marker_suffix)]}{marker_suffix}"
     try:
-        issue = repo_obj.create_issue(title=title, body=body[:4000], labels=labels)
+        issue = repo_obj.create_issue(title=title, body=body_with_marker, labels=labels)
         return issue.html_url
     except GithubException as exc:
         log.error("No se pudo crear issue de QA en %s: %s", github_repo, exc)
@@ -1126,7 +1139,8 @@ async def handle_finding(
         if "night-agent" in extra_labels and finding.files:
             body = f"{body}\n\nArchivos:\n" + "\n".join(finding.files)
 
-        url = create_qa_issue(gh, github_repo, title, body, extra_labels)
+        marker = qa_issue_marker(finding.category, finding.repo)
+        url = create_qa_issue(gh, github_repo, title, body, extra_labels, marker)
         if url:
             log.info("Issue de QA para %s: %s", finding.repo, url)
 

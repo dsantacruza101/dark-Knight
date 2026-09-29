@@ -80,6 +80,7 @@ no con un timer independiente.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -105,9 +106,11 @@ OLLAMA_API_BASE = "http://localhost:11434"
 DEFAULT_WORKSPACE_DIR = "~/projects/.nightwing-workspace"
 DEFAULT_AIDER_TIMEOUT = 2700
 DEFAULT_AIDER_ATTEMPTS = 2
+PER_FILE_AIDER_TIMEOUT = 900
 
 MAX_HOURS_PER_ISSUE = 3
 CLONE_TIMEOUT = 300
+NPM_CI_TIMEOUT = 300
 PROGRESS_INTERVAL = timedelta(minutes=30)
 
 FORBIDDEN_NAME_SUBSTRINGS = (".env", "docker-compose")
@@ -306,13 +309,15 @@ def extract_allowed_files(text: str) -> list[str]:
     return extract_mentioned_files_excluding_service_lines(text)
 
 
-def build_aider_message(issue: dict, body: str, claude_md: str) -> str:
+def build_aider_message(issue: dict, body: str, claude_md: str, only_file: Optional[str] = None) -> str:
     claude_context = "\n".join(claude_md.splitlines()[:40]) if claude_md else "(sin CLAUDE.md en el repositorio)"
+    focus = f"De la tarea descrita, crea o edita SOLO el archivo {only_file}.\n\n" if only_file else ""
     return (
         f"Resuelve el issue #{issue['number']} del repositorio {issue['repo']}: "
         f"{issue['title']}\n\n"
         f"{body[:3000]}\n\n"
         f"## Contexto del repositorio (CLAUDE.md)\n{claude_context}\n\n"
+        f"{focus}"
         "Reglas obligatorias:\n"
         "- Usa rutas relativas dentro del repositorio.\n"
         "- NUNCA edites ni crees archivos .env, docker-compose*, ni "
@@ -595,10 +600,32 @@ def verify_python_files(repo_path: Path, py_files: list[str]) -> list[str]:
     return errors
 
 
+def npm_ci_if_needed(repo_path: Path) -> None:
+    """Antes de verificar en repos Node, instala dependencias con `npm ci` si
+    `node_modules` no existe o si `package-lock.json` cambio desde la ultima
+    instalacion (hash guardado dentro de `node_modules`, que sobrevive al
+    `git clean -fd` de `setup_workspace_repo` por estar gitignoreado)."""
+    lockfile = repo_path / "package-lock.json"
+    node_modules = repo_path / "node_modules"
+    hash_marker = node_modules / ".night-agent-lockfile-hash"
+
+    current_hash = hashlib.sha256(lockfile.read_bytes()).hexdigest() if lockfile.exists() else None
+    previous_hash = hash_marker.read_text(encoding="utf-8").strip() if hash_marker.exists() else None
+
+    if node_modules.exists() and current_hash == previous_hash:
+        return
+
+    log.info("%s: instalando dependencias (npm ci)", repo_path.name)
+    run_cli(["npm", "ci"], cwd=repo_path, timeout=NPM_CI_TIMEOUT)
+    if current_hash is not None and node_modules.exists():
+        hash_marker.write_text(current_hash, encoding="utf-8")
+
+
 def verify_node_repo(repo_path: Path, test_files: list[str]) -> list[str]:
     """Para repos Node: build + test suite; si hay archivos de test entre los
     permitidos, confirma que jest/vitest detecto al menos un test."""
     errors: list[str] = []
+    npm_ci_if_needed(repo_path)
     if node_has_script(repo_path, "build"):
         build = run_cli(["npm", "run", "build"], cwd=repo_path, timeout=600)
         if build.returncode != 0:
@@ -703,14 +730,29 @@ def process_issue(config: dict, issue: dict) -> str:
             return msg
 
         attempts += 1
-        aider_log_path = REPORTS_DIR / f"aider-{repo_short_name}-{issue['number']}-{attempts}.log"
-        if run_aider(repo_path, aider_model, message, allowed_files, aider_timeout, aider_log_path):
+        attempt_log_path = REPORTS_DIR / f"aider-{repo_short_name}-{issue['number']}-{attempts}.log"
+
+        if len(allowed_files) > 1:
+            aider_ok = True
+            for rel_path in allowed_files:
+                file_tag = re.sub(r"[^\w.-]", "_", rel_path)
+                file_log_path = REPORTS_DIR / f"aider-{repo_short_name}-{issue['number']}-{attempts}-{file_tag}.log"
+                file_message = build_aider_message(issue, body, claude_md, only_file=rel_path)
+                if not run_aider(repo_path, aider_model, file_message, [rel_path], PER_FILE_AIDER_TIMEOUT, file_log_path):
+                    log.warning(
+                        "%s: aider fallo con el archivo %s (intento %d/%d)", tag, rel_path, attempts, aider_attempts
+                    )
+                    aider_ok = False
+        else:
+            aider_ok = run_aider(repo_path, aider_model, message, allowed_files, aider_timeout, attempt_log_path)
+
+        if aider_ok:
             reverted = revert_forbidden_changes(repo_path)
             if reverted:
                 log.warning("%s: aider toco rutas prohibidas, revertidas: %s", tag, ", ".join(reverted))
 
             if allowed_files:
-                unlisted = revert_unlisted_changes(repo_path, allowed_files, aider_log_path)
+                unlisted = revert_unlisted_changes(repo_path, allowed_files, attempt_log_path)
                 if unlisted:
                     log.warning(
                         "%s: aider toco archivos fuera de la lista permitida, revertidos: %s",
@@ -719,7 +761,7 @@ def process_issue(config: dict, issue: dict) -> str:
 
             written = changed_files(repo_path)
             if written:
-                ok, error = verify_changes(repo_path, allowed_files, aider_log_path)
+                ok, error = verify_changes(repo_path, allowed_files, attempt_log_path)
                 if ok:
                     break
                 log.warning("%s: intento %d/%d fallo la verificacion: %s", tag, attempts, aider_attempts, error)
