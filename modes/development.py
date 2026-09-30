@@ -46,13 +46,23 @@ Flujo por issue:
   6. Candado: los cambios en rutas prohibidas se revierten
      (`revert_forbidden_changes`), y cualquier archivo modificado o creado
      que no este en la lista de archivos permitidos tambien se revierte
-     (`revert_unlisted_changes`), ambos antes de verificar o comitear.
-  7. Verificacion antes de comitear (`verify_changes`): `py_compile` sobre
-     los `.py` permitidos; si el repo es Node, `npm run build` y
-     `npm test -- --passWithNoTests --watchAll=false`; si hay archivos de
-     test entre los permitidos, se confirma que jest/vitest o pytest los
-     detecta (conteo de tests > 0). Si falla, el intento cuenta como
-     fallido (se descartan los cambios con `discard_changes`) y se reintenta.
+     (`revert_unlisted_changes`); los archivos permitidos que queden vacios
+     o solo con espacios/comentarios se borran (`delete_empty_allowed_files`).
+     Este candado se aplica SIEMPRE, incluso si aider termino por timeout o
+     error, antes de verificar o comitear.
+  7. Verificacion antes de comitear (`verify_changes`): cada archivo
+     permitido debe existir, tener contenido real y pasar una validacion
+     minima segun su tipo (`validate_allowed_file_content`): `.py` debe
+     compilar con `py_compile` y tener al menos un `def`/`class`; `.service`
+     debe tener `[Unit]`/`[Service]` y `ExecStart=`; `.timer` debe tener
+     `[Timer]` y `OnCalendar=`/`OnUnitActiveSec=`; `.spec.ts`/`.test.ts`
+     debe tener `describe(`/`it(`/`test(`. Ademas, si el repo es Node,
+     `npm run build` y `npm test -- --passWithNoTests --watchAll=false`; si
+     hay archivos de test entre los permitidos, se confirma que jest/vitest
+     o pytest los detecta (conteo de tests > 0). Si falla, el intento cuenta
+     como fallido (se descartan los cambios con `discard_changes`, y el
+     motivo queda en `reports/aider-<repo>-<issue>-<intento>.log`) y se
+     reintenta.
   8. Nightwing comitea con el mensaje 'feat(nightwing): ...' y hace push
      (contra el remoto de GitHub, no contra el directorio de produccion).
 
@@ -122,6 +132,24 @@ SERVICE_CHECK_LINE_RE = re.compile(r"systemctl|is-active|docker", re.IGNORECASE)
 TEST_FILE_NAME_RE = re.compile(r"^test_.+\.py$|.+\.(?:spec|test)\.[jt]sx?$")
 NODE_TEST_COUNT_RE = re.compile(r"Tests:\s*(?:(\d+) failed,\s*)?(?:(\d+) skipped,\s*)?(\d+) passed")
 PYTEST_COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
+
+DEF_OR_CLASS_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+\w+", re.MULTILINE)
+UNIT_SECTION_RE = re.compile(r"^\s*\[(?:Unit|Service)\]\s*$", re.MULTILINE)
+EXEC_START_RE = re.compile(r"^\s*ExecStart\s*=", re.MULTILINE)
+TIMER_SECTION_RE = re.compile(r"^\s*\[Timer\]\s*$", re.MULTILINE)
+TIMER_SCHEDULE_RE = re.compile(r"^\s*(?:OnCalendar|OnUnitActiveSec)\s*=", re.MULTILINE)
+TEST_BODY_RE = re.compile(r"\b(?:describe|it|test)\s*\(")
+
+COMMENT_PREFIXES_BY_SUFFIX = {
+    ".py": ("#",),
+    ".yaml": ("#",),
+    ".yml": ("#",),
+    ".service": ("#", ";"),
+    ".timer": ("#", ";"),
+    ".ts": ("//", "/*", "*"),
+    ".js": ("//", "/*", "*"),
+    ".md": (),
+}
 
 log = logging.getLogger("night_agent.development")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -466,6 +494,81 @@ def discard_changes(repo_path: Path) -> None:
         run_cli(["git", "clean", "-fd", "--", rel_path], cwd=repo_path)
 
 
+def strip_comments_and_blank(content: str, suffix: str) -> str:
+    """Contenido 'real' de un archivo: sin lineas en blanco ni comentarios,
+    segun el juego de prefijos de comentario de su extension (fallback
+    '#', '//', ';' para extensiones no listadas)."""
+    prefixes = COMMENT_PREFIXES_BY_SUFFIX.get(suffix, ("#", "//", ";"))
+    meaningful = [
+        line.strip()
+        for line in content.splitlines()
+        if line.strip() and not line.strip().startswith(prefixes)
+    ]
+    return "\n".join(meaningful)
+
+
+def delete_empty_allowed_files(repo_path: Path, allowed_files: list[str], log_path: Path) -> list[str]:
+    """Candado (punto 3): borra los archivos permitidos que Aider haya dejado
+    vacios o solo con espacios/comentarios, para que no cuenten como cambio
+    valido (ni queden comiteados vacios si el resto del intento parece ok)."""
+    emptied: list[str] = []
+    for rel in allowed_files:
+        full = repo_path / rel
+        if not full.exists() or full.is_dir():
+            continue
+        try:
+            content = full.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if strip_comments_and_blank(content, full.suffix):
+            continue
+        full.unlink()
+        emptied.append(rel)
+    if emptied:
+        append_to_log(log_path, "candado (archivos permitidos vacios, eliminados)", "\n".join(emptied))
+    return emptied
+
+
+def validate_allowed_file_content(repo_path: Path, allowed_files: list[str]) -> list[str]:
+    """Verificacion por archivo permitido (puntos 1 y 2 antes de comitear):
+    debe existir, tener contenido real (no vacio/solo comentarios), y pasar
+    la validacion minima segun su tipo."""
+    errors: list[str] = []
+    for rel in allowed_files:
+        full = repo_path / rel
+        if not full.exists():
+            errors.append(f"{rel}: no existe tras la corrida de aider")
+            continue
+        try:
+            content = full.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"{rel}: no se pudo leer ({exc})")
+            continue
+
+        if not strip_comments_and_blank(content, full.suffix):
+            errors.append(f"{rel}: vacio o solo contiene espacios/comentarios")
+            continue
+
+        name = full.name
+        if full.suffix == ".py":
+            if not DEF_OR_CLASS_RE.search(content):
+                errors.append(f"{rel}: no contiene ninguna definicion (def/class)")
+        elif full.suffix == ".service":
+            if not UNIT_SECTION_RE.search(content):
+                errors.append(f"{rel}: falta la seccion [Unit] o [Service]")
+            elif not EXEC_START_RE.search(content):
+                errors.append(f"{rel}: falta la linea ExecStart=")
+        elif full.suffix == ".timer":
+            if not TIMER_SECTION_RE.search(content):
+                errors.append(f"{rel}: falta la seccion [Timer]")
+            elif not TIMER_SCHEDULE_RE.search(content):
+                errors.append(f"{rel}: falta OnCalendar= u OnUnitActiveSec=")
+        elif name.endswith(".spec.ts") or name.endswith(".test.ts"):
+            if not TEST_BODY_RE.search(content):
+                errors.append(f"{rel}: no contiene describe(/it(/test(")
+    return errors
+
+
 def run_cli(cmd: list[str], cwd: Optional[Path] = None, timeout: int = 600) -> subprocess.CompletedProcess:
     log.info("Ejecutando: %s (cwd=%s)", mask_secrets(" ".join(cmd)), cwd)
     try:
@@ -659,14 +762,17 @@ def verify_python_test_files(repo_path: Path, test_files: list[str]) -> list[str
 
 
 def verify_changes(repo_path: Path, allowed_files: list[str], log_path: Path) -> tuple[bool, str]:
-    """Verificacion antes de comitear: py_compile en los .py permitidos; si
+    """Verificacion antes de comitear: cada archivo permitido debe existir,
+    tener contenido real y pasar su validacion minima por tipo
+    (`validate_allowed_file_content`); py_compile en los .py permitidos; si
     el repo es Node, npm run build + npm test; y para archivos de test
     (permitidos), confirma que el framework correspondiente los detecta.
     Si falla, el intento cuenta como fallido y el error queda en el log."""
     py_files = [f for f in allowed_files if f.endswith(".py")]
     test_files = [f for f in allowed_files if TEST_FILE_NAME_RE.match(Path(f).name)]
 
-    errors = verify_python_files(repo_path, py_files)
+    errors = validate_allowed_file_content(repo_path, allowed_files)
+    errors.extend(verify_python_files(repo_path, py_files))
 
     if (repo_path / "package.json").exists():
         node_test_files = [f for f in test_files if Path(f).suffix in (".js", ".jsx", ".ts", ".tsx")]
@@ -746,27 +852,42 @@ def process_issue(config: dict, issue: dict) -> str:
         else:
             aider_ok = run_aider(repo_path, aider_model, message, allowed_files, aider_timeout, attempt_log_path)
 
-        if aider_ok:
-            reverted = revert_forbidden_changes(repo_path)
-            if reverted:
-                log.warning("%s: aider toco rutas prohibidas, revertidas: %s", tag, ", ".join(reverted))
+        # Candado: se aplica SIEMPRE, incluso si aider termino por timeout o
+        # error, para revertir rutas prohibidas/archivos fuera de la lista
+        # permitida y borrar los archivos permitidos que hayan quedado vacios.
+        reverted = revert_forbidden_changes(repo_path)
+        if reverted:
+            log.warning("%s: aider toco rutas prohibidas, revertidas: %s", tag, ", ".join(reverted))
 
-            if allowed_files:
-                unlisted = revert_unlisted_changes(repo_path, allowed_files, attempt_log_path)
-                if unlisted:
-                    log.warning(
-                        "%s: aider toco archivos fuera de la lista permitida, revertidos: %s",
-                        tag, ", ".join(unlisted),
-                    )
+        if allowed_files:
+            unlisted = revert_unlisted_changes(repo_path, allowed_files, attempt_log_path)
+            if unlisted:
+                log.warning(
+                    "%s: aider toco archivos fuera de la lista permitida, revertidos: %s",
+                    tag, ", ".join(unlisted),
+                )
+            emptied = delete_empty_allowed_files(repo_path, allowed_files, attempt_log_path)
+            if emptied:
+                log.warning("%s: archivos permitidos vacios tras aider, eliminados: %s", tag, ", ".join(emptied))
 
-            written = changed_files(repo_path)
-            if written:
-                ok, error = verify_changes(repo_path, allowed_files, attempt_log_path)
-                if ok:
-                    break
-                log.warning("%s: intento %d/%d fallo la verificacion: %s", tag, attempts, aider_attempts, error)
-                discard_changes(repo_path)
-                written = []
+        if not aider_ok:
+            append_to_log(
+                attempt_log_path,
+                "intento sin resultado util",
+                "aider termino por timeout o error; se aplico el candado y se descartan los cambios restantes",
+            )
+            discard_changes(repo_path)
+            log.warning("%s: intento %d/%d con aider sin resultado util", tag, attempts, aider_attempts)
+            continue
+
+        written = changed_files(repo_path)
+        if written:
+            ok, error = verify_changes(repo_path, allowed_files, attempt_log_path)
+            if ok:
+                break
+            log.warning("%s: intento %d/%d fallo la verificacion: %s", tag, attempts, aider_attempts, error)
+            discard_changes(repo_path)
+            written = []
         log.warning("%s: intento %d/%d con aider sin resultado util", tag, attempts, aider_attempts)
 
     if not written:
