@@ -1,0 +1,7 @@
+[Unit]
+Description=Ace Timer — corre cada hora
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+WantedBy=timers.target
