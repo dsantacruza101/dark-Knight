@@ -11,9 +11,10 @@ en `workspace_dir/<nombre-repo>`:
 
   - Si la copia no existe: `git clone` desde la URL publica
     `https://github.com/<repo_full_name>.git`; si `GITHUB_TOKEN` esta
-    definido, se autentica con un header HTTP pasado solo a ese comando
-    puntual (`git_cmd`), nunca embebido en la URL ni guardado en
-    `.git/config`.
+    definido, se autentica con un header HTTP pasado como variables de
+    entorno del subproceso (`github_auth_env()`, via `extra_env` de
+    `run_cli`), nunca como argumento de git ni embebido en la URL ni
+    guardado en `.git/config`.
   - Si ya existe: `git fetch origin` + `checkout <work_branch>` +
     `reset --hard origin/<work_branch>`.
   - Si `origin` no tiene la rama de trabajo (`github.work_branch`), se crea
@@ -223,27 +224,33 @@ def get_repo_paths(config: dict) -> dict[str, Path]:
 
 
 def build_clone_url(repo_full_name: str) -> str:
-    """URL de clone publica; nunca lleva el token embebido (ver `git_cmd`)."""
+    """URL de clone publica; nunca lleva el token embebido (ver `github_auth_env`)."""
     return f"https://github.com/{repo_full_name}.git"
 
 
-def get_github_auth_header() -> Optional[str]:
-    """Header HTTP Basic para autenticar con GITHUB_TOKEN sin guardarlo en la
-    URL remota ni en .git/config; se pasa solo al comando puntual (`git_cmd`)."""
+def github_auth_env() -> Optional[dict]:
+    """Variables de entorno para autenticar con GITHUB_TOKEN via
+    `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`, nunca como
+    argumento de git: un argumento queda en el log del comando y es visible
+    con `ps`/`/proc/<pid>/cmdline` para cualquier usuario del sistema; una
+    variable de entorno del subproceso no. Se pasa solo a `run_cli` via
+    `extra_env` para el comando puntual (clone/fetch/push), nunca se guarda
+    en la URL remota ni en `.git/config`."""
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         return None
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    return f"Authorization: Basic {basic}"
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+    }
 
 
 def git_cmd(args: list[str]) -> list[str]:
     """Antepone 'git' a un subcomando que habla con el remoto de GitHub
-    (clone/fetch/push), inyectando el header de auth de GITHUB_TOKEN solo
-    para ese comando puntual si esta definido."""
-    header = get_github_auth_header()
-    if header:
-        return ["git", "-c", f"http.extraHeader={header}", *args]
+    (clone/fetch/push). Ya no inyecta el header de auth aqui: eso viaja por
+    `github_auth_env()`, pasado como `extra_env` al llamar `run_cli`."""
     return ["git", *args]
 
 
@@ -567,10 +574,17 @@ def validate_allowed_file_content(repo_path: Path, allowed_files: list[str]) -> 
     return errors
 
 
-def run_cli(cmd: list[str], cwd: Optional[Path] = None, timeout: int = 600) -> subprocess.CompletedProcess:
+def run_cli(
+    cmd: list[str], cwd: Optional[Path] = None, timeout: int = 600, extra_env: Optional[dict] = None
+) -> subprocess.CompletedProcess:
+    """Ejecuta `cmd`. Si `extra_env` viene dado (p. ej. `github_auth_env()`),
+    se funde con `os.environ` y se pasa solo al proceso hijo: el header de
+    autenticacion nunca forma parte de `cmd`, asi que no aparece en el log
+    de abajo ni en `ps`/`/proc/<pid>/cmdline`."""
     log.info("Ejecutando: %s (cwd=%s)", mask_secrets(" ".join(cmd)), cwd)
+    env = {**os.environ, **extra_env} if extra_env else None
     try:
-        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.error("Fallo ejecutando %s: %s", mask_secrets(" ".join(cmd)), exc)
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=str(exc))
@@ -603,13 +617,15 @@ def setup_workspace_repo(repo_full_name: str, workspace_dir: Path, branch: str) 
         workspace_dir.mkdir(parents=True, exist_ok=True)
         log.info("Clonando %s -> %s (workspace aislado)", repo_full_name, workspace_repo_path)
         clone = run_cli(
-            git_cmd(["clone", build_clone_url(repo_full_name), str(workspace_repo_path)]), timeout=CLONE_TIMEOUT
+            git_cmd(["clone", build_clone_url(repo_full_name), str(workspace_repo_path)]),
+            timeout=CLONE_TIMEOUT,
+            extra_env=github_auth_env(),
         )
         if clone.returncode != 0:
             log.error("Fallo el clone de %s: %s", repo_full_name, mask_secrets(clone.stderr[-500:]))
             return None
     else:
-        run_cli(git_cmd(["fetch", "origin"]), cwd=workspace_repo_path)
+        run_cli(git_cmd(["fetch", "origin"]), cwd=workspace_repo_path, extra_env=github_auth_env())
 
     if run_cli(["git", "rev-parse", "--verify", f"origin/{branch}"], cwd=workspace_repo_path).returncode == 0:
         if run_cli(["git", "checkout", branch], cwd=workspace_repo_path).returncode != 0:
@@ -625,7 +641,7 @@ def setup_workspace_repo(repo_full_name: str, workspace_dir: Path, branch: str) 
         if run_cli(["git", "checkout", "-b", branch], cwd=workspace_repo_path).returncode != 0:
             log.error("%s: no se pudo crear la rama '%s' en el workspace", repo_full_name, branch)
             return None
-        push = run_cli(git_cmd(["push", "-u", "origin", branch]), cwd=workspace_repo_path)
+        push = run_cli(git_cmd(["push", "-u", "origin", branch]), cwd=workspace_repo_path, extra_env=github_auth_env())
         if push.returncode != 0:
             log.error(
                 "%s: fallo pusheando la nueva rama '%s': %s", repo_full_name, branch, mask_secrets(push.stderr[-500:])
@@ -650,7 +666,7 @@ def commit_and_push(repo_path: Path, branch: str, message: str) -> bool:
         return False
     run_cli(["git", "add", "-A"], cwd=repo_path)
     run_cli(["git", "commit", "-m", message], cwd=repo_path)
-    push = run_cli(git_cmd(["push", "origin", branch]), cwd=repo_path)
+    push = run_cli(git_cmd(["push", "origin", branch]), cwd=repo_path, extra_env=github_auth_env())
     if push.returncode != 0:
         log.error("Fallo el push a %s: %s", branch, mask_secrets(push.stderr[-500:]))
     return True

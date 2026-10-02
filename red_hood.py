@@ -109,6 +109,7 @@ from modes.development import (
     changed_files,
     commit_and_push,
     git_cmd,
+    github_auth_env,
     is_forbidden_path,
     read_repo_claude_md,
     repo_is_clean,
@@ -397,12 +398,16 @@ def setup_workspace_repo(prod_repo_path: Path, workspace_dir: Path) -> tuple[Opt
             return None, "main", True
         workspace_dir.mkdir(parents=True, exist_ok=True)
         log.info("Clonando %s -> %s (workspace aislado)", origin_url, workspace_repo_path)
-        clone = run_cli(git_cmd(["clone", origin_url, str(workspace_repo_path)]), timeout=CLONE_TIMEOUT)
+        clone = run_cli(
+            git_cmd(["clone", origin_url, str(workspace_repo_path)]),
+            timeout=CLONE_TIMEOUT,
+            extra_env=github_auth_env(),
+        )
         if clone.returncode != 0:
             log.error("Fallo el clone de %s: %s", origin_url, mask_secrets(clone.stderr[-500:]))
             return None, "main", True
     else:
-        run_cli(git_cmd(["fetch", "origin"]), cwd=workspace_repo_path)
+        run_cli(git_cmd(["fetch", "origin"]), cwd=workspace_repo_path, extra_env=github_auth_env())
 
     if run_cli(["git", "checkout", "dev"], cwd=workspace_repo_path).returncode == 0:
         run_cli(["git", "reset", "--hard", "origin/dev"], cwd=workspace_repo_path)
