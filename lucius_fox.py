@@ -121,6 +121,7 @@ CATALOG: list[ServiceCheck] = [
     ServiceCheck("cloudflared", "systemd", "critical", "Tunel de Cloudflare, unico acceso remoto al servidor"),
     ServiceCheck("night-agent.timer", "systemd", "high", "Timer que dispara a Batman cada noche a las 22:00"),
     ServiceCheck("red-hood.timer", "systemd", "medium", "Timer de auditoria de calidad (QA) de Red Hood, corre diario a las 02:00"),
+    ServiceCheck("ace.timer", "systemd", "medium", "Ace, health check horario de la Batifamilia"),
     ServiceCheck("webhook-portfolio", "systemd", "high", "Servidor de webhooks que dispara los deploys via Docker"),
     ServiceCheck("signal.service", "systemd", "high", "Vigilante diurno Signal, complemento de Batman en horario diurno"),
     ServiceCheck("ollama", "systemd", "medium", "Motor de IA local usado por Batman en modo Desarrollo"),
