@@ -7,3 +7,4 @@ reports/
 batcave/comms.json
 batcave/memory/
 .fail2ban_seen_ips.json
+.aider*
