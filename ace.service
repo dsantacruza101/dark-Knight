@@ -1,13 +1,11 @@
 [Unit]
 Description=Ace — Health check de todos los servicios de la Batifamilia
+After=network-online.target
 
 [Service]
 Type=oneshot
 User=dsantacruz
-WorkingDirectory=.
-ExecStart=venv/bin/python3 ace.py
+WorkingDirectory=/home/dsantacruz/projects/night-agent
+ExecStart=/home/dsantacruz/projects/night-agent/venv/bin/python3 ace.py
 EnvironmentFile=/etc/night-agent.env
 Environment=PATH=/home/dsantacruz/.nvm/versions/node/v22.23.2/bin:/usr/local/bin:/usr/bin:/bin
-
-[Install]
-WantedBy=timers.target
