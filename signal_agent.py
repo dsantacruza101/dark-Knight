@@ -299,14 +299,30 @@ def check_http_endpoints() -> tuple[list[dict], list[str]]:
                     }
                 )
             elif elapsed_ms > HTTP_SLOW_THRESHOLD_MS:
-                anomalies.append(
-                    {
-                        "type": "http_slow",
-                        "name": url,
-                        "description": f"{url} respondio lento: {elapsed_ms:.0f}ms",
-                        "details": {"status_code": resp.status_code, "response_time_ms": elapsed_ms},
-                    }
+                latencies_ms = [elapsed_ms]
+                for _ in range(2):
+                    time.sleep(5)
+                    try:
+                        retry_start = time.monotonic()
+                        requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+                        latencies_ms.append((time.monotonic() - retry_start) * 1000)
+                    except requests.RequestException:
+                        latencies_ms.append(float("inf"))
+                slow_count = sum(1 for ms in latencies_ms if ms > HTTP_SLOW_THRESHOLD_MS)
+                latencies_str = ", ".join(
+                    "timeout" if ms == float("inf") else f"{ms:.0f}ms" for ms in latencies_ms
                 )
+                if slow_count >= 2:
+                    anomalies.append(
+                        {
+                            "type": "http_slow",
+                            "name": url,
+                            "description": f"{url} respondio lento en {slow_count}/3 mediciones: {latencies_str}",
+                            "details": {"status_code": resp.status_code, "response_times_ms": latencies_ms},
+                        }
+                    )
+                else:
+                    log.info("Pico aislado de latencia en %s (no se notifica): %s", url, latencies_str)
         except requests.RequestException as exc:
             summary_lines.append(f"{url}: error ({exc})")
             anomalies.append(
