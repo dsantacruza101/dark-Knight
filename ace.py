@@ -11,6 +11,7 @@ SERVICES = {
     "Batman": "night-agent.timer",
     "Lucius": "lucius-fox.timer",
     "Signal": "signal.timer",
+    "Batwoman": "batwoman.service",
 }
 
 WAZUH_CONTAINERS = {

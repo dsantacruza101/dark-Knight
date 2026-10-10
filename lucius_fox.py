@@ -124,6 +124,7 @@ CATALOG: list[ServiceCheck] = [
     ServiceCheck("ace.timer", "systemd", "medium", "Ace, health check horario de la Batifamilia"),
     ServiceCheck("webhook-portfolio", "systemd", "high", "Servidor de webhooks que dispara los deploys via Docker"),
     ServiceCheck("signal.service", "systemd", "high", "Vigilante diurno Signal, complemento de Batman en horario diurno"),
+    ServiceCheck("batwoman.service", "systemd", "high", "Batwoman — analista de seguridad"),
     ServiceCheck("ollama", "systemd", "medium", "Motor de IA local usado por Batman en modo Desarrollo"),
     ServiceCheck("daniel-portfolio-app", "docker", "high", "Frontend del portafolio en produccion"),
     ServiceCheck("portfolioservicelauncher-client-gateway-1", "docker", "high", "API Gateway NestJS del backend"),

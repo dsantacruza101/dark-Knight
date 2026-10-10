@@ -12,6 +12,7 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 | **Alfred** | Bot de Telegram (`~/projects/telegram-bot`, `telegram-bot.service`) | Canal de comunicacion: recibe las notificaciones de Batman y Lucius, y responde preguntas usando `batcave/comms.json` como contexto. |
 | **Lucius Fox** | `lucius_fox.py` (`lucius-fox.service` + `lucius-fox.timer`, cada 30 min) | Guardian de infraestructura. Vigila servicios/containers/binarios criticos, usa TypeSafe (Jev) para decidir si auto-repararlos, y escala lo que no puede resolver. |
 | **Red Hood** | `red_hood.py` (`red-hood.service` + `red-hood.timer`, diario a las 02:00 America/El_Salvador) | QA brutal, sin piedad. Audita tests, cobertura, lint, vulnerabilidades y secretos hardcodeados en los repos locales, genera tests faltantes con Aider y reporta todo sin filtro. |
+| **Batwoman** (Kate Kane) | `batwoman.py` (`batwoman.service`, `Type=simple`, poll cada `batwoman.poll_interval` s) | Analista de seguridad. Lee las alertas de Wazuh, hace triage (allowlist, rutas criticas, nivel), las evalua con TypeSafe (Jev) y avisa a Alfred/Batman de las amenazas reales; digest diario a las 08:00. |
 
 ## Modos de Batman (`modes/`)
 
@@ -145,6 +146,45 @@ a Lucius tambien), y notifica a Alfred por Telegram. Reporte diario en
 `reports/red-hood-YYYY-MM-DD.md`. Con `--dry-run` audita igual pero no
 genera tests, no crea issues, no comitea/pushea y no envia Telegram.
 
+## Batwoman: triage de alertas de Wazuh (`batwoman.py`)
+
+Servicio de larga duracion (`batwoman.service`). Cada `batwoman.poll_interval`
+segundos (60 por defecto) lee las alertas nuevas de
+`/var/ossec/logs/alerts/alerts.json` dentro de `single-node-wazuh.manager-1`
+con `docker exec` (dsantacruz esta en el grupo docker). El progreso (offset
+en bytes, tamano e inode) vive en `batcave/memory/batwoman_state.json`; si el
+archivo se achica o cambia de inode (rotacion diaria) se relee desde 0. En el
+primer arranque empieza al final del archivo. Una alerta JSON por linea; las
+malformadas se omiten.
+
+Triage, en este orden:
+
+1. **Ruta critica** (`batwoman.critical_paths` en `config.yaml`: sudoers.d,
+   ssh, authorized_keys, los `.env` de `/etc`, cloudflared, units systemd,
+   settings de Claude): toda alerta de syscheck ahi se evalua SIEMPRE, sin
+   importar nivel ni allowlist, y nunca termina en `ignore`.
+2. **Allowlist** (`batcave/batwoman_allowlist.yaml`, se relee en cada poll):
+   `rule_id` + regex sobre `full_log`/`syscheck.path`. Hoy solo ignora la
+   regla 5402 (sudo a root) con los comandos de `sudoers.d/batifamilia`. Los
+   cambios FIM bajo `night-agent` (git pull) NO se ignoran a proposito.
+3. **Nivel**: < 7 se ignora; 7-9 va al digest; >= 10 se evalua.
+
+Evaluacion con TypeSafe (Jev): `is_real_threat` (Noul), `severity` (Score:
+info/low/medium/high/critical), `action` (Choice: notify_now/digest/ignore),
+con estado = regla, nivel, descripcion, tacticas MITRE, grupos, srcip, ruta y
+evento FIM, y un extracto enmascarado de `full_log` (max 500 chars). Fallback
+sin `TYPESAFE_API_KEY`: `notify_now` si nivel >= 12 o ruta critica, si no
+`digest`.
+
+`notify_now` → Telegram ("🦇 Batwoman ..."); severidad high/critical →
+mensaje `type: security_alert` para Batman en `batcave/comms.json`. Ambos se
+deduplican en `batcave/memory/batwoman_alert_state.json` por
+`rule_id|srcip-o-ruta` (reenvio solo tras 6h). Digest diario a
+`batwoman.digest_hour` (America/El_Salvador): conteo por nivel, top 5 reglas,
+top 5 IPs, cambios FIM; se guarda en `reports/batwoman-YYYY-MM-DD.md`.
+`--dry-run` lee las ultimas 200 alertas e imprime el triage (sin Telegram ni
+estado); `--once` hace un solo poll.
+
 ## Variables de entorno (`/etc/night-agent.env`)
 
 Nunca se edita este archivo desde el codigo (regla global: nunca tocar
@@ -161,9 +201,9 @@ Los `.service`/`.timer` viven en este repo pero se instalan a mano en
 `/etc/systemd/system/` (no se hace automaticamente desde el codigo):
 
 ```bash
-sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer red-hood.service red-hood.timer /etc/systemd/system/
+sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer red-hood.service red-hood.timer batwoman.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer
+sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer batwoman.service
 ```
 
 ## Convenciones

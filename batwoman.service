@@ -1,0 +1,17 @@
+[Unit]
+Description=Batwoman (Kate Kane) — analista de seguridad de la Batifamilia
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=dsantacruz
+WorkingDirectory=/home/dsantacruz/projects/night-agent
+ExecStart=/home/dsantacruz/projects/night-agent/venv/bin/python3 batwoman.py
+EnvironmentFile=/etc/night-agent.env
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

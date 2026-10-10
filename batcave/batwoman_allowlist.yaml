@@ -1,0 +1,28 @@
+# Allowlist de Batwoman: actividad conocida de la Batifamilia que NO debe
+# generar alertas ni contar en el digest diario.
+#
+# Cada entrada de `ignore` puede tener:
+#   rule_id:   id de la regla de Wazuh (string)
+#   full_log:  regex (re.search) contra el campo full_log de la alerta
+#   path:      regex (re.search) contra syscheck.path
+#   reason:    por que se ignora (obligatorio, para auditar el allowlist)
+# Una entrada aplica solo si TODOS sus campos presentes coinciden.
+#
+# Reglas fijas (no se pueden saltar desde aqui):
+# - Los cambios FIM bajo /home/dsantacruz/projects/night-agent (p. ej. por
+#   git pull) NO se ignoran: los cambios de codigo de los agentes deben
+#   quedar visibles. No agregar entradas de `path` para ese directorio.
+# - Las alertas sobre batwoman.critical_paths (config.yaml) se escalan
+#   SIEMPRE, aunque coincidan con una entrada de este archivo.
+#
+# Se relee en cada poll: editarlo no requiere reiniciar batwoman.service.
+
+ignore:
+  # Comandos permitidos en /etc/sudoers.d/batifamilia: Lucius Fox repara
+  # servicios con systemctl y Batman (modo Monitoreo) consulta fail2ban.
+  - rule_id: "5402"
+    full_log: 'COMMAND=(/usr)?/bin/systemctl (restart|start|enable --now) (telegram-bot|cloudflared|night-agent\.timer|red-hood\.timer|ace\.timer|lucius-fox\.timer|webhook-portfolio|signal\.service|ollama|wazuh-agent|batwoman\.service)(\.service)?\s*$'
+    reason: "Lucius Fox reparando un servicio conocido de la Batifamilia"
+  - rule_id: "5402"
+    full_log: 'COMMAND=(/usr)?/bin/fail2ban-client status( [A-Za-z0-9_-]+)?\s*$'
+    reason: "Batman (modo Monitoreo) consultando el estado de fail2ban"

@@ -53,3 +53,23 @@ red_hood:
     - ~/projects/portfolioServiceLauncher/nodeMailer-ms
     - ~/projects/telegram-bot
     - ~/projects/night-agent
+
+batwoman:
+  poll_interval: 60
+  digest_hour: 8            # America/El_Salvador
+  container: single-node-wazuh.manager-1
+  alerts_path: /var/ossec/logs/alerts/alerts.json
+  min_level: 7              # bajo esto se ignora
+  evaluate_level: 10        # desde aqui se evalua con TypeSafe
+  notify_level: 12          # fallback sin TypeSafe: notify_now desde este nivel
+  alert_cooldown_hours: 6
+  critical_paths:
+    - /etc/sudoers.d
+    - /etc/ssh
+    - /home/dsantacruz/.ssh/authorized_keys
+    - /etc/night-agent.env
+    - /etc/webhook.env
+    - /etc/telegram-bot.env
+    - /etc/cloudflared
+    - /etc/systemd/system
+    - /home/dsantacruz/.claude/settings.json
