@@ -182,6 +182,14 @@ deduplican en `batcave/memory/batwoman_alert_state.json` por
 `rule_id|srcip-o-ruta` (reenvio solo tras 6h). Digest diario a
 `batwoman.digest_hour` (America/El_Salvador): conteo por nivel, top 5 reglas,
 top 5 IPs, cambios FIM; se guarda en `reports/batwoman-YYYY-MM-DD.md`.
+
+Junto con el digest corre `sudo -n dpkg --verify` (timeout
+`batwoman.integrity_timeout`, 600s). Se ignoran conffiles (flag `c`) y todo
+bajo `/etc`; cualquier otro archivo con checksum alterado (`5` en la 3a
+columna) es critico: Telegram inmediato + mensaje `type: integrity_alert`
+(priority critical) para Batman en `comms.json`. El digest muestra los
+paquetes limpios (`instalados - con archivos alterados`) o el error si no se
+pudo verificar. Requiere `dpkg --verify` en `sudoers.d/batifamilia` (NOPASSWD).
 `--dry-run` lee las ultimas 200 alertas e imprime el triage (sin Telegram ni
 estado); `--once` hace un solo poll.
 

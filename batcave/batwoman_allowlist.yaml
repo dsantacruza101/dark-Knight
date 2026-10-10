@@ -26,3 +26,6 @@ ignore:
   - rule_id: "5402"
     full_log: 'COMMAND=(/usr)?/bin/fail2ban-client status( [A-Za-z0-9_-]+)?\s*$'
     reason: "Batman (modo Monitoreo) consultando el estado de fail2ban"
+  - rule_id: "5402"
+    full_log: 'COMMAND=(/usr)?/bin/dpkg --verify\s*$'
+    reason: "Batwoman verificando la integridad de paquetes junto con el digest diario"

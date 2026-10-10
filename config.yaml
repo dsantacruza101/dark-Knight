@@ -63,6 +63,7 @@ batwoman:
   evaluate_level: 10        # desde aqui se evalua con TypeSafe
   notify_level: 12          # fallback sin TypeSafe: notify_now desde este nivel
   alert_cooldown_hours: 6
+  integrity_timeout: 600    # segundos para sudo -n dpkg --verify (corre con el digest)
   critical_paths:
     - /etc/sudoers.d
     - /etc/ssh
