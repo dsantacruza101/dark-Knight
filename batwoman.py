@@ -40,6 +40,14 @@ envia el digest: conteo por nivel, top 5 reglas, top 5 IPs de origen y
 numero de cambios FIM; lo guarda en reports/batwoman-YYYY-MM-DD.md y lo
 reinicia.
 
+Junto con el digest corre el chequeo de integridad de paquetes:
+`sudo -n dpkg --verify` (timeout `batwoman.integrity_timeout`, 600s por
+defecto). Se ignoran los conffiles (flag `c`) y todo lo que este bajo /etc.
+Cualquier otro archivo con checksum alterado ('5' en la 3a columna) es un
+hallazgo critico: aviso inmediato a Alfred y mensaje `integrity_alert` para
+Batman en batcave/comms.json. El digest incluye el resultado (paquetes
+verificados limpios / con archivos alterados).
+
 Todo lo que se loguea, se envia por Telegram o se escribe a disco pasa por
 batcave.secrets.mask_secrets (los full_log de FIM pueden traer contenido de
 archivos sensibles).
@@ -99,6 +107,7 @@ DEFAULTS = {
     "notify_level": 12,
     "alert_cooldown_hours": 6,
     "critical_paths": [],
+    "integrity_timeout": 600,
 }
 
 # Tope de bytes leidos por poll: si Wazuh genera una rafaga enorme, el resto
@@ -108,6 +117,13 @@ DRY_RUN_TAIL_ALERTS = 200
 FULL_LOG_EXCERPT_CHARS = 500
 ALERT_STATE_RETENTION = timedelta(days=7)
 DOCKER_TIMEOUT = 30
+
+INTEGRITY_CMD = ["sudo", "-n", "dpkg", "--verify"]
+INTEGRITY_IGNORED_PREFIX = "/etc/"
+# Formato de dpkg --verify (estilo rpm): 9 caracteres de resultado ("??5??????"
+# o "missing  "), espacio, atributo ('c' = conffile o espacio), espacio, ruta.
+DPKG_VERIFY_LINE = re.compile(r"^(?P<result>.{9}) (?P<attr>[c ]) (?P<path>/.*)$")
+INTEGRITY_MAX_LISTED = 15
 
 SEVERITY_LEVELS = ["info", "low", "medium", "high", "critical"]
 COMMS_SEVERITIES = {"high", "critical"}
@@ -274,6 +290,15 @@ def update_memory(event: str, **kwargs) -> None:
                 causa=_table_cell(f"regla {kwargs['rule_id']} nivel {kwargs['level']} {kwargs.get('target', '')}".strip()),
                 solucion="notificado a Alfred" + (" y Batman" if kwargs.get("to_batman") else ""),
                 resultado=f"severidad {kwargs['severity']}",
+            )
+            memory_store.bump_stat("batwoman", "escalaciones")
+        elif event == "integrity_alert":
+            memory_store.append_error(
+                "batwoman",
+                error=f"dpkg --verify: {kwargs['count']} archivo(s) con checksum alterado",
+                causa=_table_cell(kwargs["packages"]),
+                solucion="notificado a Alfred y Batman",
+                resultado="severidad critical",
             )
             memory_store.bump_stat("batwoman", "escalaciones")
     except (OSError, ValueError) as exc:
@@ -646,6 +671,160 @@ async def act(fields: dict, decision: dict, critical: bool, config: dict, notifi
     return True
 
 
+# --- Integridad de paquetes (dpkg --verify) ---------------------------------------
+
+
+def parse_dpkg_verify(output: str) -> dict:
+    """Clasifica la salida de dpkg --verify. Solo los archivos fuera de /etc,
+    que no son conffiles y tienen checksum alterado cuentan como hallazgo."""
+    result = {"modified": [], "ignored": 0, "missing": 0, "other": 0, "unparsed": 0}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        match = DPKG_VERIFY_LINE.match(line)
+        if not match:
+            result["unparsed"] += 1
+            continue
+        path = match["path"]
+        if match["attr"] == "c" or path.startswith(INTEGRITY_IGNORED_PREFIX):
+            result["ignored"] += 1
+        elif match["result"].startswith("missing"):
+            result["missing"] += 1
+        elif match["result"][2] == "5":
+            result["modified"].append(path)
+        else:
+            result["other"] += 1
+    if result["unparsed"]:
+        log.warning("dpkg --verify: %d linea(s) con formato inesperado", result["unparsed"])
+    return result
+
+
+def run_dpkg_verify(timeout: int) -> tuple[Optional[str], Optional[str]]:
+    """Corre `sudo -n dpkg --verify`. Devuelve (salida, None) o (None, error).
+    dpkg sale con 1 cuando encuentra diferencias, eso no es un error."""
+    try:
+        proc = subprocess.run(INTEGRITY_CMD, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"timeout de {timeout}s"
+    except OSError as exc:
+        return None, str(exc)
+    if proc.returncode not in (0, 1) or (proc.returncode == 1 and not proc.stdout.strip()):
+        return None, f"exit {proc.returncode}: {proc.stderr.strip()[-300:] or 'sin stderr'}"
+    return proc.stdout, None
+
+
+def packages_owning(paths: list[str]) -> dict[str, str]:
+    """Mapea ruta -> paquete(s) duenos via `dpkg -S` (no requiere sudo)."""
+    if not paths:
+        return {}
+    try:
+        proc = subprocess.run(["dpkg", "-S", *paths], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("No se pudo resolver el paquete de los archivos alterados: %s", exc)
+        return {}
+    owners = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("diversion ") or ": " not in line:
+            continue
+        pkgs, path = line.split(": ", 1)
+        owners[path] = pkgs
+    return owners
+
+
+def installed_package_count() -> Optional[int]:
+    try:
+        proc = subprocess.run(
+            ["dpkg-query", "-W", "-f", "${db:Status-Abbrev}\n"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("No se pudo contar los paquetes instalados: %s", exc)
+        return None
+    return sum(1 for line in proc.stdout.splitlines() if line.startswith("ii"))
+
+
+async def check_package_integrity(config: dict, notifier: TelegramNotifier) -> dict:
+    """Chequeo diario de integridad. Si hay binarios/librerias alterados,
+    avisa a Alfred y deja mensaje para Batman. Devuelve el resumen para el
+    digest."""
+    timeout = int(config["integrity_timeout"])
+    log.info("Verificando integridad de paquetes (dpkg --verify, timeout %ss)", timeout)
+    output, error = await asyncio.to_thread(run_dpkg_verify, timeout)
+    if error:
+        log.error("No se pudo correr dpkg --verify: %s", error)
+        return {"ok": False, "error": error}
+
+    parsed = parse_dpkg_verify(output)
+    modified = parsed["modified"]
+    owners = await asyncio.to_thread(packages_owning, modified) if modified else {}
+    affected = {pkg.strip() for p in modified for pkg in owners.get(p, "?").split(",")}
+    installed = await asyncio.to_thread(installed_package_count)
+    summary = {
+        "ok": True,
+        "installed": installed,
+        "clean": installed - len(affected) if installed is not None else None,
+        "modified": len(modified),
+        "affected_packages": sorted(affected),
+        "ignored": parsed["ignored"],
+        "missing": parsed["missing"],
+    }
+    log.info(
+        "dpkg --verify: %d archivo(s) alterado(s), %d ignorado(s) (conffiles//etc), %d faltante(s)",
+        len(modified), parsed["ignored"], parsed["missing"],
+    )
+    if not modified:
+        return summary
+
+    listed = modified[:INTEGRITY_MAX_LISTED]
+    lines = [
+        "🦇 Batwoman — <b>CRITICO: integridad de paquetes comprometida</b>",
+        f"{_code(len(modified))} binario(s)/libreria(s) con checksum distinto al de su paquete:",
+        *[f"• {_code(p)} ({_code(owners.get(p, '?'))})" for p in listed],
+    ]
+    if len(modified) > len(listed):
+        lines.append(f"… y {len(modified) - len(listed)} mas (ver batwoman.log)")
+    await notifier.send("\n".join(lines))
+    append_comm(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "from": "batwoman",
+            "to": "batman",
+            "type": "integrity_alert",
+            "service": "dpkg",
+            "priority": "critical",
+            "message": mask_secrets(
+                f"dpkg --verify: {len(modified)} archivo(s) de paquetes con checksum alterado "
+                f"(paquetes: {', '.join(sorted(affected))})"
+            ),
+            "files": [{"path": p, "package": owners.get(p, "?")} for p in modified],
+            "read": False,
+        }
+    )
+    for path in modified:
+        log.critical("Integridad: checksum alterado en %s (paquete %s)", path, owners.get(path, "?"))
+    update_memory("integrity_alert", count=len(modified), packages=", ".join(sorted(affected)))
+    return summary
+
+
+def render_integrity(integrity: Optional[dict]) -> tuple[str, str]:
+    """Linea del digest para el chequeo de integridad: (HTML, Markdown)."""
+    if not integrity:
+        return "no se corrio", "no se corrio"
+    if not integrity["ok"]:
+        return f"⚠️ no se pudo verificar ({_code(integrity['error'])})", f"no se pudo verificar ({integrity['error']})"
+    clean = f"{integrity['clean']}/{integrity['installed']}" if integrity["clean"] is not None else "?"
+    status = "✅" if integrity["modified"] == 0 else "🚨"
+    extra = f"{integrity['ignored']} conffile(s)//etc ignorado(s), {integrity['missing']} faltante(s)"
+    if integrity["modified"]:
+        extra = (
+            f"{integrity['modified']} archivo(s) alterado(s) en "
+            f"{', '.join(integrity['affected_packages'])}; " + extra
+        )
+    return (
+        f"{status} {_code(clean)} paquete(s) limpios — {html.escape(extra)}",
+        f"{status} {clean} paquete(s) limpios — {extra}",
+    )
+
+
 # --- Digest diario ----------------------------------------------------------------
 
 
@@ -679,6 +858,8 @@ def render_digest(digest: dict) -> tuple[str, str]:
     msg.append("<b>Top IPs de origen:</b>")
     msg += [f"• {_code(ip)} — {n}" for ip, n in top_ips] or ["• ninguna"]
     msg.append(f"<b>Cambios FIM:</b> {_code(digest['fim_changes'])}")
+    integrity_html, integrity_md = render_integrity(digest.get("integrity"))
+    msg.append(f"<b>Integridad de paquetes:</b> {integrity_html}")
 
     md = [
         f"# Digest de seguridad (Batwoman) - {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d')}",
@@ -688,6 +869,7 @@ def render_digest(digest: dict) -> tuple[str, str]:
         f"- Notificadas a Alfred/Batman: {digest['notified']}",
         f"- Ignoradas por allowlist: {digest['allowlisted']}",
         f"- Cambios FIM: {digest['fim_changes']}",
+        f"- Integridad de paquetes (dpkg --verify): {integrity_md}",
         "",
         "## Conteo por nivel",
         "| Nivel | Alertas |",
@@ -720,7 +902,12 @@ def digest_due(state: dict, config: dict) -> bool:
     return now.hour >= int(config["digest_hour"]) and state["last_digest_date"] != now.date().isoformat()
 
 
-async def send_digest(state: dict, notifier: TelegramNotifier) -> None:
+async def send_digest(state: dict, config: dict, notifier: TelegramNotifier) -> None:
+    try:
+        state["digest"]["integrity"] = await check_package_integrity(config, notifier)
+    except Exception as exc:  # noqa: BLE001 - el digest sale aunque falle el chequeo
+        log.exception("Fallo el chequeo de integridad de paquetes")
+        state["digest"]["integrity"] = {"ok": False, "error": str(exc)[:300]}
     message, report = render_digest(state["digest"])
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_path = REPORTS_DIR / f"batwoman-{datetime.now(LOCAL_TZ).strftime('%Y-%m-%d')}.md"
@@ -806,7 +993,7 @@ async def poll(config: dict, client: Optional[AsyncTypeSafeClient], notifier: Te
         log.info("Poll: %d alerta(s) nuevas (%s)", len(alerts), dict(counts))
 
     if digest_due(state, config):
-        await send_digest(state, notifier)
+        await send_digest(state, config, notifier)
 
     write_state(state)
     update_memory("cycle_complete")
