@@ -130,6 +130,10 @@ CATALOG: list[ServiceCheck] = [
     ServiceCheck("portfolioservicelauncher-nodemailer-micro-service-1", "docker", "high", "Microservicio de envio de correo"),
     ServiceCheck("portfolioservicelauncher-nats-server-1", "docker", "high", "Broker NATS (TLS) del backend de microservicios"),
     ServiceCheck("sonarqube", "docker", "medium", "Analisis estatico de codigo, no forma parte del trafico de produccion"),
+    ServiceCheck("single-node-wazuh.manager-1", "docker", "high", "Wazuh manager — motor de deteccion"),
+    ServiceCheck("single-node-wazuh.indexer-1", "docker", "high", "Wazuh indexer — base de datos de alertas"),
+    ServiceCheck("single-node-wazuh.dashboard-1", "docker", "medium", "Wazuh dashboard"),
+    ServiceCheck("wazuh-agent", "systemd", "high", "Agente Wazuh del host"),
     ServiceCheck("claude", "binary", "critical", "Binario de Claude Code usado por Batman para resolver issues"),
 ]
 

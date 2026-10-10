@@ -13,6 +13,12 @@ SERVICES = {
     "Signal": "signal.timer",
 }
 
+WAZUH_CONTAINERS = {
+    "single-node-wazuh.manager-1",
+    "single-node-wazuh.indexer-1",
+    "single-node-wazuh.dashboard-1",
+}
+
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess | None:
     try:
@@ -35,6 +41,15 @@ def main() -> None:
     r = run(["docker", "ps", "--format", "{{.Names}}"])
     count = len(r.stdout.split()) if r and r.returncode == 0 else 0
     lines.append(line(count > 0, f"{count} containers corriendo"))
+
+    r = run(["docker", "ps", "--filter", "name=single-node-wazuh", "--format", "{{.Names}}"])
+    running = set(r.stdout.split()) if r and r.returncode == 0 else set()
+    wazuh = len(WAZUH_CONTAINERS & running)
+    lines.append(line(wazuh == len(WAZUH_CONTAINERS), f"Wazuh — {wazuh}/{len(WAZUH_CONTAINERS)} contenedores"))
+
+    r = run(["systemctl", "is-active", "wazuh-agent"])
+    state = r.stdout.strip() if r else "sin respuesta"
+    lines.append(line(state == "active", f"Agente Wazuh — {state}"))
 
     r = run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "localhost:11434"])
     ollama_ok = bool(r) and r.stdout == "200"
