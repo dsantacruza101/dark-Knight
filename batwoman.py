@@ -45,8 +45,10 @@ Junto con el digest corre el chequeo de integridad de paquetes:
 defecto). Se ignoran los conffiles (flag `c`) y todo lo que este bajo /etc.
 Cualquier otro archivo con checksum alterado ('5' en la 3a columna) es un
 hallazgo critico: aviso inmediato a Alfred y mensaje `integrity_alert` para
-Batman en batcave/comms.json. El digest incluye el resultado (paquetes
-verificados limpios / con archivos alterados).
+Batman en batcave/comms.json, salvo las rutas absolutas exactas listadas en
+`integrity_paths` del allowlist (nunca por paquete), que se cuentan aparte
+como esperadas. El digest incluye el resultado (paquetes verificados limpios
+/ con archivos alterados / esperados).
 
 Todo lo que se loguea, se envia por Telegram o se escribe a disco pasa por
 batcave.secrets.mask_secrets (los full_log de FIM pueden traer contenido de
@@ -407,16 +409,23 @@ def fetch_new_alerts(config: dict, state: dict) -> tuple[list[dict], dict]:
 # --- Triage -------------------------------------------------------------------
 
 
-def load_allowlist() -> list[dict]:
-    """Lee y compila el allowlist. Se llama en cada poll para que editarlo
-    no requiera reiniciar el servicio."""
+def _read_allowlist_file() -> dict:
     try:
         with open(ALLOWLIST_PATH, "r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError) as exc:
         log.error("No se pudo leer %s: %s", ALLOWLIST_PATH, exc)
-        return []
+        return {}
+    if not isinstance(raw, dict):
+        log.error("%s no es un mapa YAML, se ignora", ALLOWLIST_PATH)
+        return {}
+    return raw
 
+
+def load_allowlist() -> list[dict]:
+    """Lee y compila el allowlist. Se llama en cada poll para que editarlo
+    no requiera reiniciar el servicio."""
+    raw = _read_allowlist_file()
     entries = []
     for entry in raw.get("ignore") or []:
         try:
@@ -431,6 +440,19 @@ def load_allowlist() -> list[dict]:
         except (re.error, TypeError, AttributeError) as exc:
             log.error("Entrada invalida en el allowlist (%s): %s", exc, entry)
     return entries
+
+
+def load_integrity_allowlist() -> set[str]:
+    """Rutas absolutas exactas (`integrity_paths`) cuyo checksum alterado en
+    dpkg --verify es esperado. Nunca se acepta un paquete entero ni prefijos:
+    solo rutas absolutas normalizadas, comparadas por igualdad."""
+    paths = set()
+    for entry in _read_allowlist_file().get("integrity_paths") or []:
+        if not isinstance(entry, str) or not os.path.isabs(entry) or os.path.normpath(entry) != entry:
+            log.error("Entrada invalida en integrity_paths (debe ser una ruta absoluta exacta): %r", entry)
+            continue
+        paths.add(entry)
+    return paths
 
 
 def alert_fields(alert: dict) -> dict:
@@ -674,10 +696,12 @@ async def act(fields: dict, decision: dict, critical: bool, config: dict, notifi
 # --- Integridad de paquetes (dpkg --verify) ---------------------------------------
 
 
-def parse_dpkg_verify(output: str) -> dict:
+def parse_dpkg_verify(output: str, expected_paths: set[str]) -> dict:
     """Clasifica la salida de dpkg --verify. Solo los archivos fuera de /etc,
-    que no son conffiles y tienen checksum alterado cuentan como hallazgo."""
-    result = {"modified": [], "ignored": 0, "missing": 0, "other": 0, "unparsed": 0}
+    que no son conffiles y tienen checksum alterado cuentan como hallazgo;
+    los de `expected_paths` (integrity_paths del allowlist) se cuentan aparte
+    como esperados."""
+    result = {"modified": [], "expected": [], "ignored": 0, "missing": 0, "other": 0, "unparsed": 0}
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -691,7 +715,7 @@ def parse_dpkg_verify(output: str) -> dict:
         elif match["result"].startswith("missing"):
             result["missing"] += 1
         elif match["result"][2] == "5":
-            result["modified"].append(path)
+            result["expected" if path in expected_paths else "modified"].append(path)
         else:
             result["other"] += 1
     if result["unparsed"]:
@@ -753,8 +777,10 @@ async def check_package_integrity(config: dict, notifier: TelegramNotifier) -> d
         log.error("No se pudo correr dpkg --verify: %s", error)
         return {"ok": False, "error": error}
 
-    parsed = parse_dpkg_verify(output)
+    parsed = parse_dpkg_verify(output, load_integrity_allowlist())
     modified = parsed["modified"]
+    for path in parsed["expected"]:
+        log.info("Integridad: checksum alterado esperado en %s (integrity_paths)", path)
     owners = await asyncio.to_thread(packages_owning, modified) if modified else {}
     affected = {pkg.strip() for p in modified for pkg in owners.get(p, "?").split(",")}
     installed = await asyncio.to_thread(installed_package_count)
@@ -764,12 +790,13 @@ async def check_package_integrity(config: dict, notifier: TelegramNotifier) -> d
         "clean": installed - len(affected) if installed is not None else None,
         "modified": len(modified),
         "affected_packages": sorted(affected),
+        "expected": len(parsed["expected"]),
         "ignored": parsed["ignored"],
         "missing": parsed["missing"],
     }
     log.info(
-        "dpkg --verify: %d archivo(s) alterado(s), %d ignorado(s) (conffiles//etc), %d faltante(s)",
-        len(modified), parsed["ignored"], parsed["missing"],
+        "dpkg --verify: %d archivo(s) alterado(s), %d esperado(s), %d ignorado(s) (conffiles//etc), %d faltante(s)",
+        len(modified), len(parsed["expected"]), parsed["ignored"], parsed["missing"],
     )
     if not modified:
         return summary
@@ -813,7 +840,10 @@ def render_integrity(integrity: Optional[dict]) -> tuple[str, str]:
         return f"⚠️ no se pudo verificar ({_code(integrity['error'])})", f"no se pudo verificar ({integrity['error']})"
     clean = f"{integrity['clean']}/{integrity['installed']}" if integrity["clean"] is not None else "?"
     status = "✅" if integrity["modified"] == 0 else "🚨"
-    extra = f"{integrity['ignored']} conffile(s)//etc ignorado(s), {integrity['missing']} faltante(s)"
+    extra = (
+        f"{integrity.get('expected', 0)} esperado(s) (integrity_paths), "
+        f"{integrity['ignored']} conffile(s)//etc ignorado(s), {integrity['missing']} faltante(s)"
+    )
     if integrity["modified"]:
         extra = (
             f"{integrity['modified']} archivo(s) alterado(s) en "

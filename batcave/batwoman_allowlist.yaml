@@ -29,3 +29,16 @@ ignore:
   - rule_id: "5402"
     full_log: 'COMMAND=(/usr)?/bin/dpkg --verify\s*$'
     reason: "Batwoman verificando la integridad de paquetes junto con el digest diario"
+
+# Allowlist de integridad (dpkg --verify, chequeo diario junto al digest).
+# Rutas ABSOLUTAS EXACTAS (comparacion por igualdad, sin regex ni prefijos)
+# cuyo checksum alterado es esperado: se excluyen de los hallazgos criticos
+# pero se cuentan aparte como "esperados" en el digest.
+# Nunca se allowlistea por nombre de paquete: cada archivo se justifica solo.
+integrity_paths:
+  # Editado por nosotros: configuracion del agente de Wazuh (manager, FIM).
+  - /var/ossec/etc/ossec.conf
+  # Generado al registrar el agente contra el manager (id + llave).
+  - /var/ossec/etc/client.keys
+  # Se ajusta a la zona horaria del sistema durante la instalacion.
+  - /var/ossec/etc/localtime
