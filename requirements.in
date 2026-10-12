@@ -8,3 +8,4 @@ python-telegram-bot # telegram
 PyYAML              # yaml
 requests            # requests
 typesafe-sdk        # typesafe_sdk
+pip-audit
