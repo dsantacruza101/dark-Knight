@@ -6,7 +6,8 @@ Post-Reset o Monitoreo), lo ejecuta y reporta el resultado a Telegram
 via el bot Alfred.
 
 Con `--dry-run` solo se imprime el modo que se seleccionaria y (en modo
-Desarrollo) los issues que se encontraron, sin clonar nada, sin ejecutar
+Desarrollo) los issues que se encontraron y a que especialista se
+enrutaria cada uno, sin clonar nada, sin ejecutar
 Aider/claude y sin enviar Telegram.
 """
 
@@ -28,7 +29,18 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
 from batcave import memory_store
-from modes.development import get_github_client, get_open_issues, run_development_mode
+from modes.development import (
+    build_specialist_preamble,
+    default_specialist_name,
+    get_github_client,
+    get_open_issues,
+    load_env,
+    load_specialists,
+    route_issue,
+    run_development_mode,
+    select_knowledge_notes,
+    specialist_display,
+)
 from modes.monitoring import run_monitor_mode
 from modes.post_reset import run_post_reset_mode
 
@@ -37,6 +49,9 @@ CONFIG_PATH = BASE_DIR / "config.yaml"
 LOG_PATH = BASE_DIR / "night_agent.log"
 
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+# Ver `format_result_line` en modes/development.py.
+RESULT_WHO_RE = re.compile(r"especialista: ([^,]+), resuelto por: ([\w-]+)")
 
 MODE_LABELS = {
     "dev": "🦇 Batman — Modo Desarrollo activo",
@@ -119,16 +134,19 @@ def update_batman_memory(mode: str, context: Any, report_body: str) -> None:
             for issue in context or []:
                 tag = f"{issue['repo']}#{issue['number']}"
                 if f"✅ {tag}" in report_body:
+                    line = next((ln for ln in report_body.splitlines() if f"✅ {tag}" in ln), "")
+                    who = RESULT_WHO_RE.search(line)
+                    especialista, solver = (who.group(1), who.group(2)) if who else ("Nightwing", "aider-qwen")
                     memory_store.append_success(
                         "batman",
-                        problema=f"Issue {tag}: {issue['title']}",
-                        como_se_resolvio="Resuelto por Nightwing (Aider) en modo Desarrollo y pusheado a dev",
+                        problema=memory_store.table_cell(f"Issue {tag}: {issue['title']}"),
+                        como_se_resolvio=f"Resuelto por {especialista} ({solver}) en modo Desarrollo y pusheado a dev",
                     )
                 else:
                     memory_store.append_error(
                         "batman",
-                        error=f"Issue {tag}: {issue['title']}",
-                        causa="aider no genero cambios o fallo al resolverlo",
+                        error=memory_store.table_cell(f"Issue {tag}: {issue['title']}"),
+                        causa="ni aider ni la escalacion a Claude lo resolvieron",
                         solucion="ninguna, requiere revision manual",
                         resultado="sin resolver",
                     )
@@ -168,13 +186,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def print_dry_run(config: dict, started_at: datetime) -> None:
+    load_env()
     mode, context = determine_mode(config, started_at)
     print(f"[dry-run] Modo que se seleccionaria: {mode} ({MODE_LABELS[mode]})")
     if mode == "dev":
         issues = context or []
-        print(f"[dry-run] {len(issues)} issue(s) con label '{config['github']['issue_label']}' encontrados:")
+        issue_label = config["github"]["issue_label"]
+        specialists = load_specialists(config)
+        default_name = default_specialist_name(config, specialists)
+        print(f"[dry-run] Especialistas cargados: {', '.join(specialists)} (default: {default_name})")
+        max_escalations = config.get("development", {}).get("max_claude_escalations", 2)
+        print(f"[dry-run] Escalaciones a Claude permitidas esta noche: {max_escalations}")
+        print(f"[dry-run] {len(issues)} issue(s) con label '{issue_label}' encontrados:")
         for issue in issues:
+            name, reason = route_issue(issue, specialists, default_name, issue_label)
+            profile = specialists[name]
+            notes = select_knowledge_notes(config, name, f"{issue['title']}\n{issue['body']}")
             print(f"[dry-run]   - {issue['repo']}#{issue['number']}: {issue['title']} ({issue['url']})")
+            print(f"[dry-run]       labels: {', '.join(issue.get('labels', [])) or '-'}")
+            print(f"[dry-run]       -> {specialist_display(profile)} [{name}] ({reason})")
+            print(
+                f"[dry-run]       preambulo: {len(build_specialist_preamble(profile).splitlines())} lineas; "
+                f"notas: {', '.join(stem for stem, _ in notes) or 'ninguna'}"
+            )
     else:
         print("[dry-run] Sin issues pendientes; no se clona nada ni se ejecuta Aider/claude.")
 

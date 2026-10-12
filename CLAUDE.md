@@ -13,12 +13,126 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 | **Lucius Fox** | `lucius_fox.py` (`lucius-fox.service` + `lucius-fox.timer`, cada 30 min) | Guardian de infraestructura. Vigila servicios/containers/binarios criticos, usa TypeSafe (Jev) para decidir si auto-repararlos, y escala lo que no puede resolver. |
 | **Red Hood** | `red_hood.py` (`red-hood.service` + `red-hood.timer`, diario a las 02:00 America/El_Salvador) | QA brutal, sin piedad. Audita tests, cobertura, lint, vulnerabilidades y secretos hardcodeados en los repos locales, genera tests faltantes con Aider y reporta todo sin filtro. |
 | **Batwoman** (Kate Kane) | `batwoman.py` (`batwoman.service`, `Type=simple`, poll cada `batwoman.poll_interval` s) | Analista de seguridad. Lee las alertas de Wazuh, hace triage (allowlist, rutas criticas, nivel), las evalua con TypeSafe (Jev) y avisa a Alfred/Batman de las amenazas reales; digest diario a las 08:00. |
+| **Radar** | `batcave/radar.py` (`radar-nightwing.timer` diario 07:00, `radar-nightwing-weekly.timer` lunes 01:00) | Radar tecnologico por especialista: inventario de dependencias, vulnerabilidades (OSV) y ultimas versiones; abre issues de parches para que el especialista los aplique de noche. |
 
 ## Modos de Batman (`modes/`)
 
-- `modes/development.py` — modo Desarrollo: resuelve issues etiquetados `night-agent` en los repos de `config.yaml` usando Aider (`models.aider`, `ollama/qwen2.5-coder:3b`) sobre un workspace aislado, respetando rutas prohibidas (nunca `.env`, `docker-compose`, `nginx`, `fail2ban`, `cloudflared`, `ssh`, ni la rama `main`/`master`) y una lista de archivos permitidos (seccion `Archivos:` del issue, o extraccion por mencion excluyendo lineas de verificacion de servicios); antes de comitear corre `py_compile`/`npm run build`+`npm test` como verificacion.
+- `modes/development.py` — modo Desarrollo: resuelve issues etiquetados `night-agent` en los repos de `config.yaml` usando Aider (`models.aider`, `ollama/qwen2.5-coder:3b`) sobre un workspace aislado, respetando rutas prohibidas (nunca `.env`, `docker-compose`, `nginx`, `fail2ban`, `cloudflared`, `ssh`, ni la rama `main`/`master`) y una lista de archivos permitidos (seccion `Archivos:` del issue, o extraccion por mencion excluyendo lineas de verificacion de servicios). Cada issue lo trabaja un especialista (ver "Equipo de desarrollo" abajo), cuyo perfil define la verificacion antes de comitear; si Aider falla, escala una vez a Claude.
 - `modes/post_reset.py` — modo Post-Reset: corre el lunes tras el reset semanal de tokens; usa Claude (fresco) para auditar los commits de la semana hechos con Ollama, y genera el reporte semanal.
 - `modes/monitoring.py` — modo Monitoreo: ciclo horario que analiza `access.log` de Nginx con TypeSafe (Jev: `is_attack`, `attack_type`, `severity`, `should_block`), revisa containers/RAM/disco/fail2ban, y cada 6 ciclos lee el resumen del log diario de ClamAV (`/var/log/clamav-daily.log`, generado por el cron que corre como root) en vez de correr `clamscan` directamente.
+
+## Equipo de desarrollo: especialistas (`batcave/specialists/`)
+
+Cada especialista del modo Desarrollo es un perfil YAML en
+`batcave/specialists/` (esquema en `batcave/specialists/README.md`; agregar a
+Batgirl, Red Robin, Robin o Spoiler = agregar su YAML, sin tocar codigo).
+Hoy existe **Nightwing** (`nightwing.yaml`): backend (`label: backend`),
+TypeScript/JavaScript/Python/Java, NestJS, Express, FastAPI, Spring Boot,
+TypeORM/Prisma, NATS; dueño de `dsantacruz-client-gateway`,
+`NodeMailer_MicroService`, `telegram-bot` y `dark-Knight`.
+
+Flujo por issue en `modes/development.py`:
+
+1. **Enrutamiento**: el issue va al especialista cuyo `label` de perfil este
+   en el issue (ademas de `night-agent`). Sin label de especialidad va a
+   `specialists.default` (Nightwing), compatible con los issues viejos. Si
+   el repo no esta en `repos` del especialista solo se loguea.
+2. **Contexto**: al mensaje de Aider se le antepone un preambulo del perfil
+   (rol, stack, convenciones; max 25 lineas) y hasta 3 notas de
+   `batcave/knowledge/<especialista>/*.md` cuyas palabras clave (nombre de
+   archivo + linea `keywords:` opcional) aparecen en el issue (max 60 lineas
+   en total). El CLAUDE.md nunca se incluye (Aider agrega al chat todo
+   archivo mencionado).
+3. **Verificacion**: los pasos de `verification` del perfil para cada stack
+   detectado (Nightwing: Node -> `npm ci` si hace falta, `npm run build`,
+   `npm run lint --if-present`, `CI=true npm test -- --passWithNoTests
+   --watchAll=false`; Python -> `py_compile` de los cambiados + `pytest -q`
+   si hay `tests/`; Spring Boot -> `./mvnw -q test` si hay `mvnw`), mas la
+   validacion por archivo permitido de siempre.
+4. **Escalacion qwen -> Claude**: si los `development.aider_attempts`
+   intentos fallan, se llama UNA vez a `claude -p --permission-mode
+   acceptEdits` (prompt por stdin) en el mismo workspace con el issue, el
+   preambulo, los archivos permitidos, su contenido actual y las ultimas 80
+   lineas del ultimo error de verificacion. Despues se aplica el mismo
+   candado (revertir prohibidos y no listados) y la misma verificacion. Max
+   `development.max_claude_escalations` por noche (2), timeout
+   `development.claude_timeout` (acotado por el limite de 3h por issue); log
+   en `reports/claude-<repo>-<issue>.log`. Si Claude no esta, no hay
+   archivos permitidos, se agoto el cupo o tambien falla -> `needs-review`.
+5. **Registro**: quien resolvio (`aider-qwen`, `claude-escalation`, `none`)
+   queda en `reports/development-YYYY-MM-DD.md` (resumen + tabla), en el
+   progreso de Telegram, en el commit (`feat(<especialista>): ...` +
+   `Resuelto por: ...`) y en `batcave/memory/<especialista>.md` (se crea con
+   la plantilla si no existe).
+
+`python3 night_agent.py --dry-run` muestra a que especialista iria cada
+issue abierto y que notas de conocimiento se usarian.
+
+## Radar tecnologico (`batcave/radar.py`)
+
+`python3 -m batcave.radar --specialist <nombre> [--dry-run] [--weekly]`
+(con el venv). Sirve para cualquier perfil de `batcave/specialists/`; hoy
+solo Nightwing tiene timers. Config en `config.yaml` (`radar:`).
+
+- **Inventario**: por cada repo de `repos` del perfil, copia de SOLO
+  LECTURA en `radar.workspace_dir/<repo>` (`~/projects/.radar-workspace`):
+  `clone` o `fetch` + `reset --hard origin/dev` (si no hay `dev`,
+  `main`/`master`). Se niega a correr si el workspace se cruza con un
+  directorio de produccion (`repo_paths`, `red_hood.local_repos`). Auth de
+  git con `github_auth_env()` (header por entorno). Nunca comitea ni pushea.
+  Directas: `package.json` (version instalada de `package-lock.json`; si no
+  hay lock, la base del rango), `requirements.in` si existe (paquetes
+  realmente importados; la version sale del pin de `requirements.txt` /
+  `requirements*.lock`) o si no `requirements.txt`, `requirements-dev.txt`
+  (dev), `pyproject.toml` (PEP 621 + Poetry) y `pom.xml` (con
+  `${propiedades}`). Transitivas: el resto de `package-lock.json` (anidadas
+  incluidas), de `requirements.txt` (pip freeze) y de `requirements*.lock`.
+  `devDependencies`, extras opcionales y scope `test` cuentan como dev. Sin
+  version fija no se consulta. Vulnerabilidades se revisan en TODAS;
+  `outdated_*` solo en directas. Cada hallazgo indica `directa`/`transitiva`.
+- **Chequeo diario (sin tokens de Claude)**: OSV `querybatch` + `/vulns/{id}`
+  (npm, PyPI, Maven; los alias PYSEC/GHSA se deduplican; severidad de
+  `database_specific.severity` o calculada del vector CVSS v3), y ultima
+  version en npm registry / PyPI JSON / Maven Central. Clasificacion:
+  `security_patch` (todos los fixes en el mismo major; en 0.x el minor
+  cuenta como major), `security_major` (algun fix exige otro major o no hay
+  fix), `outdated_major`, `outdated_minor`.
+- **Issues** (dedup por marcador oculto `<!-- radar:<repo>:<paquete>:<advisories> -->`
+  en issues abiertos; mismo repo+paquete = se actualiza titulo/cuerpo/labels):
+  - `security_patch` → labels `night-agent` + label del especialista +
+    `dependencies`, con advisories, version actual/objetivo, comando exacto
+    (`npm install pkg@x.y.z`, `--save-dev` si es dev) y seccion `Archivos:`
+    (`package.json`, `package-lock.json` / manifiesto Python / `pom.xml`).
+    Batman lo enruta al especialista esa noche (modo Desarrollo, rama `dev`).
+  - `security_major` → `needs-human` + label del especialista +
+    `dependencies` (nunca `night-agent`; si un issue cambia de categoria se
+    quita el label opuesto). Si existe la nota semanal del paquete, se
+    incluye en el cuerpo.
+  - Los labels faltantes se crean en el repo.
+- **Telegram** ("📡 Radar de <Especialista>", HTML escapado): inmediato solo
+  para advisories `radar.alert_severities` (CRITICAL/HIGH) en dependencias
+  de produccion, una vez por advisory. Todo lo demas va al resumen semanal.
+- **Modo semanal** (`--weekly`, lunes 01:00 tras el reset del domingo
+  23:00): repite el chequeo y, para hasta `radar.max_weekly_summaries` (5)
+  paquetes `security_major`/`outdated_major` sin nota previa, baja las
+  release notes de GitHub (repo resuelto desde la metadata de npm/PyPI;
+  fallback `CHANGELOG.md`) y llama `claude -p` (solo `Read,Grep,Glob`;
+  `Bash/Edit/Write` prohibidos; timeout `radar.claude_timeout`) con los
+  usos del paquete en nuestro codigo. Guarda la nota en
+  `batcave/knowledge/<especialista>/<paquete>-<version>.md` (con linea
+  `keywords:`, asi el modo Desarrollo la usa). Luego envia el resumen
+  semanal: vulnerabilidades nuevas/corregidas (7 dias), majors pendientes,
+  notas nuevas.
+- **Estado**: `batcave/memory/radar_<especialista>_state.json` (advisories
+  vistos, alertas enviadas, eventos `found`/`fixed`; un advisory solo pasa a
+  `fixed` si su repo se inventario bien ese dia). Reporte en
+  `reports/radar-<especialista>-YYYY-MM-DD[-semanal].md`, log en `radar.log`
+  (secretos enmascarados con `batcave/secrets.py`).
+- `--dry-run`: sincroniza el workspace e imprime inventario por repo y
+  hallazgos clasificados; sin issues, Telegram, Claude ni estado. Con
+  `--weekly` muestra que notas se pedirian y el tamano de sus release notes.
+- **Otro especialista**: copiar `radar-nightwing*.service/.timer` cambiando
+  `--specialist`, y agregar los timers al `CATALOG` de Lucius.
 
 ## Comunicacion: `batcave/comms.json`
 
@@ -78,7 +192,8 @@ reparar ni alertar) mientras esten en mantenimiento:
 Catalogo de `ServiceCheck` (`kind` → chequeo/reparacion):
 
 - **systemd**: `telegram-bot`, `cloudflared`, `night-agent.timer`,
-  `webhook-portfolio`, `ollama` → `systemctl is-active` / `systemctl restart`
+  `webhook-portfolio`, `ollama`, `radar-nightwing.timer` y
+  `radar-nightwing-weekly.timer` (medium) → `systemctl is-active` / `systemctl restart`
   (para `*.timer`, `systemctl enable --now` en vez de solo `restart`, para
   que la reparacion sobreviva reinicios del servidor).
 - **docker**: `daniel-portfolio-app`, `portfolioservicelauncher-client-gateway-1`,
@@ -187,8 +302,12 @@ Junto con el digest corre `sudo -n dpkg --verify` (timeout
 `batwoman.integrity_timeout`, 600s). Se ignoran conffiles (flag `c`) y todo
 bajo `/etc`; cualquier otro archivo con checksum alterado (`5` en la 3a
 columna) es critico: Telegram inmediato + mensaje `type: integrity_alert`
-(priority critical) para Batman en `comms.json`. El digest muestra los
-paquetes limpios (`instalados - con archivos alterados`) o el error si no se
+(priority critical) para Batman en `comms.json`. Excepcion: las rutas
+absolutas exactas de `integrity_paths` en `batcave/batwoman_allowlist.yaml`
+(hoy `ossec.conf`, `client.keys` y `localtime` de `/var/ossec/etc`) no son
+hallazgo critico y se cuentan aparte como "esperados"; nunca se allowlistea
+por nombre de paquete. El digest muestra los paquetes limpios
+(`instalados - con archivos alterados`), los esperados, o el error si no se
 pudo verificar. Requiere `dpkg --verify` en `sudoers.d/batifamilia` (NOPASSWD).
 `--dry-run` lee las ultimas 200 alertas e imprime el triage (sin Telegram ni
 estado); `--once` hace un solo poll.
@@ -209,9 +328,11 @@ Los `.service`/`.timer` viven en este repo pero se instalan a mano en
 `/etc/systemd/system/` (no se hace automaticamente desde el codigo):
 
 ```bash
-sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer red-hood.service red-hood.timer batwoman.service /etc/systemd/system/
+sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer red-hood.service red-hood.timer batwoman.service \
+  radar-nightwing.service radar-nightwing.timer radar-nightwing-weekly.service radar-nightwing-weekly.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer batwoman.service
+sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer batwoman.service \
+  radar-nightwing.timer radar-nightwing-weekly.timer
 ```
 
 ## Convenciones

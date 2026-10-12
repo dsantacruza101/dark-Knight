@@ -23,8 +23,52 @@ STATS_LABELS = {
 }
 
 
+MEMORY_TEMPLATE = """# {display_name} — Memoria Individual
+
+## Identidad
+- Rol: {rol}
+- Activo desde: {since}
+- Última actividad: —
+
+## Errores registrados
+| Fecha | Error | Causa | Solución aplicada | Resultado |
+|---|---|---|---|---|
+
+## Correcciones exitosas
+| Fecha | Problema | Cómo se resolvió |
+|---|---|---|
+
+## Aprendizajes
+- Lista de patrones aprendidos con el tiempo
+
+## Estadísticas
+- Total de ciclos ejecutados: 0
+- Errores encontrados: 0
+- Auto-reparaciones exitosas: 0
+- Escalaciones a Alfred: 0
+"""
+
+
 def _memory_path(agent: str) -> Path:
     return MEMORY_DIR / f"{agent}.md"
+
+
+def ensure_memory_file(agent: str, display_name: str, rol: str) -> None:
+    """Crea batcave/memory/<agente>.md con la plantilla estandar si no existe
+    (para especialistas nuevos agregados solo con su YAML)."""
+    path = _memory_path(agent)
+    if path.exists():
+        return
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        MEMORY_TEMPLATE.format(display_name=display_name, rol=rol, since=datetime.now().strftime("%Y-%m-%d")),
+        encoding="utf-8",
+    )
+
+
+def table_cell(text: str) -> str:
+    """Escapa texto libre (titulos de issue, errores) para una celda de tabla Markdown."""
+    return " ".join(text.split()).replace("|", "\\|")
 
 
 def _read(agent: str) -> str:

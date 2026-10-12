@@ -1,0 +1,10 @@
+# Dependencias directas: solo los paquetes que el codigo importa.
+# requirements.txt es el pip freeze completo (pines exactos + transitivas).
+PyGithub            # github
+packaging           # packaging
+psutil              # psutil
+python-dotenv       # dotenv
+python-telegram-bot # telegram
+PyYAML              # yaml
+requests            # requests
+typesafe-sdk        # typesafe_sdk

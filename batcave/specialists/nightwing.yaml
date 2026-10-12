@@ -1,0 +1,54 @@
+# Nightwing (Dick Grayson) — especialista backend del modo Desarrollo.
+# Esquema documentado en batcave/specialists/README.md.
+
+name: nightwing
+display_name: Nightwing
+emoji: "🐦"
+role: backend
+label: backend
+# Recibe los issues que solo tienen `night-agent` (sin label de especialidad).
+default: true
+
+languages: [TypeScript, JavaScript, Python, Java]
+frameworks: [NestJS, Node.js+Express, FastAPI, Spring Boot]
+orms: [TypeORM, Prisma]
+messaging: [NATS]
+
+# Nombres de repo en GitHub (sin el owner).
+repos:
+  - dsantacruz-client-gateway
+  - NodeMailer_MicroService
+  - telegram-bot
+  - dark-Knight
+
+conventions:
+  - "Conventional commits (feat/fix/chore/ci/test/refactor)."
+  - "TypeScript estricto: nunca `any`; tipa parametros, retornos y DTOs."
+  - "NestJS: un modulo por feature; DTOs con decoradores de class-validator."
+  - "Nunca tocar .env, docker-compose ni archivos de infraestructura (nginx, fail2ban, cloudflared, ssh, systemd)."
+
+# Verificacion por stack. Se corren todos los stacks cuyo `detect` coincida
+# con algun archivo en la raiz del repo, en el orden listado.
+verification:
+  node:
+    detect: [package.json]
+    steps:
+      - builtin: npm_ci_if_needed
+      - cmd: npm run build
+        when: script:build
+      - cmd: npm run lint --if-present
+      - cmd: CI=true npm test -- --passWithNoTests --watchAll=false
+        when: script:test
+        counts_tests: node
+  python:
+    detect: [requirements.txt, pyproject.toml, setup.py]
+    steps:
+      - builtin: py_compile_changed
+      - cmd: python3 -m pytest -q
+        when: exists:tests
+  spring:
+    detect: [mvnw, pom.xml]
+    steps:
+      - cmd: ./mvnw -q test
+        when: exists:mvnw
+        timeout: 1200

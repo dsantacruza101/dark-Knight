@@ -37,6 +37,25 @@ development:
   workspace_dir: ~/projects/.nightwing-workspace
   aider_timeout: 2700
   aider_attempts: 3
+  max_claude_escalations: 2   # escalaciones qwen -> Claude por noche
+  claude_timeout: 1800        # segundos por escalacion (acotado por el limite de 3h por issue)
+
+# Equipo de desarrollo: perfiles en specialists.dir (esquema en su README.md).
+# Un issue va al especialista cuyo label tenga; sin label de especialidad, al default.
+specialists:
+  dir: batcave/specialists
+  knowledge_dir: batcave/knowledge   # notas por especialista: <knowledge_dir>/<nombre>/*.md
+  default: nightwing
+
+# Radar tecnologico (batcave/radar.py): inventario de dependencias, OSV y
+# ultimas versiones por especialista. Workspace de solo lectura, nunca produccion.
+radar:
+  workspace_dir: ~/projects/.radar-workspace
+  github_owner: dsantacruza101     # owner para repos de un perfil que no esten en github.repos
+  http_timeout: 15                 # segundos por llamada HTTP (OSV, npm, PyPI, Maven, GitHub)
+  alert_severities: [CRITICAL, HIGH]   # Telegram inmediato solo para estas, en dependencias de produccion
+  max_weekly_summaries: 5          # notas de Claude por semana (protege el presupuesto semanal)
+  claude_timeout: 600              # segundos por nota en modo --weekly
 
 knowledge_base:
   path: ~/projects/night-agent/knowledge

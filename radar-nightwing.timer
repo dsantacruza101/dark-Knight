@@ -1,0 +1,9 @@
+[Unit]
+Description=Radar de Nightwing — chequeo diario a las 7 AM
+
+[Timer]
+OnCalendar=*-*-* 07:00:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target
