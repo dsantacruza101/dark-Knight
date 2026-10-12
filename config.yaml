@@ -93,3 +93,16 @@ batwoman:
     - /etc/cloudflared
     - /etc/systemd/system
     - /home/dsantacruz/.claude/settings.json
+  # Conexiones salientes (batcave/egress.py). Linea base por
+  # (proceso o container, ASN destino, puerto destino), nunca por IP.
+  egress:
+    enabled: true
+    interval: 60                # segundos entre snapshots (ss + conntrack)
+    learning_days: 7            # desde el primer ciclo: solo aprende, nunca alerta
+    safe_ports: [80, 443, 53, 853, 22, 7844]   # fallback sin TypeSafe: fuera de estos -> notify_now
+    asn_cache_days: 7           # TTL de batcave/memory/egress_asn_cache.json (Team Cymru + rDNS)
+    docker_refresh: 600         # segundos entre `docker network inspect` (IP -> container)
+    dns_timeout: 3              # segundos por consulta DNS
+    command_timeout: 20         # segundos por ss / conntrack / docker
+    max_lookups_per_cycle: 50   # IPs nuevas resueltas por ciclo (el resto en el siguiente)
+    max_evaluations_per_cycle: 10   # destinos nuevos evaluados por ciclo (el resto en el siguiente)

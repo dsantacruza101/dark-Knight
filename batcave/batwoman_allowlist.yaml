@@ -29,6 +29,9 @@ ignore:
   - rule_id: "5402"
     full_log: 'COMMAND=(/usr)?/bin/dpkg --verify\s*$'
     reason: "Batwoman verificando la integridad de paquetes junto con el digest diario"
+  - rule_id: "5402"
+    full_log: 'COMMAND=(/usr)?/s?bin/(ss -tnpH state established|conntrack -L -p tcp -o extended)\s*$'
+    reason: "Batwoman tomando el snapshot de conexiones salientes (egress)"
 
 # Allowlist de integridad (dpkg --verify, chequeo diario junto al digest).
 # Rutas ABSOLUTAS EXACTAS (comparacion por igualdad, sin regex ni prefijos)
@@ -42,3 +45,25 @@ integrity_paths:
   - /var/ossec/etc/client.keys
   # Se ajusta a la zona horaria del sistema durante la instalacion.
   - /var/ossec/etc/localtime
+
+# Allowlist de egress (conexiones salientes, batcave/egress.py).
+# `org` se compara como substring (sin distinguir mayusculas) contra el
+# nombre de organizacion del ASN destino que devuelve Team Cymru
+# (p. ej. "CLOUDFLARENET - Cloudflare, Inc., US"). Un destino nuevo de una de
+# estas organizaciones entra directo a la linea base, sin evaluacion ni
+# alerta. Se relee en cada ciclo de egress.
+egress_orgs:
+  - org: "Cloudflare"
+    reason: "Cloudflare Tunnel (cloudflared, puerto 7844) y CDN de muchos registros"
+  - org: "GitHub"
+    reason: "git fetch/push, API de issues, release notes del radar"
+  - org: "Telegram"
+    reason: "Alfred y las notificaciones de la Batifamilia"
+  - org: "Anthropic"
+    reason: "Claude Code (escalaciones, post-reset, radar semanal)"
+  - org: "Fastly"
+    reason: "CDN de PyPI y del registry de npm"
+  - org: "Canonical"
+    reason: "Repositorios apt y servicios de Ubuntu"
+  - org: "Docker"
+    reason: "Docker Hub (pull de imagenes)"

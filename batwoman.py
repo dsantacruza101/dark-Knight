@@ -50,14 +50,26 @@ Batman en batcave/comms.json, salvo las rutas absolutas exactas listadas en
 como esperadas. El digest incluye el resultado (paquetes verificados limpios
 / con archivos alterados / esperados).
 
+Cada `batwoman.egress.interval` segundos corre ademas el monitoreo de
+conexiones salientes (batcave/egress.py): linea base por (proceso o
+container, ASN destino, puerto destino), aprendizaje los primeros
+`egress.learning_days` dias y evaluacion con TypeSafe de los destinos
+nuevos (is_suspicious/severity/action notify_now|digest|learn). Las
+organizaciones de `egress_orgs` del allowlist van directo a la linea base.
+Las notificaciones usan la misma deduplicacion que las alertas de Wazuh y
+el digest incluye una seccion Egress.
+
 Todo lo que se loguea, se envia por Telegram o se escribe a disco pasa por
 batcave.secrets.mask_secrets (los full_log de FIM pueden traer contenido de
 archivos sensibles).
 
 Flags:
-  --dry-run  lee las ultimas 200 alertas e imprime las decisiones de
-             triage; sin Telegram ni cambios de estado.
-  --once     un solo poll (con efectos normales) y termina.
+  --dry-run          lee las ultimas 200 alertas e imprime las decisiones de
+                     triage; sin Telegram ni cambios de estado.
+  --once             un solo poll (y un ciclo de egress) con efectos normales
+                     y termina.
+  --egress-snapshot  imprime las conexiones salientes actuales clasificadas
+                     (new/known/allowlisted); sin alertas ni guardar nada.
 """
 
 from __future__ import annotations
@@ -71,6 +83,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -84,7 +97,7 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 
-from batcave import memory_store
+from batcave import egress, memory_store
 from batcave.secrets import mask_secrets
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -237,6 +250,7 @@ def empty_digest() -> dict:
         "fim_changes": 0,
         "notified": 0,
         "allowlisted": 0,
+        "egress_new": [],
     }
 
 
@@ -301,6 +315,15 @@ def update_memory(event: str, **kwargs) -> None:
                 causa=_table_cell(kwargs["packages"]),
                 solucion="notificado a Alfred y Batman",
                 resultado="severidad critical",
+            )
+            memory_store.bump_stat("batwoman", "escalaciones")
+        elif event == "egress_alert":
+            memory_store.append_error(
+                "batwoman",
+                error=_table_cell(f"conexion saliente nueva: {kwargs['description']}"),
+                causa=_table_cell(f"IP {kwargs['ip']}"),
+                solucion="notificado a Alfred" + (" y Batman" if kwargs.get("to_batman") else ""),
+                resultado=f"severidad {kwargs['severity']}",
             )
             memory_store.bump_stat("batwoman", "escalaciones")
     except (OSError, ValueError) as exc:
@@ -693,7 +716,80 @@ async def act(fields: dict, decision: dict, critical: bool, config: dict, notifi
     return True
 
 
-# --- Integridad de paquetes (dpkg --verify) ---------------------------------------
+# --- Conexiones salientes (batcave/egress.py) ------------------------------------------
+
+
+async def act_egress(item: dict, config: dict, notifier: TelegramNotifier) -> bool:
+    """Notifica un destino saliente nuevo (notify_now -> Alfred, severidad
+    high/critical -> Batman), con la misma deduplicacion que las alertas."""
+    decision = item["decision"]
+    to_alfred = decision["action"] == "notify_now"
+    to_batman = decision["severity"] in COMMS_SEVERITIES
+    if not (to_alfred or to_batman):
+        return False
+
+    key = f"egress|{item['key']}"
+    cooldown = timedelta(hours=config["alert_cooldown_hours"])
+    if not should_send_alert(key, cooldown):
+        log.info("Destino saliente %s ya notificado hace menos de %s, no se reenvia", item["key"], cooldown)
+        return False
+
+    if to_alfred:
+        await notifier.send(egress.build_alert_message(item))
+    if to_batman:
+        append_comm(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "from": "batwoman",
+                "to": "batman",
+                "type": "egress_alert",
+                "service": item["source"],
+                "priority": decision["severity"],
+                "message": mask_secrets(
+                    f"Conexion saliente nueva: {egress.describe(item)} (IP {item['ip']}"
+                    + (f", {item['rdns']}" if item["rdns"] else "")
+                    + f"); origen en la linea base: {item['source_age']}"
+                ),
+                "is_suspicious": round(decision["is_suspicious"], 2),
+                "read": False,
+            }
+        )
+    record_alert(key)
+    log.warning(
+        "Egress notificado: %s severidad %s%s", egress.describe(item), decision["severity"], " + Batman" if to_batman else ""
+    )
+    update_memory(
+        "egress_alert",
+        description=egress.describe(item),
+        ip=item["ip"],
+        severity=decision["severity"],
+        to_batman=to_batman,
+    )
+    return True
+
+
+async def egress_poll(
+    monitor: egress.EgressMonitor, config: dict, client: Optional[AsyncTypeSafeClient], notifier: TelegramNotifier
+) -> None:
+    """Un ciclo de egress: snapshot, linea base, evaluacion, notificacion y
+    registro en el digest (en batwoman_state.json)."""
+    evaluated = await monitor.run_cycle(client)
+    if not evaluated:
+        return
+    state = read_state()
+    for item in evaluated:
+        try:
+            if await act_egress(item, config, notifier) and state is not None:
+                state["digest"]["notified"] += 1
+        except Exception:  # noqa: BLE001 - un destino raro no debe bloquear el resto
+            log.exception("Fallo notificando el destino saliente %s", item["key"])
+        if state is not None:
+            egress.add_to_digest(state["digest"].setdefault("egress_new", []), item)
+    if state is not None:
+        write_state(state)
+
+
+# --- Integridad de paquetes (dpkg --verify)---------------------------------------
 
 
 def parse_dpkg_verify(output: str, expected_paths: set[str]) -> dict:
@@ -869,7 +965,7 @@ def add_to_digest(digest: dict, fields: dict) -> None:
         digest["fim_changes"] += 1
 
 
-def render_digest(digest: dict) -> tuple[str, str]:
+def render_digest(digest: dict, config: dict) -> tuple[str, str]:
     """Devuelve (mensaje HTML para Telegram, reporte Markdown)."""
     total = sum(digest["by_level"].values())
     by_level = sorted(digest["by_level"].items(), key=lambda kv: -int(kv[0]))
@@ -890,6 +986,16 @@ def render_digest(digest: dict) -> tuple[str, str]:
     msg.append(f"<b>Cambios FIM:</b> {_code(digest['fim_changes'])}")
     integrity_html, integrity_md = render_integrity(digest.get("integrity"))
     msg.append(f"<b>Integridad de paquetes:</b> {integrity_html}")
+    egress_html, egress_md = [], []
+    ecfg = egress.load_config(config)
+    if ecfg["enabled"]:
+        try:
+            egress_html, egress_md = egress.render_digest_section(digest.get("egress_new") or [], digest["since"], ecfg)
+        except Exception as exc:  # noqa: BLE001 - el digest sale aunque falle la seccion Egress
+            log.exception("Fallo la seccion Egress del digest")
+            egress_html = [f"<b>Egress:</b> ⚠️ no se pudo generar ({_code(str(exc)[:200])})"]
+            egress_md = ["## Egress (conexiones salientes)", "", f"- No se pudo generar: {str(exc)[:200]}", ""]
+    msg += egress_html
 
     md = [
         f"# Digest de seguridad (Batwoman) - {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d')}",
@@ -916,6 +1022,7 @@ def render_digest(digest: dict) -> tuple[str, str]:
         "|---|---|",
         *[f"| {ip} | {n} |" for ip, n in top_ips],
         "",
+        *egress_md,
     ]
     return "\n".join(msg), mask_secrets("\n".join(md))
 
@@ -938,7 +1045,7 @@ async def send_digest(state: dict, config: dict, notifier: TelegramNotifier) -> 
     except Exception as exc:  # noqa: BLE001 - el digest sale aunque falle el chequeo
         log.exception("Fallo el chequeo de integridad de paquetes")
         state["digest"]["integrity"] = {"ok": False, "error": str(exc)[:300]}
-    message, report = render_digest(state["digest"])
+    message, report = render_digest(state["digest"], config)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_path = REPORTS_DIR / f"batwoman-{datetime.now(LOCAL_TZ).strftime('%Y-%m-%d')}.md"
     report_path.write_text(report, encoding="utf-8")
@@ -1060,6 +1167,10 @@ async def dry_run(config: dict, client: Optional[AsyncTypeSafeClient]) -> None:
 
 
 async def run(config: dict, args: argparse.Namespace) -> None:
+    if args.egress_snapshot:
+        await egress.print_snapshot(egress.load_config(config))
+        return
+
     typesafe_available = bool(os.environ.get("TYPESAFE_API_KEY"))
     if not typesafe_available:
         log.warning("TYPESAFE_API_KEY no esta definida, Batwoman opera en modo fallback (sin Jev)")
@@ -1075,15 +1186,31 @@ async def run(config: dict, args: argparse.Namespace) -> None:
                 "🦇 Batwoman: <code>TYPESAFE_API_KEY</code> no esta definida. "
                 "Triage de alertas en modo fallback, sin TypeSafe/Jev."
             )
-        log.info("Batwoman en guardia: poll cada %ss sobre %s", config["poll_interval"], config["container"])
+        ecfg = egress.load_config(config)
+        monitor = egress.EgressMonitor(ecfg) if ecfg["enabled"] else None
+        log.info(
+            "Batwoman en guardia: poll cada %ss sobre %s; egress %s",
+            config["poll_interval"], config["container"],
+            f"cada {ecfg['interval']}s" if monitor else "desactivado",
+        )
+        next_poll = next_egress = time.monotonic()
         while True:
-            try:
-                await poll(config, client, notifier)
-            except Exception:  # noqa: BLE001 - un poll fallido no debe tumbar el servicio
-                log.exception("Fallo el poll de Batwoman, se reintenta en el proximo ciclo")
+            if time.monotonic() >= next_poll:
+                next_poll = time.monotonic() + config["poll_interval"]
+                try:
+                    await poll(config, client, notifier)
+                except Exception:  # noqa: BLE001 - un poll fallido no debe tumbar el servicio
+                    log.exception("Fallo el poll de Batwoman, se reintenta en el proximo ciclo")
+            if monitor and time.monotonic() >= next_egress:
+                next_egress = time.monotonic() + ecfg["interval"]
+                try:
+                    await egress_poll(monitor, config, client, notifier)
+                except Exception:  # noqa: BLE001 - un ciclo de egress fallido no debe tumbar el servicio
+                    log.exception("Fallo el ciclo de egress, se reintenta en el proximo")
             if args.once:
                 return
-            await asyncio.sleep(config["poll_interval"])
+            wake = min(next_poll, next_egress) if monitor else next_poll
+            await asyncio.sleep(max(1.0, wake - time.monotonic()))
 
     if typesafe_available:
         async with AsyncTypeSafeClient() as client:
@@ -1095,7 +1222,11 @@ async def run(config: dict, args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batwoman: triage de alertas de Wazuh")
     parser.add_argument("--dry-run", action="store_true", help="ultimas 200 alertas, sin Telegram ni estado")
-    parser.add_argument("--once", action="store_true", help="un solo poll y termina")
+    parser.add_argument("--once", action="store_true", help="un solo poll (y un ciclo de egress) y termina")
+    parser.add_argument(
+        "--egress-snapshot", action="store_true",
+        help="imprime las conexiones salientes actuales clasificadas, sin alertar ni guardar",
+    )
     return parser.parse_args()
 
 

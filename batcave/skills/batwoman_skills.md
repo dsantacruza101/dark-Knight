@@ -20,5 +20,16 @@
 - Severidad high/critical → mensaje `security_alert` para Batman en `batcave/comms.json`.
 - Dedup en `batcave/memory/batwoman_alert_state.json` por `rule_id|srcip-o-ruta`: se reenvia solo tras 6h.
 
+## Conexiones salientes (egress, `batcave/egress.py`)
+- Cada `batwoman.egress.interval` s (60). Host: `sudo -n ss -tnpH state established` (proceso; se descartan las entrantes, puerto local en `ss -tlnH`). Containers: `sudo -n conntrack -L -p tcp -o extended` (direccion original src/dst/dport, solo ESTABLISHED); IP de origen -> container via `docker network inspect` (cache 10 min).
+- Solo destinos publicos (`is_global`, fuera de subredes Docker): sin loopback, RFC1918, link-local, CGNAT.
+- Identidad: ASN + organizacion por DNS de Team Cymru (TXT `<ip-invertida>.origin.asn.cymru.com` / `origin6` en IPv6, y `AS<n>.asn.cymru.com`) + reverse DNS solo para mostrar. Cache `batcave/memory/egress_asn_cache.json` (TTL 7 dias). Cliente DNS propio (stdlib, resolver de `/etc/resolv.conf`).
+- Llave de linea base: `(proceso o docker:<container>, ASN, puerto)`, nunca la IP. `batcave/memory/egress_baseline.json` (`started_at` + `keys` con first_seen/last_seen/count/origin).
+- Aprendizaje `egress.learning_days` (7) desde el primer ciclo: todo se registra, nada alerta.
+- Despues: llave nunca vista = destino nuevo. Organizacion en `egress_orgs` del allowlist (substring del nombre) → directo a la linea base. Si no, TypeSafe: `is_suspicious` (Noul), `severity` (Score), `action` (Choice: notify_now/digest/learn). Fallback: `notify_now` si el puerto no esta en `egress.safe_ports` (80/443/53/853/22/7844) o el origen no existe en la linea base; si no `digest`. Toda llave evaluada entra a la linea base (alerta una sola vez).
+- Notificacion igual que Wazuh: `notify_now` → Telegram; high/critical → `egress_alert` para Batman en `comms.json`; dedup `egress|<llave>` en `batwoman_alert_state.json`.
+- Topes por ciclo: `max_lookups_per_cycle` IPs nuevas, `max_evaluations_per_cycle` evaluaciones; el resto en el siguiente ciclo.
+- `--egress-snapshot`: imprime `origen -> org [ASN] :puerto  IP (rDNS)` con estado new/known/allowlisted; no alerta ni guarda (ni cache).
+
 ## Digest diario
-- A `batwoman.digest_hour` (America/El_Salvador): conteo por nivel, top 5 reglas, top 5 IPs, cambios FIM. Se envia a Alfred, se guarda en `reports/batwoman-YYYY-MM-DD.md` y se reinicia.
+- A `batwoman.digest_hour` (America/El_Salvador): conteo por nivel, top 5 reglas, top 5 IPs, cambios FIM, integridad de paquetes y seccion **Egress** (progreso del aprendizaje o destinos nuevos desde el ultimo digest, top 5 procesos/containers por destinos distintos ASN+puerto). Se envia a Alfred, se guarda en `reports/batwoman-YYYY-MM-DD.md` y se reinicia.

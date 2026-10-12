@@ -310,7 +310,50 @@ por nombre de paquete. El digest muestra los paquetes limpios
 (`instalados - con archivos alterados`), los esperados, o el error si no se
 pudo verificar. Requiere `dpkg --verify` en `sudoers.d/batifamilia` (NOPASSWD).
 `--dry-run` lee las ultimas 200 alertas e imprime el triage (sin Telegram ni
-estado); `--once` hace un solo poll.
+estado); `--once` hace un solo poll (y un ciclo de egress).
+
+### Egress: conexiones salientes (`batcave/egress.py`)
+
+El mismo ciclo principal corre, cada `batwoman.egress.interval` segundos (60),
+un snapshot de conexiones TCP establecidas hacia IPs publicas (`is_global`,
+fuera de las subredes de Docker):
+
+- **Host**: `sudo -n ss -tnpH state established` → proceso, local, remoto.
+  Se descartan las entrantes (puerto local en escucha segun `ss -tlnH`).
+- **Containers**: `sudo -n conntrack -L -p tcp -o extended` → direccion
+  original (src/dst/dport) de las ESTABLISHED cuyo src esta en una subred de
+  Docker; la IP se mapea al container (`docker:<nombre>`) con
+  `docker network inspect` (cache 10 min, refresco forzado si aparece una IP
+  desconocida).
+- **Identidad**: ASN y organizacion via DNS de Team Cymru (TXT a
+  `<ip-invertida>.origin.asn.cymru.com` / `origin6` y `AS<n>.asn.cymru.com`,
+  cliente DNS propio con stdlib) + reverse DNS solo para mostrar. Cache en
+  `batcave/memory/egress_asn_cache.json` (TTL `egress.asn_cache_days`, 7).
+- **Linea base** (`batcave/memory/egress_baseline.json`): llave
+  `(proceso o container, ASN, puerto)`, nunca la IP; `first_seen`,
+  `last_seen`, `count`, `origin` (learning/allowlist/evaluated). Durante
+  `egress.learning_days` (7) desde el primer ciclo solo se aprende.
+- **Destino nuevo** (llave nunca vista, ya fuera de aprendizaje): si la
+  organizacion coincide (substring) con `egress_orgs` del allowlist
+  (Cloudflare, GitHub, Telegram, Anthropic, Fastly, Canonical, Docker) entra
+  directo a la linea base. Si no, TypeSafe (Jev): `is_suspicious` (Noul),
+  `severity` (Score), `action` (Choice: notify_now/digest/learn), con
+  origen, ASN/org, rDNS, puerto y antiguedad del origen en la linea base.
+  Fallback: `notify_now` si el puerto no esta en `egress.safe_ports`
+  (80/443/53/853/22/7844) o el origen no existe en la linea base; si no
+  `digest`. Toda llave evaluada se agrega a la linea base (alerta una vez).
+  Notificacion y dedup como las alertas de Wazuh (llave `egress|...`;
+  high/critical → `type: egress_alert` para Batman en `comms.json`).
+  Topes por ciclo: `max_lookups_per_cycle`, `max_evaluations_per_cycle`.
+- **Digest**: seccion Egress (progreso del aprendizaje o destinos nuevos
+  desde el ultimo digest + top 5 origenes por destinos distintos).
+- `python3 batwoman.py --egress-snapshot` imprime las conexiones actuales
+  clasificadas (`origen -> org [ASN] :puerto`, new/known/allowlisted) sin
+  alertar ni guardar nada.
+- Requiere en `sudoers.d/batifamilia` (NOPASSWD) exactamente
+  `/usr/bin/ss -tnpH state established` y
+  `/usr/sbin/conntrack -L -p tcp -o extended` (allowlisteados para la regla
+  5402 en `batwoman_allowlist.yaml`).
 
 ## Variables de entorno (`/etc/night-agent.env`)
 
