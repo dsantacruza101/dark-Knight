@@ -30,8 +30,8 @@ ignore:
     full_log: 'COMMAND=(/usr)?/bin/dpkg --verify\s*$'
     reason: "Batwoman verificando la integridad de paquetes junto con el digest diario"
   - rule_id: "5402"
-    full_log: 'COMMAND=(/usr)?/s?bin/(ss -tnpH state established|conntrack -L -p tcp -o extended)\s*$'
-    reason: "Batwoman tomando el snapshot de conexiones salientes (egress)"
+    full_log: 'COMMAND=(/usr)?/s?bin/(ss -tunpH state established|ss -uanpH|conntrack -L -o extended|conntrack -E -e NEW -o timestamp,extended)\s*$'
+    reason: "Batwoman monitoreando conexiones salientes (egress: stream de conntrack, snapshot y atribucion con ss)"
 
 # Allowlist de integridad (dpkg --verify, chequeo diario junto al digest).
 # Rutas ABSOLUTAS EXACTAS (comparacion por igualdad, sin regex ni prefijos)
@@ -49,12 +49,34 @@ integrity_paths:
 # Allowlist de egress (conexiones salientes, batcave/egress.py).
 # `org` se compara como substring (sin distinguir mayusculas) contra el
 # nombre de organizacion del ASN destino que devuelve Team Cymru
-# (p. ej. "CLOUDFLARENET - Cloudflare, Inc., US"). Un destino nuevo de una de
-# estas organizaciones entra directo a la linea base, sin evaluacion ni
-# alerta. Se relee en cada ciclo de egress.
+# (p. ej. "CLOUDFLARENET - Cloudflare, Inc., US"). Campos opcionales:
+#   sources: patrones (fnmatch) contra el origen del flujo, p. ej.
+#            host:cloudflared, host:python3, docker:*
+#   ports:   lista de puerto/protocolo, p. ej. 7844/udp, 443/tcp
+#   cdn:     true para CDNs/hosting compartido (Cloudflare, Fastly, ...)
+# Una entrada solo allowlistea un flujo si coinciden org, origen y puerto
+# (los campos ausentes no restringen). Un destino nuevo cubierto entra
+# directo a la linea base, sin evaluacion ni alerta.
+#
+# CDNs: alojan millones de sitios ajenos (incluido C2 de malware), asi que
+# NUNCA se allowlistean por organizacion completa. Las entradas `cdn: true`
+# exigen `sources` y `ports` (si faltan, la entrada se rechaza al cargar).
+# Cloudflare, Fastly, Akamai y CloudFront se tratan como CDN aunque falte
+# `cdn: true`, y una entrada amplia (sin sources/ports) nunca cubre un CDN.
+# Los flujos a un CDN que no coinciden pasan por la evaluacion normal con
+# TypeSafe (durante el aprendizaje simplemente se aprenden).
+# Se relee en cada ciclo de egress.
 egress_orgs:
   - org: "Cloudflare"
-    reason: "Cloudflare Tunnel (cloudflared, puerto 7844) y CDN de muchos registros"
+    cdn: true
+    sources: ["host:cloudflared"]
+    ports: ["7844/udp", "7844/tcp"]
+    reason: "Cloudflare Tunnel (cloudflared, QUIC/HTTP2 al edge en 7844)"
+  - org: "Cloudflare"
+    cdn: true
+    sources: ["host:python3", "host:penguin"]
+    ports: ["443/tcp"]
+    reason: "Agentes de la Batifamilia y penguin hacia APIs detras de Cloudflare"
   - org: "GitHub"
     reason: "git fetch/push, API de issues, release notes del radar"
   - org: "Telegram"
@@ -62,7 +84,10 @@ egress_orgs:
   - org: "Anthropic"
     reason: "Claude Code (escalaciones, post-reset, radar semanal)"
   - org: "Fastly"
-    reason: "CDN de PyPI y del registry de npm"
+    cdn: true
+    sources: ["host:python3", "host:pip"]
+    ports: ["443/tcp"]
+    reason: "PyPI (pip y el radar consultando PyPI JSON)"
   - org: "Canonical"
     reason: "Repositorios apt y servicios de Ubuntu"
   - org: "Docker"

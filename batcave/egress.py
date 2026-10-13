@@ -1,25 +1,45 @@
 """Monitoreo de conexiones salientes (egress) de Batwoman.
 
+Fuentes de flujos salientes hacia IPs publicas:
+
+  1. Stream de eventos (principal): `sudo -n conntrack -E -e NEW -o
+     timestamp,extended` corre en segundo plano (ConntrackStream) y ve cada
+     flujo NUEVO, TCP y UDP (QUIC de cloudflared, llamadas cortas a
+     TypeSafe/GitHub/Telegram). Si el proceso muere se reinicia con backoff
+     exponencial. El origen es `docker:<container>` si la IP de origen esta
+     en una subred de Docker, o `host:<proceso>` si es una IP del host: el
+     proceso sale de un snapshot cacheado de `sudo -n ss -tunpH state
+     established` (refresco cada `ss_refresh` s, y bajo demanda cuando llega
+     un flujo nuevo, porque un snapshot anterior al flujo no puede
+     contenerlo), cruzando puerto local + ip:puerto remoto. Para UDP no
+     conectado (QUIC) se cae a `sudo -n ss -uanpH` por puerto local. Si no
+     aparece: `host:unknown`.
+  2. Snapshot periodico (respaldo): solo si el stream estuvo caido desde el
+     ciclo anterior (y en el primer ciclo, para ver las conexiones que ya
+     existian antes de arrancar). Host: `sudo -n ss -tunpH state established`
+     (TCP + UDP conectado), descartando entrantes (puerto local en escucha
+     segun `ss -tulnH`). Containers: `sudo -n conntrack -L -o extended`.
+
+Se omiten loopback, RFC1918, link-local, CGNAT, las subredes de Docker y el
+DNS (53/853) hacia los resolvers del sistema (/etc/resolv.conf y los
+upstream de systemd-resolved).
+
 Lo llama el ciclo principal de batwoman.py cada `batwoman.egress.interval`
 segundos (60 por defecto). Cada ciclo:
 
-  1. Snapshot de conexiones TCP establecidas hacia IPs publicas:
-     - Host: `sudo -n ss -tnpH state established` (proceso, local, remoto).
-       Se descartan las conexiones entrantes (puerto local en escucha segun
-       `ss -tlnH`).
-     - Containers: `sudo -n conntrack -L -p tcp -o extended` (direccion
-       original: src/dst/dport). La IP de origen se mapea al nombre del
-       container con `docker network inspect` (cache de 10 min).
-     Se omiten loopback, RFC1918, link-local, CGNAT y las subredes de Docker.
+  1. Toma los flujos acumulados por el stream (y el snapshot de respaldo si
+     hizo falta), deduplicados por (origen, ip, puerto, protocolo).
   2. Identidad del destino: ASN y organizacion via DNS de Team Cymru (TXT a
      <ip-invertida>.origin.asn.cymru.com / origin6 para IPv6 y
      AS<n>.asn.cymru.com), mas reverse DNS (solo para mostrar). Cache
      persistente en batcave/memory/egress_asn_cache.json (TTL 7 dias).
   3. Linea base (batcave/memory/egress_baseline.json) por la llave
-     (proceso o container, ASN destino, puerto destino); nunca por IP.
+     (origen, ASN destino, puerto destino, protocolo); nunca por IP.
      Durante `learning_days` desde el primer ciclo solo se aprende. Despues,
-     una llave nunca vista es un "destino nuevo": si la organizacion esta en
-     `egress_orgs` del allowlist entra directo a la linea base; si no, se
+     una llave nunca vista es un "destino nuevo": si una entrada de
+     `egress_orgs` del allowlist cubre el flujo (organizacion, y si la
+     entrada los define, origen y puerto/protocolo; obligatorios para los
+     CDN) entra directo a la linea base; si no, se
      evalua con TypeSafe (o el fallback) y luego se agrega a la linea base
      (cada llave alerta una sola vez).
 
@@ -30,6 +50,7 @@ que devuelve `run_cycle`.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import html
 import ipaddress
 import json
@@ -40,7 +61,7 @@ import socket
 import struct
 import subprocess
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -56,12 +77,18 @@ BASELINE_PATH = MEMORY_DIR / "egress_baseline.json"
 ASN_CACHE_PATH = MEMORY_DIR / "egress_asn_cache.json"
 ALLOWLIST_PATH = BASE_DIR / "batwoman_allowlist.yaml"
 RESOLV_CONF = Path("/etc/resolv.conf")
+# Upstreams reales de systemd-resolved (/etc/resolv.conf solo trae el stub).
+RESOLVED_UPSTREAM_CONF = Path("/run/systemd/resolve/resolv.conf")
 
 log = logging.getLogger("batwoman.egress")
 
 DEFAULTS = {
     "enabled": True,
     "interval": 60,
+    "stream": True,                 # conntrack -E en segundo plano (si no, solo snapshots)
+    "ss_refresh": 10,               # segundos entre refrescos periodicos del cache de ss
+    "attribution_delay": 0.5,       # segundos de espera tras un flujo nuevo antes de buscar su proceso
+    "ss_min_interval": 1,           # segundos minimos entre refrescos de ss bajo demanda
     "learning_days": 7,
     "safe_ports": [80, 443, 53, 853, 22, 7844],
     "asn_cache_days": 7,
@@ -73,9 +100,31 @@ DEFAULTS = {
 }
 
 # Comandos con sudo: deben coincidir EXACTO con /etc/sudoers.d/batifamilia.
-HOST_CMD = ["sudo", "-n", "ss", "-tnpH", "state", "established"]
-CONNTRACK_CMD = ["sudo", "-n", "conntrack", "-L", "-p", "tcp", "-o", "extended"]
-LISTEN_CMD = ["ss", "-tlnH"]
+HOST_CMD = ["sudo", "-n", "ss", "-tunpH", "state", "established"]
+UDP_SOCKETS_CMD = ["sudo", "-n", "ss", "-uanpH"]
+CONNTRACK_CMD = ["sudo", "-n", "conntrack", "-L", "-o", "extended"]
+EVENTS_CMD = ["sudo", "-n", "conntrack", "-E", "-e", "NEW", "-o", "timestamp,extended"]
+LISTEN_CMD = ["ss", "-tulnH"]
+ADDR_CMD = ["ip", "-o", "addr", "show"]
+
+# Lineas para /etc/sudoers.d/batifamilia (las comas de los argumentos van
+# escapadas en sudoers). Las imprime --egress-snapshot.
+SUDOERS_LINES = [
+    "dsantacruz ALL=(root) NOPASSWD: /usr/bin/ss -tunpH state established",
+    "dsantacruz ALL=(root) NOPASSWD: /usr/bin/ss -uanpH",
+    "dsantacruz ALL=(root) NOPASSWD: /usr/sbin/conntrack -L -o extended",
+    "dsantacruz ALL=(root) NOPASSWD: /usr/sbin/conntrack -E -e NEW -o timestamp\\,extended",
+]
+
+PROTOCOLS = ("tcp", "udp")
+DNS_PORTS = {53, 853}
+STREAM_BACKOFF_MAX = 300        # segundos maximos entre reintentos del stream
+STREAM_STABLE = 300             # si el stream duro mas que esto, el backoff vuelve a 1s
+ATTRIBUTION_TICK = 0.25         # segundos entre pasadas del atribuidor
+PENDING_MAX = 5000              # flujos esperando atribucion (rafagas: se descartan los mas viejos)
+FLOWS_MAX = 5000                # flujos distintos acumulados entre ciclos
+RECENT_MAX = 5000               # eventos recientes (para --egress-snapshot)
+SNAPSHOT_LISTEN_SECONDS = 60
 
 SEVERITY_LEVELS = ["info", "low", "medium", "high", "critical"]
 ACTION_CRITERIA = {
@@ -86,6 +135,9 @@ ACTION_CRITERIA = {
 UNROUTED_ASN = "0"
 DIGEST_MAX_NEW = 50
 SS_PROCESS = re.compile(r'users:\(\("([^"]+)"')
+# CDNs/hosting que alojan millones de sitios ajenos (incluido C2): aunque el
+# allowlist olvide `cdn: true`, se tratan como CDN (exigen sources + ports).
+KNOWN_CDN_ORGS = ("cloudflare", "fastly", "akamai", "cloudfront")
 
 _last_errors: dict[str, str] = {}
 
@@ -177,16 +229,50 @@ def is_public(ip: ipaddress._BaseAddress, docker_subnets: list) -> bool:
 # --- Docker ------------------------------------------------------------------------
 
 
+def system_resolvers() -> set[str]:
+    """IPs de los resolvers del sistema: el stub de /etc/resolv.conf y los
+    upstream de systemd-resolved."""
+    servers = set()
+    for path in (RESOLV_CONF, RESOLVED_UPSTREAM_CONF):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "nameserver":
+                ip = _parse_ip(parts[1])
+                if ip is not None:
+                    servers.add(str(ip))
+    return servers
+
+
+def host_addresses(timeout: int) -> set[str]:
+    """IPs configuradas en las interfaces del host (`ip -o addr show`)."""
+    out = _run("ip addr", ADDR_CMD, timeout) or ""
+    addrs = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] in ("inet", "inet6"):
+            ip = _parse_ip(parts[3].split("/", 1)[0])
+            if ip is not None:
+                addrs.add(str(ip))
+    return addrs
+
+
 class DockerMap:
-    """IP de container -> nombre, y subredes de Docker. Se refresca cada
-    `docker_refresh` segundos (o antes, si aparece una IP desconocida dentro
-    de una subred de Docker, como mucho una vez por minuto)."""
+    """IP de container -> nombre, subredes de Docker, IPs del host y
+    resolvers del sistema. Se refresca cada `docker_refresh` segundos (o
+    antes, si aparece una IP desconocida dentro de una subred de Docker, como
+    mucho una vez por minuto)."""
 
     def __init__(self, ecfg: dict) -> None:
         self.refresh_every = int(ecfg["docker_refresh"])
         self.timeout = int(ecfg["command_timeout"])
         self.by_ip: dict[str, str] = {}
         self.subnets: list = []
+        self.local_ips: set[str] = set()
+        self.dns_servers: set[str] = set()
         self.loaded_at = 0.0
 
     def refresh(self, force: bool = False) -> None:
@@ -194,6 +280,8 @@ class DockerMap:
         if self.loaded_at and age < self.refresh_every and not (force and age > 60):
             return
         self.loaded_at = time.monotonic()
+        self.local_ips = host_addresses(self.timeout) or self.local_ips
+        self.dns_servers = system_resolvers()
         ids = _run("docker network ls", ["docker", "network", "ls", "-q"], self.timeout)
         if not ids or not ids.split():
             return
@@ -222,19 +310,99 @@ class DockerMap:
     def in_docker(self, ip: ipaddress._BaseAddress) -> bool:
         return any(ip.version == net.version and ip in net for net in self.subnets)
 
+    def is_host(self, ip: ipaddress._BaseAddress) -> bool:
+        # Sin `ip addr` disponible, cualquier IP no global se asume del host.
+        return str(ip) in self.local_ips if self.local_ips else not ip.is_global
 
-# --- Snapshot ------------------------------------------------------------------------
+
+def classify_flow(src, dst, dport: int, docker: DockerMap) -> Optional[str]:
+    """'container' / 'host' si es un flujo saliente a una IP publica que nos
+    interesa; '?' si el origen es una IP privada desconocida (quizas una red
+    de Docker nueva: hay que refrescar el mapa); None si se ignora (destino
+    privado/loopback/link-local/Docker, DNS al resolver del sistema, o flujo
+    entrante/reenviado)."""
+    if src is None or dst is None or not is_public(dst, docker.subnets):
+        return None
+    if str(dst) in docker.local_ips:
+        return None
+    if dport in DNS_PORTS and str(dst) in docker.dns_servers:
+        return None
+    if docker.in_docker(src):
+        return "container"
+    if docker.is_host(src):
+        return "host"
+    return "?" if not src.is_global else None
 
 
-def listening_ports(timeout: int) -> set[int]:
-    out = _run("ss -tlnH", LISTEN_CMD, timeout) or ""
+# --- Parsers de ss y conntrack ----------------------------------------------------------
+
+
+def parse_ss_line(line: str) -> Optional[dict]:
+    """Una linea de `ss -H`: [Netid] [State] Recv-Q Send-Q Local Peer [proceso].
+    Netid solo aparece si se piden varias tablas (-tu); State solo sin filtro
+    `state`."""
+    tokens = line.split()
+    proto = None
+    if tokens and tokens[0] in PROTOCOLS:
+        proto = tokens.pop(0)
+    if tokens and not tokens[0].isdigit():
+        tokens.pop(0)
+    if len(tokens) < 4:
+        return None
+    local_ip, local_port = _split_hostport(tokens[2])
+    peer_ip, peer_port = _split_hostport(tokens[3])
+    match = SS_PROCESS.search(" ".join(tokens[4:]))
+    return {
+        "proto": proto, "local_ip": local_ip, "local_port": local_port,
+        "peer_ip": peer_ip, "peer_port": peer_port, "process": match.group(1) if match else None,
+    }
+
+
+CT_TIMESTAMP = re.compile(r"^\s*\[(\d+(?:\.\d+)?)\]")
+
+
+def parse_conntrack_line(line: str) -> Optional[dict]:
+    """Una linea de conntrack (-L o -E, `-o extended` y opcional `timestamp`).
+    Devuelve la direccion ORIGINAL (primera aparicion de src/dst/sport/dport);
+    None si no es TCP/UDP o esta incompleta."""
+    tokens = line.split()
+    proto = next((t for t in tokens if t in PROTOCOLS), None)
+    if proto is None:
+        return None
+    original: dict[str, str] = {}
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if sep and key in ("src", "dst", "sport", "dport") and key not in original:
+            original[key] = value
+    try:
+        sport, dport = int(original.get("sport", "")), int(original.get("dport", ""))
+    except ValueError:
+        return None
+    src, dst = _parse_ip(original.get("src", "")), _parse_ip(original.get("dst", ""))
+    if src is None or dst is None:
+        return None
+    ts = CT_TIMESTAMP.match(line)
+    return {
+        "ts": float(ts.group(1)) if ts else time.time(),
+        "proto": proto, "src": src, "dst": dst, "sport": sport, "dport": dport,
+        "established": "ESTABLISHED" in tokens,
+    }
+
+
+def host_source(process: Optional[str]) -> str:
+    return f"host:{process or 'unknown'}"
+
+
+# --- Snapshot (respaldo) ----------------------------------------------------------------
+
+
+def listening_ports(timeout: int) -> set[tuple[str, int]]:
+    out = _run("ss -tulnH", LISTEN_CMD, timeout) or ""
     ports = set()
     for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 4:
-            _, port = _split_hostport(parts[3])
-            if port is not None:
-                ports.add(port)
+        parsed = parse_ss_line(line)
+        if parsed and parsed["proto"] and parsed["local_port"] is not None:
+            ports.add((parsed["proto"], parsed["local_port"]))
     return ports
 
 
@@ -246,25 +414,21 @@ def host_connections(ecfg: dict, docker: DockerMap) -> list[dict]:
     listening = listening_ports(timeout)
     conns = []
     for line in out.splitlines():
-        # Con `state established` no hay columna de estado:
-        # Recv-Q Send-Q Local:Port Peer:Port [users:(("proc",pid=N,fd=M))]
-        parts = line.split(None, 4)
-        if len(parts) < 4:
+        parsed = parse_ss_line(line)
+        if not parsed or parsed["proto"] is None or parsed["peer_port"] is None:
             continue
-        local_ip, local_port = _split_hostport(parts[2])
-        remote_ip, remote_port = _split_hostport(parts[3])
-        if remote_ip is None or remote_port is None or local_port in listening:
+        if (parsed["proto"], parsed["local_port"]) in listening:
             continue
-        if not is_public(remote_ip, docker.subnets):
+        if classify_flow(parsed["local_ip"], parsed["peer_ip"], parsed["peer_port"], docker) != "host":
             continue
-        match = SS_PROCESS.search(parts[4]) if len(parts) > 4 else None
         conns.append(
             {
-                "source": match.group(1) if match else "desconocido",
+                "source": host_source(parsed["process"]),
                 "kind": "host",
-                "ip": str(remote_ip),
-                "port": remote_port,
-                "local": f"{local_ip}:{local_port}",
+                "ip": str(parsed["peer_ip"]),
+                "port": parsed["peer_port"],
+                "protocol": parsed["proto"],
+                "local": f"{parsed['local_ip']}:{parsed['local_port']}",
             }
         )
     return conns
@@ -276,39 +440,251 @@ def container_connections(ecfg: dict, docker: DockerMap) -> list[dict]:
         return []
     conns = []
     for line in out.splitlines():
-        tokens = line.split()
-        if "ESTABLISHED" not in tokens:
+        flow = parse_conntrack_line(line)
+        # UDP no tiene estado en conntrack; TCP solo establecidas.
+        if flow is None or (flow["proto"] == "tcp" and not flow["established"]):
             continue
-        original: dict[str, str] = {}
-        for token in tokens:
-            key, sep, value = token.partition("=")
-            # La primera aparicion de cada campo es la direccion original.
-            if sep and key in ("src", "dst", "dport") and key not in original:
-                original[key] = value
-        src = _parse_ip(original.get("src", ""))
-        dst = _parse_ip(original.get("dst", ""))
-        try:
-            dport = int(original.get("dport", ""))
-        except ValueError:
+        if classify_flow(flow["src"], flow["dst"], flow["dport"], docker) != "container":
             continue
-        if src is None or dst is None or not docker.in_docker(src):
-            continue
-        if not is_public(dst, docker.subnets):
-            continue
-        name = docker.by_ip.get(str(src))
+        name = docker.by_ip.get(str(flow["src"]))
         if name is None:
             docker.refresh(force=True)
-            name = docker.by_ip.get(str(src))
+            name = docker.by_ip.get(str(flow["src"]))
         if name is None:
-            log.debug("Egress: IP de container sin nombre %s, se reintenta el proximo ciclo", src)
+            log.debug("Egress: IP de container sin nombre %s, se reintenta el proximo ciclo", flow["src"])
             continue
-        conns.append({"source": f"docker:{name}", "kind": "container", "ip": str(dst), "port": dport, "local": str(src)})
+        conns.append(
+            {
+                "source": f"docker:{name}", "kind": "container", "ip": str(flow["dst"]),
+                "port": flow["dport"], "protocol": flow["proto"], "local": str(flow["src"]),
+            }
+        )
     return conns
 
 
 def take_snapshot(ecfg: dict, docker: DockerMap) -> list[dict]:
     docker.refresh()
     return host_connections(ecfg, docker) + container_connections(ecfg, docker)
+
+
+# --- Stream de eventos (conntrack -E) ------------------------------------------------------
+
+
+class ConntrackStream:
+    """Lector de larga duracion de `conntrack -E -e NEW` mas el atribuidor
+    de procesos. Los flujos salientes atribuidos se acumulan (deduplicados)
+    hasta que el ciclo de egress los toma con `drain()`."""
+
+    def __init__(self, ecfg: dict, docker: DockerMap) -> None:
+        self.docker = docker
+        self.timeout = int(ecfg["command_timeout"])
+        self.ss_refresh = float(ecfg["ss_refresh"])
+        self.delay = float(ecfg["attribution_delay"])
+        self.min_interval = float(ecfg["ss_min_interval"])
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self.running = False
+        self.gap = True             # hubo un hueco sin stream desde el ultimo drain()
+        self.pending: deque = deque()
+        self.flows: dict[tuple, dict] = {}
+        self.recent: deque = deque(maxlen=RECENT_MAX)
+        self.dropped = 0
+        self.ss_index: dict[tuple, str] = {}
+        self.ss_at = float("-inf")
+        self.udp_index: dict[int, str] = {}
+        self.udp_at = float("-inf")
+        self.tasks: list[asyncio.Task] = []
+
+    def start(self) -> None:
+        self.tasks = [asyncio.create_task(self._reader()), asyncio.create_task(self._attributor())]
+
+    async def stop(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks = []
+        await self._kill()
+
+    # Lector ------------------------------------------------------------------------
+
+    async def _reader(self) -> None:
+        backoff = 1.0
+        while True:
+            started = time.monotonic()
+            try:
+                reason = await self._read_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - el stream se reinicia, nunca tumba a Batwoman
+                reason = f"{type(exc).__name__}: {exc}"
+            finally:
+                self.running = False
+                self.gap = True
+            if time.monotonic() - started > STREAM_STABLE:
+                backoff = 1.0
+            log.warning(
+                "Egress: el stream de conntrack termino (%s); reintento en %.0fs, mientras tanto snapshot de respaldo",
+                reason, backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, STREAM_BACKOFF_MAX)
+
+    async def _read_once(self) -> str:
+        await asyncio.to_thread(self.docker.refresh)
+        # stderr va al mismo pipe: si fuera aparte y nadie lo leyera, un error
+        # repetido (p. ej. ENOBUFS) podria llenarlo y bloquear a conntrack.
+        self.proc = await asyncio.create_subprocess_exec(
+            *EVENTS_CMD, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        self.running = True
+        log.info("Egress: stream de conntrack activo (pid %s)", self.proc.pid)
+        last_other = ""
+        try:
+            while True:
+                raw = await self.proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace")
+                try:
+                    if not self._handle(line) and not CT_TIMESTAMP.match(line):
+                        last_other = line.strip()
+                except Exception:  # noqa: BLE001 - una linea rara no corta el stream
+                    log.exception("Egress: no se pudo procesar la linea de conntrack %r", line[:300])
+        finally:
+            await self._kill()
+        return f"codigo {self.proc.returncode}" + (f": {last_other[-300:]}" if last_other else "")
+
+    async def _kill(self) -> None:
+        proc = self.proc
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except ProcessLookupError:
+            pass
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+    def _handle(self, line: str) -> bool:
+        """Encola el flujo si es saliente a una IP publica. Devuelve False si
+        la linea no es un evento de conntrack (p. ej. un error)."""
+        flow = parse_conntrack_line(line)
+        if flow is None:
+            return False
+        kind = classify_flow(flow["src"], flow["dst"], flow["dport"], self.docker)
+        if kind is None:
+            return True
+        if len(self.pending) >= PENDING_MAX:
+            self.pending.popleft()
+            self.dropped += 1
+        self.pending.append({**flow, "kind": kind, "arrival": time.monotonic()})
+        return True
+
+    # Atribuidor ------------------------------------------------------------------------
+
+    async def _attributor(self) -> None:
+        while True:
+            await asyncio.sleep(ATTRIBUTION_TICK)
+            try:
+                await self._attribute()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - se reintenta en la proxima pasada
+                log.exception("Egress: fallo atribuyendo flujos")
+
+    async def _refresh_ss(self) -> None:
+        taken = time.monotonic()
+        out = await asyncio.to_thread(_run, "ss (sudo)", HOST_CMD, self.timeout)
+        index = {}
+        for line in (out or "").splitlines():
+            parsed = parse_ss_line(line)
+            if parsed and parsed["proto"] and parsed["process"] and parsed["peer_ip"] is not None:
+                index[(parsed["proto"], parsed["local_port"], str(parsed["peer_ip"]), parsed["peer_port"])] = parsed["process"]
+        self.ss_index, self.ss_at = index, taken
+
+    async def _refresh_udp(self) -> None:
+        taken = time.monotonic()
+        out = await asyncio.to_thread(_run, "ss -u (sudo)", UDP_SOCKETS_CMD, self.timeout)
+        index = {}
+        for line in (out or "").splitlines():
+            parsed = parse_ss_line(line)
+            if parsed and parsed["process"] and parsed["local_port"] is not None:
+                index[parsed["local_port"]] = parsed["process"]
+        self.udp_index, self.udp_at = index, taken
+
+    def _can_refresh(self, last: float) -> bool:
+        return time.monotonic() - last >= self.min_interval
+
+    async def _attribute(self) -> None:
+        """Un snapshot de ss tomado ANTES de un flujo nuevo no puede
+        contenerlo: cada flujo del host espera `attribution_delay` y se busca
+        en el primer snapshot tomado despues (refresco bajo demanda, como
+        mucho uno cada `ss_min_interval`)."""
+        if self.running and self.ss_refresh > 0 and time.monotonic() - self.ss_at >= self.ss_refresh:
+            await self._refresh_ss()
+        waiting: deque = deque()
+        while self.pending:
+            ev = self.pending.popleft()
+            if ev["kind"] != "host":
+                await self._attribute_container(ev)
+                continue
+            due = ev["arrival"] + self.delay
+            if time.monotonic() < due:
+                waiting.append(ev)
+                continue
+            if self.ss_at < due:
+                if not self._can_refresh(self.ss_at):
+                    waiting.append(ev)
+                    continue
+                await self._refresh_ss()
+            process = self.ss_index.get((ev["proto"], ev["sport"], str(ev["dst"]), ev["dport"]))
+            if process is None and ev["proto"] == "udp":
+                # QUIC (cloudflared) usa sockets UDP no conectados: solo hay puerto local.
+                if self.udp_at < due:
+                    if not self._can_refresh(self.udp_at):
+                        waiting.append(ev)
+                        continue
+                    await self._refresh_udp()
+                process = self.udp_index.get(ev["sport"])
+            self._record(ev, "host", host_source(process))
+        self.pending = waiting
+
+    async def _attribute_container(self, ev: dict) -> None:
+        src = str(ev["src"])
+        if ev["kind"] == "?" or src not in self.docker.by_ip:
+            await asyncio.to_thread(self.docker.refresh, True)
+        kind = classify_flow(ev["src"], ev["dst"], ev["dport"], self.docker)
+        if kind == "container":
+            self._record(ev, "container", f"docker:{self.docker.by_ip.get(src, 'unknown')}")
+        elif kind == "host":
+            self.pending.append({**ev, "kind": "host"})
+        else:
+            log.debug("Egress: flujo de origen desconocido %s -> %s:%s, se ignora", src, ev["dst"], ev["dport"])
+
+    def _record(self, ev: dict, kind: str, source: str) -> None:
+        conn = {
+            "source": source, "kind": kind, "ip": str(ev["dst"]), "port": ev["dport"],
+            "protocol": ev["proto"], "local": f"{ev['src']}:{ev['sport']}",
+        }
+        self.recent.append({**conn, "ts": ev["ts"]})
+        key = (source, conn["ip"], conn["port"], conn["protocol"])
+        if key in self.flows:
+            return
+        if len(self.flows) >= FLOWS_MAX:
+            self.dropped += 1
+            return
+        self.flows[key] = conn
+
+    def drain(self) -> tuple[list[dict], bool]:
+        """(flujos acumulados desde el ultimo drain, hubo hueco sin stream)."""
+        conns, self.flows = list(self.flows.values()), {}
+        if self.dropped:
+            log.warning("Egress: %d flujo(s) descartado(s) por rafaga (topes del stream)", self.dropped)
+            self.dropped = 0
+        had_gap = self.gap or not self.running
+        self.gap = not self.running
+        return conns, had_gap
 
 
 # --- DNS (Team Cymru + PTR) ------------------------------------------------------------
@@ -509,9 +885,56 @@ class AsnResolver:
 # --- Allowlist y linea base ---------------------------------------------------------------
 
 
+def _parse_port_spec(value) -> Optional[tuple[int, str]]:
+    """`7844/udp` -> (7844, "udp"). El protocolo es obligatorio."""
+    port, _, protocol = str(value).strip().lower().partition("/")
+    if not port.isdigit() or not 0 < int(port) < 65536 or protocol not in PROTOCOLS:
+        return None
+    return int(port), protocol
+
+
+def _parse_org_entry(entry) -> tuple[Optional[dict], Optional[str]]:
+    """Valida una entrada de `egress_orgs`. Devuelve (entrada, None) o
+    (None, motivo del rechazo)."""
+    if isinstance(entry, str):
+        entry = {"org": entry}
+    if not isinstance(entry, dict) or not str(entry.get("org") or "").strip():
+        return None, "falta `org`"
+    org = str(entry["org"]).strip().lower()
+    cdn = bool(entry.get("cdn"))
+    if not cdn and any(name in org for name in KNOWN_CDN_ORGS):
+        _warn_once(f"allowlist-cdn:{org}", f"Egress: egress_orgs `{org}` es un CDN conocido sin `cdn: true`; se trata como CDN")
+        cdn = True
+    sources = entry.get("sources")
+    ports = entry.get("ports")
+    if sources is not None and (not isinstance(sources, list) or not all(isinstance(s, str) and s.strip() for s in sources)):
+        return None, "`sources` debe ser una lista de patrones (p. ej. host:cloudflared, docker:*)"
+    if ports is not None and not isinstance(ports, list):
+        return None, "`ports` debe ser una lista de puerto/protocolo (p. ej. 443/tcp)"
+    parsed_ports = set()
+    for spec in ports or []:
+        parsed = _parse_port_spec(spec)
+        if parsed is None:
+            return None, f"puerto invalido {spec!r} (formato puerto/tcp o puerto/udp)"
+        parsed_ports.add(parsed)
+    if cdn and (not sources or not parsed_ports):
+        return None, "una entrada `cdn: true` exige `sources` y `ports` (el CDN aloja sitios ajenos, incluido C2)"
+    return {
+        "org": org,
+        "reason": entry.get("reason", "sin razon"),
+        "cdn": cdn,
+        "sources": [s.strip() for s in sources] if sources else None,
+        "ports": parsed_ports or None,
+    }, None
+
+
 def load_org_allowlist() -> list[dict]:
-    """`egress_orgs` de batwoman_allowlist.yaml: substring (sin distinguir
-    mayusculas) del nombre de organizacion del ASN. Se relee cada ciclo."""
+    """`egress_orgs` de batwoman_allowlist.yaml. Se relee cada ciclo.
+
+    `org` es substring (sin distinguir mayusculas) del nombre de organizacion
+    del ASN. `sources` (patrones fnmatch sobre el origen) y `ports`
+    (`puerto/protocolo`) son opcionales, salvo en las entradas `cdn: true`,
+    donde son obligatorios: una entrada CDN incompleta se rechaza."""
     try:
         with open(ALLOWLIST_PATH, "r", encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
@@ -520,32 +943,60 @@ def load_org_allowlist() -> list[dict]:
         return []
     entries = []
     for entry in (raw.get("egress_orgs") if isinstance(raw, dict) else None) or []:
-        if isinstance(entry, str):
-            entry = {"org": entry}
-        if not isinstance(entry, dict) or not str(entry.get("org") or "").strip():
-            log.error("Entrada invalida en egress_orgs: %r", entry)
+        parsed, problem = _parse_org_entry(entry)
+        if parsed is None:
+            _warn_once(f"allowlist:{entry!r}", f"Egress: entrada de egress_orgs rechazada ({problem}): {entry!r}")
             continue
-        entries.append({"org": str(entry["org"]).strip().lower(), "reason": entry.get("reason", "sin razon")})
+        entries.append(parsed)
     return entries
 
 
-def match_org(org: str, allowlist: list[dict]) -> Optional[str]:
-    org = org.lower()
+def match_org(conn: dict, allowlist: list[dict]) -> Optional[str]:
+    """Razon de la primera entrada que cubre el flujo (org + origen + puerto),
+    o None. Si la organizacion es un CDN (alguna entrada `cdn: true` o un CDN
+    conocido coincide), solo cuentan las entradas con `sources` y `ports`: una
+    entrada amplia nunca allowlistea trafico hacia un CDN."""
+    org = conn["org"].lower()
+    is_cdn = any(name in org for name in KNOWN_CDN_ORGS) or any(e["cdn"] and e["org"] in org for e in allowlist)
+    port = (int(conn["port"]), conn.get("protocol", "tcp"))
     for entry in allowlist:
-        if entry["org"] in org:
-            return entry["reason"]
+        if entry["org"] not in org:
+            continue
+        if is_cdn and (not entry["sources"] or not entry["ports"]):
+            continue
+        if entry["sources"] and not any(fnmatch.fnmatchcase(conn["source"], pat) for pat in entry["sources"]):
+            continue
+        if entry["ports"] and port not in entry["ports"]:
+            continue
+        return entry["reason"]
     return None
 
 
-def baseline_key(source: str, asn: str, port: int) -> str:
-    return f"{source}|AS{asn}|{port}"
+def baseline_key(source: str, asn: str, port: int, protocol: str) -> str:
+    return f"{source}|AS{asn}|{port}|{protocol}"
+
+
+def _migrate_baseline(keys: dict) -> dict:
+    """Llaves del formato anterior (solo TCP, procesos del host sin prefijo):
+    `proceso|ASn|puerto` -> `host:proceso|ASn|puerto|tcp`. Asi no se pierde
+    lo aprendido."""
+    migrated = {}
+    for key, entry in keys.items():
+        if "protocol" not in entry:
+            entry["protocol"] = "tcp"
+            source = entry.get("source", "")
+            if entry.get("kind") == "host" and not source.startswith("host:"):
+                entry["source"] = host_source(None if source == "desconocido" else source)
+            key = baseline_key(entry["source"], entry["asn"], entry["port"], entry["protocol"])
+        migrated[key] = entry
+    return migrated
 
 
 def load_baseline() -> dict:
     data = _read_json(BASELINE_PATH, {})
     if not isinstance(data, dict):
         data = {}
-    data.setdefault("keys", {})
+    data["keys"] = _migrate_baseline(data.get("keys") or {})
     return data
 
 
@@ -597,13 +1048,15 @@ def typesafe_state(finding: dict, known_destinations: int) -> dict:
         "organizacion_destino": finding["org"],
         "reverse_dns": finding["rdns"] or "sin PTR",
         "puerto_destino": finding["port"],
+        "protocolo": finding["protocol"] + (" (probablemente QUIC)" if finding["protocol"] == "udp" and finding["port"] == 443 else ""),
         "antiguedad_del_origen_en_linea_base": _human_age(finding["source_first_seen"]),
         "destinos_conocidos_del_origen": known_destinations,
         "context": (
             "Servidor personal Ubuntu (portafolio, API NestJS, bot de Telegram, Ollama, Wazuh, "
             "agentes autonomos que usan GitHub, Telegram, Anthropic, PyPI y npm). El trafico "
             "publico entra por Cloudflare Tunnel. Esta es una conexion SALIENTE que no estaba en "
-            "la linea base aprendida (proceso/container, ASN, puerto)."
+            "la linea base aprendida (proceso/container, ASN, puerto, protocolo). "
+            "'host:unknown' significa que no se pudo identificar el proceso del host."
         ),
     }
 
@@ -657,7 +1110,7 @@ def _enrich(conns: list[dict], identities: dict[str, dict]) -> list[dict]:
         ident = identities.get(conn["ip"])
         if ident is None:
             continue
-        key = baseline_key(conn["source"], ident["asn"], conn["port"])
+        key = baseline_key(conn["source"], ident["asn"], conn["port"], conn["protocol"])
         if key in seen:
             continue
         seen.add(key)
@@ -666,22 +1119,48 @@ def _enrich(conns: list[dict], identities: dict[str, dict]) -> list[dict]:
 
 
 class EgressMonitor:
-    """Estado vivo entre ciclos (mapa de Docker y cache de ASN)."""
+    """Estado vivo entre ciclos (mapa de Docker, cache de ASN y el stream de
+    conntrack si esta activo)."""
 
     def __init__(self, ecfg: dict, persist: bool = True) -> None:
         self.ecfg = ecfg
         self.docker = DockerMap(ecfg)
         self.resolver = AsnResolver(ecfg, persist=persist)
+        self.stream: Optional[ConntrackStream] = None
 
-    async def snapshot(self) -> list[dict]:
-        conns = await asyncio.to_thread(take_snapshot, self.ecfg, self.docker)
+    async def start_stream(self) -> None:
+        if self.stream is None:
+            self.stream = ConntrackStream(self.ecfg, self.docker)
+            self.stream.start()
+
+    async def stop_stream(self) -> None:
+        if self.stream is not None:
+            await self.stream.stop()
+            self.stream = None
+
+    async def identify(self, conns: list[dict]) -> list[dict]:
         identities = await self.resolver.resolve_many({c["ip"] for c in conns})
         return _enrich(conns, identities)
+
+    async def snapshot(self) -> list[dict]:
+        return await self.identify(await asyncio.to_thread(take_snapshot, self.ecfg, self.docker))
+
+    async def collect(self) -> list[dict]:
+        """Flujos del stream; el snapshot solo si el stream estuvo caido desde
+        el ciclo anterior (o es el primer ciclo: conexiones ya existentes)."""
+        conns, need_snapshot = [], True
+        if self.stream is not None:
+            conns, need_snapshot = self.stream.drain()
+        if need_snapshot:
+            if self.stream is not None:
+                log.debug("Egress: stream de conntrack sin cobertura completa, se agrega snapshot de respaldo")
+            conns += await asyncio.to_thread(take_snapshot, self.ecfg, self.docker)
+        return await self.identify(conns)
 
     async def run_cycle(self, client: Optional[AsyncTypeSafeClient]) -> list[dict]:
         """Un ciclo completo. Devuelve los destinos nuevos evaluados, cada uno
         con su `decision`, para que batwoman.py notifique y arme el digest."""
-        conns = await self.snapshot()
+        conns = await self.collect()
         baseline = load_baseline()
         now = _now().isoformat()
         if not baseline.get("started_at"):
@@ -695,7 +1174,7 @@ class EgressMonitor:
         def add(conn: dict, origin: str, **extra) -> None:
             keys[conn["key"]] = {
                 "source": conn["source"], "kind": conn["kind"], "asn": conn["asn"], "org": conn["org"],
-                "port": conn["port"], "first_seen": now, "last_seen": now, "count": 1, "origin": origin, **extra,
+                "port": conn["port"], "protocol": conn["protocol"], "first_seen": now, "last_seen": now, "count": 1, "origin": origin, **extra,
             }
 
         new = []
@@ -706,9 +1185,9 @@ class EgressMonitor:
                 entry["count"] = int(entry.get("count", 0)) + 1
             elif learning:
                 add(conn, "learning")
-            elif match_org(conn["org"], allowlist):
+            elif match_org(conn, allowlist):
                 add(conn, "allowlist")
-                log.info("Egress: %s -> %s [AS%s] :%s en allowlist, a la linea base", conn["source"], conn["org"], conn["asn"], conn["port"])
+                log.info("Egress: %s en allowlist, a la linea base", describe(conn))
             else:
                 new.append(conn)
 
@@ -721,8 +1200,8 @@ class EgressMonitor:
             finding = {**conn, "source_first_seen": first_seen.get(conn["source"])}
             decision = await evaluate(client, finding, known_per_source[conn["source"]], self.ecfg)
             log.info(
-                "Egress nuevo: %s -> %s [AS%s] %s:%s (%s): sospechoso=%.2f severidad=%s accion=%s [%s]",
-                conn["source"], conn["org"], conn["asn"], conn["ip"], conn["port"], conn["rdns"] or "sin PTR",
+                "Egress nuevo: %s %s (%s): sospechoso=%.2f severidad=%s accion=%s [%s]",
+                describe(conn), conn["ip"], conn["rdns"] or "sin PTR",
                 decision["is_suspicious"], decision["severity"], decision["action"], decision["source"],
             )
             add(conn, "evaluated", action=decision["action"], severity=decision["severity"])
@@ -741,7 +1220,7 @@ def _code(value) -> str:
 
 
 def describe(item: dict) -> str:
-    return f"{item['source']} -> {item['org']} [AS{item['asn']}] :{item['port']}"
+    return f"{item['source']} -> {item['org']} [AS{item['asn']}] :{item['port']}/{item.get('protocol', 'tcp')}"
 
 
 def build_alert_message(item: dict) -> str:
@@ -749,7 +1228,7 @@ def build_alert_message(item: dict) -> str:
     lines = [
         "🦇 Batwoman — <b>conexion saliente nueva</b>",
         f"Origen: {_code(item['source'])} ({'container' if item['kind'] == 'container' else 'proceso del host'})",
-        f"Destino: {_code(item['org'])} [{_code('AS' + item['asn'])}] puerto {_code(item['port'])}",
+        f"Destino: {_code(item['org'])} [{_code('AS' + item['asn'])}] puerto {_code(str(item['port']) + '/' + item['protocol'])}",
         f"IP: {_code(item['ip'])}" + (f" ({_code(item['rdns'])})" if item["rdns"] else ""),
         f"Origen en la linea base: {_code(item['source_age'])}",
         f"Severidad: {_code(d['severity'])} | Sospechosa: {_code(round(d['is_suspicious'], 2))} [{html.escape(d['source'])}]",
@@ -761,7 +1240,7 @@ def digest_record(item: dict) -> dict:
     d = item["decision"]
     return {
         "source": item["source"], "asn": item["asn"], "org": item["org"], "port": item["port"],
-        "ip": item["ip"], "rdns": item["rdns"], "action": d["action"], "severity": d["severity"],
+        "protocol": item["protocol"], "ip": item["ip"], "rdns": item["rdns"], "action": d["action"], "severity": d["severity"],
     }
 
 
@@ -779,7 +1258,7 @@ def render_digest_section(new_items: list[dict], since: str, ecfg: dict) -> tupl
     for entry in baseline["keys"].values():
         ts = _parse_ts(entry.get("last_seen"))
         if ts and ts >= since_dt:
-            per_source.setdefault(entry["source"], set()).add((entry["asn"], entry["port"]))
+            per_source.setdefault(entry["source"], set()).add((entry["asn"], entry["port"], entry["protocol"]))
     top = sorted(per_source.items(), key=lambda kv: -len(kv[1]))[:5]
 
     if not baseline.get("started_at"):
@@ -808,7 +1287,7 @@ def render_digest_section(new_items: list[dict], since: str, ecfg: dict) -> tupl
             "| Origen | Organizacion | ASN | Puerto | IP (rDNS) | Accion | Severidad |",
             "|---|---|---|---|---|---|---|",
             *[
-                f"| {i['source']} | {i['org'].replace('|', '/')} | AS{i['asn']} | {i['port']} | "
+                f"| {i['source']} | {i['org'].replace('|', '/')} | AS{i['asn']} | {i['port']}/{i.get('protocol', 'tcp')} | "
                 f"{i['ip']} ({i['rdns'] or '-'}) | {i['action']} | {i['severity']} |"
                 for i in new_items
             ],
@@ -817,7 +1296,7 @@ def render_digest_section(new_items: list[dict], since: str, ecfg: dict) -> tupl
     msg.append("<b>Top procesos por destinos distintos:</b>")
     msg += [f"• {_code(src)} — {len(dests)}" for src, dests in top] or ["• ninguno"]
     md += [
-        "### Top 5 procesos/containers por destinos distintos (ASN+puerto)",
+        "### Top 5 procesos/containers por destinos distintos (ASN+puerto+protocolo)",
         "| Origen | Destinos |",
         "|---|---|",
         *[f"| {src} | {len(dests)} |" for src, dests in top],
@@ -826,25 +1305,70 @@ def render_digest_section(new_items: list[dict], since: str, ecfg: dict) -> tupl
     return msg, md
 
 
-async def print_snapshot(ecfg: dict) -> None:
-    """--egress-snapshot: clasifica las conexiones actuales sin alertar ni
-    guardar nada (ni linea base ni cache de ASN)."""
+def _status(conn: dict, baseline: dict, allowlist: list[dict]) -> str:
+    if match_org(conn, allowlist):
+        return "allowlisted"
+    return "known" if conn["key"] in baseline["keys"] else "new"
+
+
+async def print_snapshot(ecfg: dict, listen_seconds: int = SNAPSHOT_LISTEN_SECONDS) -> None:
+    """--egress-snapshot: escucha el stream de conntrack `listen_seconds`
+    segundos, imprime esos eventos y el snapshot actual de ss/conntrack,
+    clasificados (new/known/allowlisted), sin alertar ni guardar nada (ni
+    linea base ni cache de ASN)."""
+    print("Lineas requeridas en /etc/sudoers.d/batifamilia (reemplazan las de ss/conntrack anteriores):")
+    for line in SUDOERS_LINES:
+        print(f"  {line}")
     monitor = EgressMonitor(ecfg, persist=False)
-    conns = await monitor.snapshot()
+    print(f"\n=== Escuchando eventos de conntrack durante {listen_seconds}s ... ===", flush=True)
+    await monitor.start_stream()
+    try:
+        await asyncio.sleep(listen_seconds)
+        # Ultima oportunidad para atribuir los flujos que llegaron al final.
+        await asyncio.sleep(monitor.stream.delay + monitor.stream.min_interval + ATTRIBUTION_TICK)
+        events = list(monitor.stream.recent)
+        stream_ok = monitor.stream.running
+        pending = len(monitor.stream.pending)
+    finally:
+        await monitor.stop_stream()
+
     baseline = load_baseline()
     learning, days_left = learning_status(baseline, ecfg)
     allowlist = load_org_allowlist()
     state = f"aprendiendo, faltan {days_left:.1f} dia(s)" if learning else "linea base activa"
-    print(f"=== Egress snapshot: {len(conns)} destino(s) publico(s), {len(baseline['keys'])} llave(s) en la linea base ({state}) ===")
+
+    identities = await monitor.resolver.resolve_many({ev["ip"] for ev in events})
+    grouped: dict[str, dict] = {}
+    for ev in events:
+        group = grouped.setdefault(f"{ev['source']}|{ev['ip']}|{ev['port']}|{ev['protocol']}", {**ev, "n": 0, "first": ev["ts"]})
+        group["n"] += 1
+        group["first"] = min(group["first"], ev["ts"])
+    print(
+        f"=== Stream: {len(events)} flujo(s) saliente(s) publico(s) en {listen_seconds}s "
+        f"({len(grouped)} distinto(s)); stream {'activo' if stream_ok else 'CAIDO (ver log / sudoers)'}"
+        + (f"; {pending} sin atribuir al cierre" if pending else "") + " ==="
+    )
     counts: Counter = Counter()
-    for conn in sorted(conns, key=lambda c: (c["source"], c["org"], c["port"])):
-        if match_org(conn["org"], allowlist):
-            status = "allowlisted"
-        elif conn["key"] in baseline["keys"]:
-            status = "known"
-        else:
-            status = "new"
+    for group in sorted(grouped.values(), key=lambda g: g["first"]):
+        when = datetime.fromtimestamp(group["first"]).strftime("%H:%M:%S")
+        ident = identities.get(group["ip"])
+        if ident is None:
+            print(mask_secrets(f"{when} [sin ASN    ] {group['source']} -> {group['ip']}:{group['port']}/{group['protocol']} x{group['n']}"))
+            counts["sin ASN"] += 1
+            continue
+        conn = {**group, **ident, "key": baseline_key(group["source"], ident["asn"], group["port"], group["protocol"])}
+        status = _status(conn, baseline, allowlist)
+        counts[status] += 1
+        rdns = f" ({conn['rdns']})" if conn["rdns"] else ""
+        print(mask_secrets(f"{when} [{status:<11}] {describe(conn)}  {conn['ip']}{rdns} x{group['n']}"))
+    print(f"=== Resumen stream: {dict(counts)} ===\n")
+
+    conns = await monitor.snapshot()
+    print(f"=== Snapshot ss/conntrack: {len(conns)} destino(s) publico(s), {len(baseline['keys'])} llave(s) en la linea base ({state}) ===")
+    counts = Counter()
+    for conn in sorted(conns, key=lambda c: (c["source"], c["org"], c["port"], c["protocol"])):
+        status = _status(conn, baseline, allowlist)
         counts[status] += 1
         rdns = f" ({conn['rdns']})" if conn["rdns"] else ""
         print(mask_secrets(f"[{status:<11}] {describe(conn)}  {conn['ip']}{rdns}"))
-    print(f"=== Resumen: {dict(counts)} ===")
+    print(f"=== Resumen snapshot: {dict(counts)} ===")

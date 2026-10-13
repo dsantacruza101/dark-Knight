@@ -94,10 +94,14 @@ batwoman:
     - /etc/systemd/system
     - /home/dsantacruz/.claude/settings.json
   # Conexiones salientes (batcave/egress.py). Linea base por
-  # (proceso o container, ASN destino, puerto destino), nunca por IP.
+  # (proceso o container, ASN destino, puerto destino, protocolo), nunca por IP.
   egress:
     enabled: true
-    interval: 60                # segundos entre snapshots (ss + conntrack)
+    interval: 60                # segundos entre ciclos (procesa los flujos del stream; snapshot solo de respaldo)
+    stream: true                # lector de `conntrack -E -e NEW` en segundo plano (TCP + UDP)
+    ss_refresh: 0
+    attribution_delay: 0.5      # segundos tras un flujo nuevo antes de buscar su proceso en `ss`
+    ss_min_interval: 1          # segundos minimos entre refrescos de `ss` bajo demanda
     learning_days: 7            # desde el primer ciclo: solo aprende, nunca alerta
     safe_ports: [80, 443, 53, 853, 22, 7844]   # fallback sin TypeSafe: fuera de estos -> notify_now
     asn_cache_days: 7           # TTL de batcave/memory/egress_asn_cache.json (Team Cymru + rDNS)

@@ -50,12 +50,16 @@ Batman en batcave/comms.json, salvo las rutas absolutas exactas listadas en
 como esperadas. El digest incluye el resultado (paquetes verificados limpios
 / con archivos alterados / esperados).
 
-Cada `batwoman.egress.interval` segundos corre ademas el monitoreo de
-conexiones salientes (batcave/egress.py): linea base por (proceso o
-container, ASN destino, puerto destino), aprendizaje los primeros
+Ademas monitorea las conexiones salientes (batcave/egress.py): un lector de
+`conntrack -E -e NEW` en segundo plano (TCP y UDP, se reinicia con backoff)
+ve cada flujo nuevo, y cada `batwoman.egress.interval` segundos se procesan
+los acumulados (snapshot de `ss`/`conntrack -L` solo como respaldo si el
+stream estuvo caido): linea base por (proceso o container, ASN destino,
+puerto destino, protocolo), aprendizaje los primeros
 `egress.learning_days` dias y evaluacion con TypeSafe de los destinos
-nuevos (is_suspicious/severity/action notify_now|digest|learn). Las
-organizaciones de `egress_orgs` del allowlist van directo a la linea base.
+nuevos (is_suspicious/severity/action notify_now|digest|learn). Los flujos
+cubiertos por `egress_orgs` del allowlist (organizacion + origen + puerto;
+los CDN exigen origen y puerto) van directo a la linea base.
 Las notificaciones usan la misma deduplicacion que las alertas de Wazuh y
 el digest incluye una seccion Egress.
 
@@ -68,7 +72,8 @@ Flags:
                      triage; sin Telegram ni cambios de estado.
   --once             un solo poll (y un ciclo de egress) con efectos normales
                      y termina.
-  --egress-snapshot  imprime las conexiones salientes actuales clasificadas
+  --egress-snapshot  escucha 60s el stream de conntrack e imprime esos flujos
+                     mas el snapshot actual de ss/conntrack, clasificados
                      (new/known/allowlisted); sin alertas ni guardar nada.
 """
 
@@ -771,8 +776,9 @@ async def act_egress(item: dict, config: dict, notifier: TelegramNotifier) -> bo
 async def egress_poll(
     monitor: egress.EgressMonitor, config: dict, client: Optional[AsyncTypeSafeClient], notifier: TelegramNotifier
 ) -> None:
-    """Un ciclo de egress: snapshot, linea base, evaluacion, notificacion y
-    registro en el digest (en batwoman_state.json)."""
+    """Un ciclo de egress: flujos del stream (o snapshot de respaldo), linea
+    base, evaluacion, notificacion y registro en el digest (en
+    batwoman_state.json)."""
     evaluated = await monitor.run_cycle(client)
     if not evaluated:
         return
@@ -1188,29 +1194,38 @@ async def run(config: dict, args: argparse.Namespace) -> None:
             )
         ecfg = egress.load_config(config)
         monitor = egress.EgressMonitor(ecfg) if ecfg["enabled"] else None
+        # Con --once no tiene sentido el stream: un solo ciclo con snapshot.
+        use_stream = bool(monitor and ecfg["stream"] and not args.once)
         log.info(
             "Batwoman en guardia: poll cada %ss sobre %s; egress %s",
             config["poll_interval"], config["container"],
-            f"cada {ecfg['interval']}s" if monitor else "desactivado",
+            (f"cada {ecfg['interval']}s ({'stream conntrack + snapshot de respaldo' if use_stream else 'solo snapshot'})")
+            if monitor else "desactivado",
         )
+        if use_stream:
+            await monitor.start_stream()
         next_poll = next_egress = time.monotonic()
-        while True:
-            if time.monotonic() >= next_poll:
-                next_poll = time.monotonic() + config["poll_interval"]
-                try:
-                    await poll(config, client, notifier)
-                except Exception:  # noqa: BLE001 - un poll fallido no debe tumbar el servicio
-                    log.exception("Fallo el poll de Batwoman, se reintenta en el proximo ciclo")
-            if monitor and time.monotonic() >= next_egress:
-                next_egress = time.monotonic() + ecfg["interval"]
-                try:
-                    await egress_poll(monitor, config, client, notifier)
-                except Exception:  # noqa: BLE001 - un ciclo de egress fallido no debe tumbar el servicio
-                    log.exception("Fallo el ciclo de egress, se reintenta en el proximo")
-            if args.once:
-                return
-            wake = min(next_poll, next_egress) if monitor else next_poll
-            await asyncio.sleep(max(1.0, wake - time.monotonic()))
+        try:
+            while True:
+                if time.monotonic() >= next_poll:
+                    next_poll = time.monotonic() + config["poll_interval"]
+                    try:
+                        await poll(config, client, notifier)
+                    except Exception:  # noqa: BLE001 - un poll fallido no debe tumbar el servicio
+                        log.exception("Fallo el poll de Batwoman, se reintenta en el proximo ciclo")
+                if monitor and time.monotonic() >= next_egress:
+                    next_egress = time.monotonic() + ecfg["interval"]
+                    try:
+                        await egress_poll(monitor, config, client, notifier)
+                    except Exception:  # noqa: BLE001 - un ciclo de egress fallido no debe tumbar el servicio
+                        log.exception("Fallo el ciclo de egress, se reintenta en el proximo")
+                if args.once:
+                    return
+                wake = min(next_poll, next_egress) if monitor else next_poll
+                await asyncio.sleep(max(1.0, wake - time.monotonic()))
+        finally:
+            if monitor:
+                await monitor.stop_stream()
 
     if typesafe_available:
         async with AsyncTypeSafeClient() as client:
@@ -1225,7 +1240,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--once", action="store_true", help="un solo poll (y un ciclo de egress) y termina")
     parser.add_argument(
         "--egress-snapshot", action="store_true",
-        help="imprime las conexiones salientes actuales clasificadas, sin alertar ni guardar",
+        help="escucha 60s el stream de conntrack e imprime esos flujos + el snapshot de ss, sin alertar ni guardar",
     )
     return parser.parse_args()
 

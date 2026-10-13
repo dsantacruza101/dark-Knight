@@ -314,31 +314,57 @@ estado); `--once` hace un solo poll (y un ciclo de egress).
 
 ### Egress: conexiones salientes (`batcave/egress.py`)
 
-El mismo ciclo principal corre, cada `batwoman.egress.interval` segundos (60),
-un snapshot de conexiones TCP establecidas hacia IPs publicas (`is_global`,
-fuera de las subredes de Docker):
+Flujos salientes TCP y UDP hacia IPs publicas (`is_global`, fuera de las
+subredes de Docker y de las IPs del host; se ignora el DNS 53/853 hacia los
+resolvers del sistema: `/etc/resolv.conf` + upstreams de systemd-resolved):
 
-- **Host**: `sudo -n ss -tnpH state established` → proceso, local, remoto.
-  Se descartan las entrantes (puerto local en escucha segun `ss -tlnH`).
-- **Containers**: `sudo -n conntrack -L -p tcp -o extended` → direccion
-  original (src/dst/dport) de las ESTABLISHED cuyo src esta en una subred de
-  Docker; la IP se mapea al container (`docker:<nombre>`) con
-  `docker network inspect` (cache 10 min, refresco forzado si aparece una IP
-  desconocida).
+- **Stream** (principal, `egress.stream`): `ConntrackStream` corre
+  `sudo -n conntrack -E -e NEW -o timestamp,extended` en segundo plano dentro
+  de batwoman.py (backoff exponencial 1s→300s si muere). Ve conexiones
+  cortas (TypeSafe, GitHub, Telegram) y QUIC de cloudflared. Origen:
+  `docker:<nombre>` si el src esta en una subred de Docker (mapa via
+  `docker network inspect`, cache 10 min, refresco forzado ante IP
+  desconocida), si no `host:<proceso>`.
+- **Atribucion de procesos del host**: cache de
+  `sudo -n ss -tunpH state established` (refresco cada `egress.ss_refresh`,
+  10s), cruzando (protocolo, puerto local, ip:puerto remoto). Como un
+  snapshot anterior al flujo no puede contenerlo, cada flujo espera
+  `attribution_delay` (0.5s) y se busca en un snapshot tomado despues
+  (refresco bajo demanda, max uno cada `ss_min_interval`, 1s). UDP no
+  conectado (QUIC) cae a `sudo -n ss -uanpH` por puerto local. Si no
+  aparece: `host:unknown`.
+- **Snapshot de respaldo**: cada `egress.interval` (60s) el ciclo toma los
+  flujos acumulados; solo si el stream estuvo caido desde el ciclo anterior
+  (o es el primer ciclo, para ver las conexiones que ya existian) agrega
+  `sudo -n ss -tunpH state established` (descartando entrantes por puerto en
+  escucha segun `ss -tulnH`) y `sudo -n conntrack -L -o extended`
+  (containers: TCP ESTABLISHED + UDP).
 - **Identidad**: ASN y organizacion via DNS de Team Cymru (TXT a
   `<ip-invertida>.origin.asn.cymru.com` / `origin6` y `AS<n>.asn.cymru.com`,
   cliente DNS propio con stdlib) + reverse DNS solo para mostrar. Cache en
   `batcave/memory/egress_asn_cache.json` (TTL `egress.asn_cache_days`, 7).
 - **Linea base** (`batcave/memory/egress_baseline.json`): llave
-  `(proceso o container, ASN, puerto)`, nunca la IP; `first_seen`,
+  `(origen, ASN, puerto, protocolo)`, nunca la IP; `first_seen`,
   `last_seen`, `count`, `origin` (learning/allowlist/evaluated). Durante
-  `egress.learning_days` (7) desde el primer ciclo solo se aprende.
-- **Destino nuevo** (llave nunca vista, ya fuera de aprendizaje): si la
-  organizacion coincide (substring) con `egress_orgs` del allowlist
-  (Cloudflare, GitHub, Telegram, Anthropic, Fastly, Canonical, Docker) entra
-  directo a la linea base. Si no, TypeSafe (Jev): `is_suspicious` (Noul),
+  `egress.learning_days` (7) desde el primer ciclo solo se aprende. Las
+  llaves del formato anterior (`proceso|ASn|puerto`) se migran solas a
+  `host:proceso|ASn|puerto|tcp`.
+- **Destino nuevo** (llave nunca vista, ya fuera de aprendizaje): si una
+  entrada de `egress_orgs` del allowlist cubre el flujo entra directo a la
+  linea base. Cada entrada: `org` (substring), y opcionales `sources`
+  (fnmatch sobre el origen: `host:cloudflared`, `docker:*`) y `ports`
+  (`7844/udp`, `443/tcp`); deben coincidir todos los presentes. Los CDN
+  (`cdn: true`; Cloudflare, Fastly, Akamai y CloudFront se fuerzan como CDN)
+  nunca se allowlistean por organizacion completa: exigen `sources` y
+  `ports` (si faltan, la entrada se rechaza al cargar con un warning) y una
+  entrada amplia no los cubre. Hoy: Cloudflare -> `host:cloudflared`
+  7844/udp+tcp, `host:python3`/`host:penguin` 443/tcp; Fastly ->
+  `host:python3`/`host:pip` 443/tcp; GitHub, Telegram, Anthropic, Canonical
+  y Docker por organizacion. Si no hay entrada que cubra el flujo (p. ej.
+  otro proceso hacia Cloudflare), TypeSafe (Jev): `is_suspicious` (Noul),
   `severity` (Score), `action` (Choice: notify_now/digest/learn), con
-  origen, ASN/org, rDNS, puerto y antiguedad del origen en la linea base.
+  origen, ASN/org, rDNS, puerto, protocolo y antiguedad del origen en la
+  linea base.
   Fallback: `notify_now` si el puerto no esta en `egress.safe_ports`
   (80/443/53/853/22/7844) o el origen no existe en la linea base; si no
   `digest`. Toda llave evaluada se agrega a la linea base (alerta una vez).
@@ -347,13 +373,16 @@ fuera de las subredes de Docker):
   Topes por ciclo: `max_lookups_per_cycle`, `max_evaluations_per_cycle`.
 - **Digest**: seccion Egress (progreso del aprendizaje o destinos nuevos
   desde el ultimo digest + top 5 origenes por destinos distintos).
-- `python3 batwoman.py --egress-snapshot` imprime las conexiones actuales
-  clasificadas (`origen -> org [ASN] :puerto`, new/known/allowlisted) sin
+- `python3 batwoman.py --egress-snapshot` imprime las lineas de sudoers
+  requeridas, escucha el stream 60s y muestra esos flujos (hora, cantidad)
+  mas el snapshot actual de ss/conntrack, clasificados
+  (`origen -> org [ASN] :puerto/protocolo`, new/known/allowlisted) sin
   alertar ni guardar nada.
 - Requiere en `sudoers.d/batifamilia` (NOPASSWD) exactamente
-  `/usr/bin/ss -tnpH state established` y
-  `/usr/sbin/conntrack -L -p tcp -o extended` (allowlisteados para la regla
-  5402 en `batwoman_allowlist.yaml`).
+  `/usr/bin/ss -tunpH state established`, `/usr/bin/ss -uanpH`,
+  `/usr/sbin/conntrack -L -o extended` y
+  `/usr/sbin/conntrack -E -e NEW -o timestamp\,extended` (coma escapada en
+  sudoers; allowlisteados para la regla 5402 en `batwoman_allowlist.yaml`).
 
 ## Variables de entorno (`/etc/night-agent.env`)
 
