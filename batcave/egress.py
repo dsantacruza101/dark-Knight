@@ -393,6 +393,28 @@ def host_source(process: Optional[str]) -> str:
     return f"host:{process or 'unknown'}"
 
 
+def ss_flow_index(out: Optional[str]) -> dict[tuple, Optional[str]]:
+    """(protocolo, puerto local, ip remota, puerto remoto) -> proceso, desde
+    `ss -tunpH state established`."""
+    index = {}
+    for line in (out or "").splitlines():
+        parsed = parse_ss_line(line)
+        if parsed and parsed["proto"] and parsed["peer_ip"] is not None:
+            index[(parsed["proto"], parsed["local_port"], str(parsed["peer_ip"]), parsed["peer_port"])] = parsed["process"]
+    return index
+
+
+def udp_port_index(out: Optional[str]) -> dict[int, str]:
+    """Puerto local UDP -> proceso, desde `ss -uanpH` (incluye sockets no
+    conectados, como los de QUIC de cloudflared)."""
+    index = {}
+    for line in (out or "").splitlines():
+        parsed = parse_ss_line(line)
+        if parsed and parsed["process"] and parsed["local_port"] is not None:
+            index[parsed["local_port"]] = parsed["process"]
+    return index
+
+
 # --- Snapshot (respaldo) ----------------------------------------------------------------
 
 
@@ -406,9 +428,9 @@ def listening_ports(timeout: int) -> set[tuple[str, int]]:
     return ports
 
 
-def host_connections(ecfg: dict, docker: DockerMap) -> list[dict]:
-    timeout = int(ecfg["command_timeout"])
-    out = _run("ss (sudo)", HOST_CMD, timeout)
+def host_connections(out: Optional[str], docker: DockerMap, timeout: int) -> list[dict]:
+    """Conexiones salientes del host segun `ss state established`. No ve
+    sockets UDP no conectados (QUIC): esos salen de conntrack."""
     if out is None:
         return []
     listening = listening_ports(timeout)
@@ -429,22 +451,50 @@ def host_connections(ecfg: dict, docker: DockerMap) -> list[dict]:
                 "port": parsed["peer_port"],
                 "protocol": parsed["proto"],
                 "local": f"{parsed['local_ip']}:{parsed['local_port']}",
+                "flow": (parsed["proto"], parsed["local_port"], str(parsed["peer_ip"]), parsed["peer_port"]),
             }
         )
     return conns
 
 
-def container_connections(ecfg: dict, docker: DockerMap) -> list[dict]:
-    out = _run("conntrack (sudo)", CONNTRACK_CMD, int(ecfg["command_timeout"]))
+def conntrack_connections(docker: DockerMap, timeout: int, ss_index: dict, seen: set) -> list[dict]:
+    """Flujos salientes de `conntrack -L`: containers y, del host, los que ss
+    no vio (`seen`: flujos ya encontrados por ss), p. ej. QUIC en sockets UDP
+    no conectados. El proceso del host se atribuye con el mismo cruce que
+    usa el stream: `ss_index` y, para UDP, el puerto local en `ss -uanpH`."""
+    out = _run("conntrack (sudo)", CONNTRACK_CMD, timeout)
     if out is None:
         return []
-    conns = []
+    conns, host_keys = [], set()
+    udp_index: Optional[dict[int, str]] = None
     for line in out.splitlines():
         flow = parse_conntrack_line(line)
         # UDP no tiene estado en conntrack; TCP solo establecidas.
         if flow is None or (flow["proto"] == "tcp" and not flow["established"]):
             continue
-        if classify_flow(flow["src"], flow["dst"], flow["dport"], docker) != "container":
+        kind = classify_flow(flow["src"], flow["dst"], flow["dport"], docker)
+        if kind == "host":
+            ident = (flow["proto"], flow["sport"], str(flow["dst"]), flow["dport"])
+            if ident in seen:
+                continue
+            process = ss_index.get(ident)
+            if process is None and flow["proto"] == "udp":
+                if udp_index is None:
+                    udp_index = udp_port_index(_run("ss -u (sudo)", UDP_SOCKETS_CMD, timeout))
+                process = udp_index.get(flow["sport"])
+            source = host_source(process)
+            key = (source, str(flow["dst"]), flow["dport"], flow["proto"])
+            if key in host_keys:
+                continue
+            host_keys.add(key)
+            conns.append(
+                {
+                    "source": source, "kind": "host", "ip": str(flow["dst"]), "port": flow["dport"],
+                    "protocol": flow["proto"], "local": f"{flow['src']}:{flow['sport']}",
+                }
+            )
+            continue
+        if kind != "container":
             continue
         name = docker.by_ip.get(str(flow["src"]))
         if name is None:
@@ -464,7 +514,11 @@ def container_connections(ecfg: dict, docker: DockerMap) -> list[dict]:
 
 def take_snapshot(ecfg: dict, docker: DockerMap) -> list[dict]:
     docker.refresh()
-    return host_connections(ecfg, docker) + container_connections(ecfg, docker)
+    timeout = int(ecfg["command_timeout"])
+    out = _run("ss (sudo)", HOST_CMD, timeout)
+    conns = host_connections(out, docker, timeout)
+    seen = {conn.pop("flow") for conn in conns}
+    return conns + conntrack_connections(docker, timeout, ss_flow_index(out), seen)
 
 
 # --- Stream de eventos (conntrack -E) ------------------------------------------------------
@@ -596,22 +650,12 @@ class ConntrackStream:
     async def _refresh_ss(self) -> None:
         taken = time.monotonic()
         out = await asyncio.to_thread(_run, "ss (sudo)", HOST_CMD, self.timeout)
-        index = {}
-        for line in (out or "").splitlines():
-            parsed = parse_ss_line(line)
-            if parsed and parsed["proto"] and parsed["process"] and parsed["peer_ip"] is not None:
-                index[(parsed["proto"], parsed["local_port"], str(parsed["peer_ip"]), parsed["peer_port"])] = parsed["process"]
-        self.ss_index, self.ss_at = index, taken
+        self.ss_index, self.ss_at = ss_flow_index(out), taken
 
     async def _refresh_udp(self) -> None:
         taken = time.monotonic()
         out = await asyncio.to_thread(_run, "ss -u (sudo)", UDP_SOCKETS_CMD, self.timeout)
-        index = {}
-        for line in (out or "").splitlines():
-            parsed = parse_ss_line(line)
-            if parsed and parsed["process"] and parsed["local_port"] is not None:
-                index[parsed["local_port"]] = parsed["process"]
-        self.udp_index, self.udp_at = index, taken
+        self.udp_index, self.udp_at = udp_port_index(out), taken
 
     def _can_refresh(self, last: float) -> bool:
         return time.monotonic() - last >= self.min_interval
