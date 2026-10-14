@@ -67,15 +67,20 @@ Flujo por issue:
      `reports/aider-<repo>-<issue>-<intento>.log`, y se enmascaran los
      secretos al terminar el proceso (incluso si hubo timeout, queda la
      salida parcial).
-  5. Candado: los cambios en rutas prohibidas se revierten
+  5. Candado: primero se borran los artefactos de Aider (`.aider*`, ver
+     `remove_aider_artifacts`; Aider ademas los agrega al `.gitignore`, y al
+     revertir ese cambio quedarian visibles para git). Los cambios en rutas
+     prohibidas se revierten
      (`revert_forbidden_changes`), y cualquier archivo modificado o creado
      que no este en la lista de archivos permitidos tambien se revierte
      (`revert_unlisted_changes`); los archivos permitidos que queden vacios
      o solo con espacios/comentarios se borran (`delete_empty_allowed_files`).
      Este candado se aplica SIEMPRE, incluso si aider termino por timeout o
      error, antes de verificar o comitear.
-  6. Verificacion antes de comitear (`verify_changes`): cada archivo
-     permitido debe existir, tener contenido real y pasar una validacion
+  6. Verificacion antes de comitear (`verify_changes`): sin lista de
+     archivos permitidos no hay intento posible (needs-review directo). Cada
+     archivo permitido debe existir, no estar vacio, diferir de su version
+     en `origin/<work_branch>` (o ser nuevo) y pasar una validacion
      minima segun su tipo (`validate_allowed_file_content`): `.py` debe
      tener al menos un `def`/`class`; `.service`
      debe tener `[Unit]`/`[Service]` y `ExecStart=`; `.timer` debe tener
@@ -83,8 +88,10 @@ Flujo por issue:
      debe tener `describe(`/`it(`/`test(`. Ademas se corren los pasos de
      `verification` del perfil del especialista para cada stack detectado
      (p. ej. Node: npm ci si hace falta, build, lint, test; Python:
-     py_compile + pytest); si hay archivos de test entre los permitidos, se
-     confirma que jest/vitest o pytest los detecta (conteo de tests > 0).
+     py_compile + pytest). Cada archivo de test permitido (`*.spec.ts`,
+     `*.test.ts`, `test_*.py`) se corre aparte con su runner apuntando solo a
+     ese archivo (`run_test_file`: jest `--runTestsByPath` con `--json`, o
+     `pytest <archivo>`): debe ejecutar mas de 0 tests y 0 fallidos.
      Si falla, el intento cuenta
      como fallido: la salida COMPLETA del comando que fallo queda en
      `reports/aider-<repo>-<issue>-<intento>.log`,
@@ -98,6 +105,12 @@ Flujo por issue:
   7. Si Aider agoto sus intentos, escalacion a Claude (ver arriba).
   8. El especialista comitea con el mensaje 'feat(<especialista>): ...' y hace push
      (contra el remoto de GitHub, no contra el directorio de produccion).
+     Nunca `git add -A`: `commit_allowed_and_push` borra los `.aider*`,
+     stagea solo `git add -- <archivo permitido>` y exige que
+     `git diff --cached --name-only` sea un subconjunto no vacio de la lista
+     permitida; si no, aborta el commit y el intento cuenta como fallido.
+     El reporte incluye una autoverificacion: archivos exactos del commit y
+     tests ejecutados por archivo de test.
 
 Restricciones duras (no configurables):
   - Nunca se toca ni se hace checkout de main/master; si el branch de trabajo
@@ -134,6 +147,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -191,8 +205,13 @@ FILES_SECTION_HEADER_RE = re.compile(r"^\s*archivos\s*:\s*$", re.IGNORECASE)
 SERVICE_CHECK_LINE_RE = re.compile(r"systemctl|is-active|docker", re.IGNORECASE)
 TEST_FILE_NAME_RE = re.compile(r"^test_.+\.py$|.+\.(?:spec|test)\.[jt]sx?$")
 NODE_TEST_COUNT_RE = re.compile(r"Tests:\s*(?:(\d+) failed,\s*)?(?:(\d+) skipped,\s*)?(\d+) passed")
-PYTEST_COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 PYTEST_PASSED_RE = re.compile(r"(\d+)\s+passed")
+PYTEST_FAILED_RE = re.compile(r"(\d+)\s+failed")
+PYTEST_ERRORS_RE = re.compile(r"(\d+)\s+errors?\b")
+PYTEST_SUMMARY_LINE_RE = re.compile(r"^.*\bin [\d.]+s\b.*$", re.MULTILINE)
+JEST_TESTS_LINE_RE =re.compile(r"^Tests:\s+(.+)$", re.MULTILINE)
+AIDER_ARTIFACT_PREFIX = ".aider"
+ARTIFACT_SCAN_SKIP_DIRS = {".git", "node_modules"}
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 NOTE_KEYWORDS_RE = re.compile(r"^\s*keywords\s*:\s*(.+)$", re.IGNORECASE)
 NOTE_STEM_SPLIT_RE = re.compile(r"[-_.\s]+")
@@ -648,8 +667,17 @@ def run_aider(
     return True
 
 
+def normalize_rel_path(rel_path: str) -> str:
+    """Quita espacios y prefijos `./` (no `lstrip("./")`, que tambien le
+    quitaria el punto inicial a `.env`, `.ssh` o `.aider*`)."""
+    normalized = rel_path.strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.rstrip("/")
+
+
 def is_forbidden_path(rel_path: str) -> bool:
-    normalized = rel_path.strip().lstrip("./").lower()
+    normalized = normalize_rel_path(rel_path).lower()
     name = Path(normalized).name
     if any(sub in name for sub in FORBIDDEN_NAME_SUBSTRINGS):
         return True
@@ -685,10 +713,10 @@ def revert_unlisted_changes(repo_path: Path, allowed_files: list[str], log_path:
     """Candado: revierte (git checkout -- y git clean) cualquier archivo
     modificado o creado que no este en `allowed_files`. Se registra en
     `log_path` para que quede rastro de lo que Aider intento tocar de mas."""
-    allowed = {f.strip().lstrip("./") for f in allowed_files}
+    allowed = {normalize_rel_path(f) for f in allowed_files}
     reverted: list[str] = []
     for rel_path in changed_files(repo_path):
-        if rel_path.strip().lstrip("./") in allowed:
+        if normalize_rel_path(rel_path) in allowed:
             continue
         run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
         run_cli(["git", "clean", "-fd", "--", rel_path], cwd=repo_path)
@@ -696,6 +724,27 @@ def revert_unlisted_changes(repo_path: Path, allowed_files: list[str], log_path:
     if reverted:
         append_to_log(log_path, "candado (fuera de la lista permitida, revertidos)", "\n".join(reverted))
     return reverted
+
+
+def remove_aider_artifacts(repo_path: Path) -> list[str]:
+    """Borra todo archivo/directorio `.aider*` del workspace (historial de
+    chat, input, cache de tags). Recorre el disco en vez de `git status`
+    porque Aider los agrega al `.gitignore`: mientras ese cambio exista git
+    no los ve, y al revertirlo el candado los dejaria listos para comitear."""
+    removed: list[str] = []
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in ARTIFACT_SCAN_SKIP_DIRS]
+        for name in [d for d in dirs if d.startswith(AIDER_ARTIFACT_PREFIX)]:
+            shutil.rmtree(Path(root) / name, ignore_errors=True)
+            dirs.remove(name)
+            removed.append(str((Path(root) / name).relative_to(repo_path)) + "/")
+        for name in files:
+            if name.startswith(AIDER_ARTIFACT_PREFIX):
+                (Path(root) / name).unlink(missing_ok=True)
+                removed.append(str((Path(root) / name).relative_to(repo_path)))
+    if removed:
+        log.info("%s: artefactos de Aider eliminados: %s", repo_path.name, ", ".join(removed))
+    return removed
 
 
 def discard_changes(repo_path: Path) -> None:
@@ -880,16 +929,65 @@ def commit_and_push(repo_path: Path, branch: str, message: str) -> bool:
     return True
 
 
+def commit_allowed_and_push(
+    repo_path: Path, branch: str, message: str, allowed_files: list[str]
+) -> tuple[list[str], str, bool]:
+    """Commit del modo Desarrollo: nunca `git add -A`. Borra los `.aider*`,
+    stagea solo `git add -- <archivo>` por cada archivo permitido y exige que
+    `git diff --cached --name-only` sea un subconjunto NO vacio de la lista
+    permitida antes de comitear; si no, vacia el index y aborta.
+
+    Devuelve (archivos del commit segun `git show HEAD`, error si se aborto,
+    push ok). Lista vacia = no hubo commit (el intento cuenta como fallido)."""
+    remove_aider_artifacts(repo_path)
+    allowed = [normalize_rel_path(f) for f in allowed_files]
+    if not allowed:
+        return [], "sin lista de archivos permitidos no se comitea", False
+
+    run_cli(["git", "reset", "-q"], cwd=repo_path)
+    for rel in allowed:
+        add = run_cli(["git", "add", "--", rel], cwd=repo_path)
+        if add.returncode != 0:
+            run_cli(["git", "reset", "-q"], cwd=repo_path)
+            return [], f"git add fallo en {rel}: {mask_secrets(add.stderr.strip()[-300:])}", False
+
+    staged = [
+        normalize_rel_path(line)
+        for line in run_cli(["git", "diff", "--cached", "--name-only"], cwd=repo_path).stdout.splitlines()
+        if line.strip()
+    ]
+    outside = sorted(set(staged) - set(allowed))
+    if not staged or outside:
+        run_cli(["git", "reset", "-q"], cwd=repo_path)
+        reason = (
+            "no hay cambios staged en los archivos permitidos"
+            if not staged
+            else f"el index contiene archivos fuera de la lista permitida: {', '.join(outside)}"
+        )
+        log.error("%s: commit abortado, %s", repo_path.name, reason)
+        return [], f"commit abortado: {reason}", False
+
+    commit = run_cli(["git", "commit", "-m", message], cwd=repo_path)
+    if commit.returncode != 0:
+        run_cli(["git", "reset", "-q"], cwd=repo_path)
+        return [], f"git commit fallo: {mask_secrets((commit.stdout + commit.stderr).strip()[-300:])}", False
+
+    committed = [
+        line.strip()
+        for line in run_cli(["git", "show", "--name-only", "--pretty=format:", "HEAD"], cwd=repo_path).stdout.splitlines()
+        if line.strip()
+    ]
+    push = run_cli(git_cmd(["push", "origin", branch]), cwd=repo_path, extra_env=github_auth_env())
+    if push.returncode != 0:
+        log.error("Fallo el push a %s: %s", branch, mask_secrets(push.stderr[-500:]))
+    return committed, "", push.returncode == 0
+
+
 def count_node_tests_detected(output: str) -> int:
     match = NODE_TEST_COUNT_RE.search(output)
     if not match:
         return 0
     return int(match.group(1) or 0) + int(match.group(3) or 0)
-
-
-def count_pytest_collected(output: str) -> int:
-    match = PYTEST_COLLECTED_RE.search(output)
-    return int(match.group(1)) if match else 0
 
 
 def node_has_script(repo_path: Path, script: str) -> bool:
@@ -1035,18 +1133,105 @@ def run_verification_steps(
     return errors, full_outputs
 
 
-def verify_python_test_files(repo_path: Path, test_files: list[str]) -> list[str]:
-    """Para archivos de test Python entre los permitidos, confirma que
-    pytest los detecta (conteo de tests recolectados > 0)."""
-    if not test_files:
-        return []
-    proc = run_cli(
-        ["python3", "-m", "pytest", *test_files, "--collect-only", "-q"], cwd=repo_path, timeout=120
-    )
-    detected = count_pytest_collected(proc.stdout + proc.stderr)
-    if detected == 0:
-        return ["Los archivos de test no fueron detectados por pytest (0 tests recolectados)"]
-    return []
+def unchanged_vs_remote(repo_path: Path, branch: str, allowed_files: list[str]) -> list[str]:
+    """Archivos permitidos identicos a su version en `origin/<branch>` (los
+    que no existen en el remoto cuentan como nuevos, o sea cambiados)."""
+    unchanged: list[str] = []
+    for rel in allowed_files:
+        full = repo_path / rel
+        if not full.is_file():
+            continue
+        remote = run_cli(["git", "rev-parse", "--verify", "-q", f"origin/{branch}:{normalize_rel_path(rel)}"], cwd=repo_path)
+        if remote.returncode != 0:
+            continue
+        local = run_cli(["git", "hash-object", "--", rel], cwd=repo_path)
+        if local.returncode == 0 and local.stdout.strip() == remote.stdout.strip():
+            unchanged.append(rel)
+    return unchanged
+
+
+def parse_jest_json(report_path: Path, test_path: Path) -> Optional[tuple[int, int]]:
+    """(ejecutados, fallidos) de `test_path` en el reporte `--json` de jest,
+    o None si el reporte no existe o no menciona ese archivo."""
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    for suite in data.get("testResults", []):
+        if Path(suite.get("name", "")).resolve() != test_path.resolve():
+            continue
+        statuses = [a.get("status") for a in suite.get("assertionResults", [])]
+        failed = statuses.count("failed")
+        if suite.get("status") == "failed" and failed == 0:
+            failed = 1  # la suite no compilo / reventó antes de correr tests
+        return statuses.count("passed") + statuses.count("failed"), failed
+    return None
+
+
+def run_test_file(repo_path: Path, rel: str) -> tuple[int, int, str]:
+    """Corre el runner apuntando SOLO a `rel`. Devuelve (tests ejecutados,
+    fallidos, salida). Node: `npm test -- --runTestsByPath <rel>` con
+    `--json` a un archivo temporal fuera del repo (fallback: linea `Tests:`
+    del texto, exigiendo que el archivo aparezca en la salida). Python:
+    `pytest <rel>`; ejecutados = passed + failed + errors."""
+    if rel.endswith(".py"):
+        proc = run_cli(
+            ["python3", "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"], cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT
+        )
+        output = mask_secrets(proc.stdout + proc.stderr)
+        summaries = PYTEST_SUMMARY_LINE_RE.findall(output)
+        summary = summaries[-1] if summaries else ""
+        counts = {
+            name: sum(int(n) for n in regex.findall(summary))
+            for name, regex in (("passed", PYTEST_PASSED_RE), ("failed", PYTEST_FAILED_RE), ("errors", PYTEST_ERRORS_RE))
+        }
+        failed = counts["failed"] + counts["errors"]
+        if proc.returncode not in (0, 5) and failed == 0:
+            failed = 1
+        return counts["passed"] + failed, failed, output
+
+    with tempfile.TemporaryDirectory(prefix="nightwing-jest-") as tmp:
+        report_path = Path(tmp) / "jest.json"
+        proc = run_cli(
+            ["npm", "test", "--", "--runTestsByPath", rel, "--watchAll=false", "--ci",
+             "--json", f"--outputFile={report_path}"],
+            cwd=repo_path,
+            timeout=DEFAULT_STEP_TIMEOUT,
+            extra_env={"CI": "true"},
+        )
+        output = mask_secrets(proc.stdout + proc.stderr)
+        parsed = parse_jest_json(report_path, repo_path / rel)
+    if parsed is not None:
+        executed, failed = parsed
+    else:
+        match = JEST_TESTS_LINE_RE.search(output)
+        if not match or Path(rel).name not in output:
+            return 0, 0, output
+        summary = match.group(1)
+        passed = sum(int(n) for n in re.findall(r"(\d+) passed", summary))
+        failed = sum(int(n) for n in re.findall(r"(\d+) failed", summary))
+        executed = passed + failed
+    if proc.returncode != 0 and failed == 0:
+        failed = 1
+    return executed, failed, output
+
+
+def verify_test_files(repo_path: Path, test_files: list[str]) -> tuple[list[str], list[str], dict[str, dict]]:
+    """Cada archivo de test permitido debe ejecutar > 0 tests y 0 fallidos
+    corriendo su runner apuntado a ese archivo. Devuelve (errores, salidas
+    completas de los fallidos, {archivo: {"executed", "failed"}})."""
+    errors: list[str] = []
+    full_outputs: list[str] = []
+    counts: dict[str, dict] = {}
+    for rel in test_files:
+        if not (repo_path / rel).is_file():
+            continue
+        executed, failed, output = run_test_file(repo_path, rel)
+        counts[rel] = {"executed": executed, "failed": failed}
+        if executed == 0 or failed > 0:
+            errors.append(f"{rel}: {executed} test(s) ejecutados, {failed} fallido(s) (se exige > 0 y 0)")
+            full_outputs.append(f"=== tests de {rel} ===\n{output}")
+    return errors, full_outputs, counts
 
 
 def last_lines(text: str, n: int) -> str:
@@ -1054,34 +1239,50 @@ def last_lines(text: str, n: int) -> str:
 
 
 def verify_changes(
-    repo_path: Path, allowed_files: list[str], log_path: Path, profile: dict
-) -> tuple[bool, str, str]:
-    """Verificacion antes de comitear: cada archivo permitido debe existir,
-    tener contenido real y pasar su validacion minima por tipo
-    (`validate_allowed_file_content`); luego los pasos de `verification` del
-    perfil del especialista (`run_verification_steps`); y para archivos de
-    test Python permitidos en repos no-Node, `pytest --collect-only`.
-    Si falla, el intento cuenta como fallido, la salida COMPLETA de los
-    comandos fallidos queda en el log del intento, y se devuelve junto con
-    un resumen corto (para needs-review)."""
+    repo_path: Path, allowed_files: list[str], branch: str, log_path: Path, profile: dict
+) -> tuple[bool, str, str, dict[str, dict]]:
+    """Criterio de exito de un intento (Aider o Claude), antes de comitear:
+      - hay lista de archivos permitidos;
+      - CADA archivo permitido existe, no esta vacio, pasa su validacion
+        minima por tipo (`validate_allowed_file_content`) y difiere de su
+        version en `origin/<branch>` (o es nuevo);
+      - pasan los pasos de `verification` del perfil (`run_verification_steps`);
+      - cada archivo de test permitido, corrido aparte con su runner, ejecuta
+        > 0 tests y 0 fallidos (`verify_test_files`).
+    Si ningun archivo permitido existe o cambio respecto al remoto no se
+    corren los pasos (no hay nada que verificar). Si falla, el intento cuenta como
+    fallido, la salida COMPLETA de los comandos fallidos queda en el log del
+    intento y se devuelve junto con un resumen corto (para needs-review).
+    Devuelve (ok, resumen, salida completa, tests por archivo)."""
+    if not allowed_files:
+        error = "el issue no tiene lista de archivos permitidos"
+        append_to_log(log_path, "verificacion fallida", error)
+        return False, error, error, {}
+
     test_files = [f for f in allowed_files if TEST_FILE_NAME_RE.match(Path(f).name)]
-
     errors = validate_allowed_file_content(repo_path, allowed_files)
-    full_outputs: list[str] = []
+    unchanged = unchanged_vs_remote(repo_path, branch, allowed_files)
+    errors.extend(f"{rel}: identico a origin/{branch} (no se cambio nada)" for rel in unchanged)
+    present = [f for f in allowed_files if (repo_path / f).is_file()]
+    if len(unchanged) == len(present):
+        full_output = "\n".join(errors)
+        append_to_log(log_path, "verificacion fallida", full_output)
+        return False, "; ".join(errors), full_output, {}
 
+    full_outputs: list[str] = []
     step_errors, step_full = run_verification_steps(repo_path, profile, allowed_files, test_files)
     errors.extend(step_errors)
     full_outputs.extend(step_full)
 
-    if not (repo_path / "package.json").exists():
-        python_test_files = [f for f in test_files if f.endswith(".py")]
-        errors.extend(verify_python_test_files(repo_path, python_test_files))
+    test_errors, test_full, test_counts = verify_test_files(repo_path, test_files)
+    errors.extend(test_errors)
+    full_outputs.extend(test_full)
 
     if errors:
-        full_output = "\n\n".join(full_outputs) if full_outputs else "\n".join(errors)
+        full_output = "\n\n".join(full_outputs + ["\n".join(errors)])
         append_to_log(log_path, "verificacion fallida", full_output)
-        return False, "; ".join(errors), full_output
-    return True, "", ""
+        return False, "; ".join(errors), full_output, test_counts
+    return True, "", "", test_counts
 
 
 def mark_needs_review(repo_obj, issue_obj, reason: str, profile: dict) -> None:
@@ -1099,9 +1300,13 @@ def mark_needs_review(repo_obj, issue_obj, reason: str, profile: dict) -> None:
 
 
 def apply_guard(repo_path: Path, allowed_files: list[str], log_path: Path, tag: str, who: str) -> None:
-    """Candado comun a Aider y a la escalacion a Claude: revierte rutas
-    prohibidas y archivos fuera de la lista permitida, y borra los archivos
-    permitidos que hayan quedado vacios."""
+    """Candado comun a Aider y a la escalacion a Claude: borra los artefactos
+    `.aider*` (antes de revertir el `.gitignore` que Aider modifica), revierte
+    rutas prohibidas y archivos fuera de la lista permitida, y borra los
+    archivos permitidos que hayan quedado vacios."""
+    artifacts = remove_aider_artifacts(repo_path)
+    if artifacts:
+        append_to_log(log_path, "candado (artefactos de aider, eliminados)", "\n".join(artifacts))
     reverted = revert_forbidden_changes(repo_path)
     if reverted:
         log.warning("%s: %s toco rutas prohibidas, revertidas: %s", tag, who, ", ".join(reverted))
@@ -1226,23 +1431,24 @@ def escalate_to_claude(
     last_full_output: str,
     deadline: datetime,
     escalation_state: dict,
-) -> tuple[bool, str]:
+    branch: str,
+) -> tuple[bool, str, dict[str, dict]]:
     """Escalacion unica a Claude tras agotar los intentos de Aider. Devuelve
-    (resuelto, motivo si no se resolvio). Aplica el mismo candado y la misma
-    verificacion que con Aider."""
+    (resuelto, motivo si no se resolvio, tests por archivo). Aplica el mismo
+    candado y la misma verificacion que con Aider."""
     tag = f"{issue['repo']}#{issue['number']}"
     claude_bin = config.get("models", {}).get("claude", "claude")
     claude_timeout = int(config.get("development", {}).get("claude_timeout", DEFAULT_CLAUDE_TIMEOUT))
 
     if not allowed_files:
-        return False, "sin lista de archivos permitidos no se escala a Claude"
+        return False, "sin lista de archivos permitidos no se escala a Claude", {}
     if escalation_state["remaining"] <= 0:
-        return False, f"se alcanzo el limite de {escalation_state['max']} escalacion(es) a Claude por noche"
+        return False, f"se alcanzo el limite de {escalation_state['max']} escalacion(es) a Claude por noche", {}
     if shutil.which(claude_bin) is None:
-        return False, f"Claude no esta disponible ('{claude_bin}' no encontrado)"
+        return False, f"Claude no esta disponible ('{claude_bin}' no encontrado)", {}
     remaining_seconds = (deadline - datetime.now()).total_seconds()
     if remaining_seconds < MIN_ESCALATION_SECONDS:
-        return False, f"no queda tiempo dentro del limite de {MAX_HOURS_PER_ISSUE}h para escalar a Claude"
+        return False, f"no queda tiempo dentro del limite de {MAX_HOURS_PER_ISSUE}h para escalar a Claude", {}
 
     escalation_state["remaining"] -= 1
     escalation_state["used"] += 1
@@ -1270,17 +1476,23 @@ def escalate_to_claude(
 
     apply_guard(repo_path, allowed_files, log_path, tag, "claude")
     if not changed_files(repo_path):
-        return False, "Claude no genero cambios utilizables" + ("" if claude_ok else " (timeout o error)")
+        return False, "Claude no genero cambios utilizables" + ("" if claude_ok else " (timeout o error)"), {}
 
-    ok, error, _ = verify_changes(repo_path, allowed_files, log_path, profile)
+    ok, error, _, test_counts = verify_changes(repo_path, allowed_files, branch, log_path, profile)
     if ok:
-        return True, ""
-    return False, f"la solucion de Claude tampoco paso la verificacion: {error}"
+        return True, "", test_counts
+    return False, f"la solucion de Claude tampoco paso la verificacion: {error}", test_counts
 
 
-def process_issue(config: dict, issue: dict, profile: dict, escalation_state: dict) -> tuple[str, str]:
-    """Resuelve un issue con el especialista `profile`. Devuelve (mensaje,
-    resolutor), con resolutor en `SOLVER_AIDER`/`SOLVER_CLAUDE`/`SOLVER_NONE`."""
+def issue_result(message: str, solver: str, committed: Optional[list[str]] = None, tests: Optional[dict] = None) -> dict:
+    return {"message": message, "solver": solver, "committed": committed or [], "tests": tests or {}}
+
+
+def process_issue(config: dict, issue: dict, profile: dict, escalation_state: dict) -> dict:
+    """Resuelve un issue con el especialista `profile`. Devuelve
+    `issue_result`: mensaje, resolutor (`SOLVER_AIDER`/`SOLVER_CLAUDE`/
+    `SOLVER_NONE`), archivos exactos del commit y tests por archivo de test
+    (para la autoverificacion del reporte)."""
     tag = f"{issue['repo']}#{issue['number']}"
     repo_short_name = issue["repo"].split("/")[-1]
     branch = config["github"]["work_branch"]
@@ -1293,19 +1505,31 @@ def process_issue(config: dict, issue: dict, profile: dict, escalation_state: di
     if repo_path is None:
         msg = f"❌ {tag}: no se pudo preparar el workspace aislado para {issue['repo']}"
         log.error(msg)
-        return msg, SOLVER_NONE
+        return issue_result(msg, SOLVER_NONE)
 
     if not repo_is_clean(repo_path):
         msg = f"⚠️ {tag}: el workspace tiene cambios sin commitear, se omite para no pisarlos"
         log.warning(msg)
-        return msg, SOLVER_NONE
+        return issue_result(msg, SOLVER_NONE)
 
     body = relativize_paths_in_body(issue["body"], config, issue["repo"])
-    allowed_files = extract_allowed_files(body)
+    allowed_files = [normalize_rel_path(f) for f in extract_allowed_files(body)]
     specialist_context = build_specialist_context(config, profile, f"{issue['title']}\n{body}")
 
+    if not allowed_files:
+        reason = "el issue no declara archivos (seccion `Archivos:` o rutas mencionadas); sin lista permitida no se puede comitear"
+        mark_needs_review(issue["repo_obj"], issue["issue_obj"], reason, profile)
+        msg = f"🚫 {tag}: {reason}; marcado 'needs-review'"
+        log.error(msg)
+        return issue_result(msg, SOLVER_NONE)
+
+    def commit_message(solver: str) -> str:
+        return f"feat({profile['name']}): resuelve #{issue['number']} - {issue['title']}\n\nResuelto por: {solver}"
+
     deadline = datetime.now() + timedelta(hours=MAX_HOURS_PER_ISSUE)
-    written: list[str] = []
+    committed: list[str] = []
+    pushed = False
+    test_counts: dict[str, dict] = {}
     previous_error: Optional[str] = None
     last_full_output = ""
     attempts = 0
@@ -1313,7 +1537,7 @@ def process_issue(config: dict, issue: dict, profile: dict, escalation_state: di
         if datetime.now() >= deadline:
             msg = f"⏱️ {tag}: se alcanzo el limite de {MAX_HOURS_PER_ISSUE}h, se pasa al siguiente issue"
             log.warning(msg)
-            return msg, SOLVER_NONE
+            return issue_result(msg, SOLVER_NONE, tests=test_counts)
 
         attempts += 1
         attempt_log_path = REPORTS_DIR / f"aider-{repo_short_name}-{issue['number']}-{attempts}.log"
@@ -1339,8 +1563,9 @@ def process_issue(config: dict, issue: dict, profile: dict, escalation_state: di
             aider_ok = run_aider(repo_path, aider_model, message, allowed_files, aider_timeout, attempt_log_path)
 
         # Candado: se aplica SIEMPRE, incluso si aider termino por timeout o
-        # error, para revertir rutas prohibidas/archivos fuera de la lista
-        # permitida y borrar los archivos permitidos que hayan quedado vacios.
+        # error, para borrar los .aider*, revertir rutas prohibidas/archivos
+        # fuera de la lista permitida y borrar los permitidos que hayan
+        # quedado vacios.
         apply_guard(repo_path, allowed_files, attempt_log_path, tag, "aider")
 
         if not aider_ok:
@@ -1354,27 +1579,37 @@ def process_issue(config: dict, issue: dict, profile: dict, escalation_state: di
             log.warning("%s: intento %d/%d con aider sin resultado util", tag, attempts, aider_attempts)
             continue
 
-        written = changed_files(repo_path)
-        if written:
-            ok, error, full_output = verify_changes(repo_path, allowed_files, attempt_log_path, profile)
-            if ok:
+        ok, error, full_output, test_counts = verify_changes(
+            repo_path, allowed_files, branch, attempt_log_path, profile
+        )
+        if ok:
+            committed, commit_error, pushed = commit_allowed_and_push(
+                repo_path, branch, commit_message(SOLVER_AIDER), allowed_files
+            )
+            if committed:
                 break
-            log.warning("%s: intento %d/%d fallo la verificacion: %s", tag, attempts, aider_attempts, error)
-            # No se descartan los cambios: el siguiente intento parte del
-            # archivo ya generado para que aider lo corrija, en vez de
-            # arrancar de cero.
-            previous_error = last_lines(full_output, VERIFICATION_FEEDBACK_LINES)
-            last_full_output = full_output
-            written = []
-        log.warning("%s: intento %d/%d con aider sin resultado util", tag, attempts, aider_attempts)
+            error = full_output = commit_error
+            append_to_log(attempt_log_path, "commit abortado", commit_error)
+        log.warning("%s: intento %d/%d fallo: %s", tag, attempts, aider_attempts, error)
+        # No se descartan los cambios: el siguiente intento parte del
+        # archivo ya generado para que aider lo corrija, en vez de
+        # arrancar de cero.
+        previous_error = last_lines(full_output, VERIFICATION_FEEDBACK_LINES)
+        last_full_output = full_output
 
     solver = SOLVER_AIDER
-    if not written:
-        solved, reason = escalate_to_claude(
+    if not committed:
+        solved, reason, test_counts = escalate_to_claude(
             config, issue, profile, repo_path, body, specialist_context,
-            allowed_files, last_full_output, deadline, escalation_state,
+            allowed_files, last_full_output, deadline, escalation_state, branch,
         )
-        if not solved:
+        if solved:
+            committed, commit_error, pushed = commit_allowed_and_push(
+                repo_path, branch, commit_message(SOLVER_CLAUDE), allowed_files
+            )
+            if not committed:
+                reason = f"la solucion de Claude paso la verificacion pero {commit_error}"
+        if not committed:
             mark_needs_review(
                 issue["repo_obj"],
                 issue["issue_obj"],
@@ -1383,20 +1618,23 @@ def process_issue(config: dict, issue: dict, profile: dict, escalation_state: di
             )
             msg = f"🚫 {tag}: aider fallo {aider_attempts} veces y {reason}; marcado 'needs-review'"
             log.error(msg)
-            return msg, SOLVER_NONE
+            return issue_result(msg, SOLVER_NONE, tests=test_counts)
         solver = SOLVER_CLAUDE
-        written = changed_files(repo_path)
 
-    commit_msg = f"feat({profile['name']}): resuelve #{issue['number']} - {issue['title']}\n\nResuelto por: {solver}"
-    if commit_and_push(repo_path, branch, commit_msg):
+    if not pushed:
         msg = (
-            f"✅ {tag}: {len(written)} archivo(s) actualizados en `{branch}` "
-            f"({', '.join(written)}): {issue['url']}"
+            f"⚠️ {tag}: {solver} genero un commit local en `{branch}` ({', '.join(committed)}) "
+            f"pero el push fallo; no cuenta como resuelto"
         )
-        log.info(msg)
-        return msg, solver
+        log.error(msg)
+        return issue_result(msg, SOLVER_NONE, committed, test_counts)
 
-    return f"ℹ️ {tag}: {solver} respondio pero no genero cambios reales en el repo", SOLVER_NONE
+    msg = (
+        f"✅ {tag}: {len(committed)} archivo(s) actualizados en `{branch}` "
+        f"({', '.join(committed)}): {issue['url']}"
+    )
+    log.info(msg)
+    return issue_result(msg, solver, committed, test_counts)
 
 
 def record_specialist_memory(profile: dict, issue: dict, message: str, solver: str, branch: str) -> None:
@@ -1450,6 +1688,24 @@ def write_development_report(started_at: datetime, results: list[dict], escalati
             f"| {r['tag']} | {r['specialist']} | {r['solver']} | {memory_store.table_cell(r['message'])} |"
             for r in results
         )
+        lines.extend(["", "## Autoverificacion"])
+        for r in results:
+            committed = r.get("committed") or []
+            lines.append(f"### {r['tag']} ({r['solver']})")
+            lines.append(
+                "- Archivos comiteados: " + (", ".join(f"`{f}`" for f in committed) if committed else "ninguno")
+            )
+            if any(Path(f).name.startswith(AIDER_ARTIFACT_PREFIX) for f in committed):
+                lines.append("- ❌ El commit contiene artefactos de Aider")
+            tests = r.get("tests") or {}
+            if tests:
+                lines.extend(
+                    f"- Tests `{f}`: {c['executed']} ejecutado(s), {c['failed']} fallido(s)"
+                    + ("" if c["executed"] > 0 and c["failed"] == 0 else " ❌")
+                    for f, c in tests.items()
+                )
+            else:
+                lines.append("- Tests por archivo: sin archivos de test en la lista permitida")
     else:
         lines.append("No habia issues con label 'night-agent' pendientes.")
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1494,10 +1750,11 @@ async def run_development_mode(config: dict, notifier) -> str:
             specialist_display(profile), issue["number"], idx, len(issues), tag, reason,
         )
         try:
-            message, solver = process_issue(config, issue, profile, escalation_state)
+            outcome = process_issue(config, issue, profile, escalation_state)
         except Exception as exc:  # noqa: BLE001 - un issue no debe tumbar el resto de la corrida
             log.exception("Fallo inesperado procesando %s", tag)
-            message, solver = f"❌ {tag}: error inesperado: {exc}", SOLVER_NONE
+            outcome = issue_result(f"❌ {tag}: error inesperado: {exc}", SOLVER_NONE)
+        message, solver = outcome["message"], outcome["solver"]
         record_specialist_memory(profile, issue, message, solver, config["github"]["work_branch"])
         worked.add(name)
         results.append(
@@ -1507,6 +1764,8 @@ async def run_development_mode(config: dict, notifier) -> str:
                 "solver": solver,
                 "message": message,
                 "line": format_result_line(message, profile, solver),
+                "committed": outcome["committed"],
+                "tests": outcome["tests"],
             }
         )
 
