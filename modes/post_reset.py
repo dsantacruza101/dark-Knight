@@ -43,10 +43,12 @@ from typing import Optional
 from telegram.error import TelegramError
 
 from modes.development import (
-    commit_and_push,
+    changed_files,
+    commit_allowed_and_push,
     get_workspace_dir,
     is_forbidden_path,
     load_env,
+    normalize_rel_path,
     repo_is_clean,
     run_cli,
     setup_workspace_repo,
@@ -136,6 +138,23 @@ def _revert_forbidden_changes(repo_path: Path, status_lines: list[str]) -> list[
     return reverted
 
 
+def get_commit_files(repo_path: Path, commit_hash: str) -> list[str]:
+    """Archivos que toco el commit revisado: son la lista permitida para las
+    correcciones de Claude (nunca `git add -A`)."""
+    proc = run_cli(["git", "show", "--name-only", "--pretty=format:", commit_hash], cwd=repo_path, timeout=60)
+    return [normalize_rel_path(line) for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _discard_leftover_changes(repo_path: Path) -> list[str]:
+    """Descarta lo que quedo sin comitear (fuera de la lista permitida o de un
+    commit abortado) para que el siguiente commit se revise sobre repo limpio."""
+    discarded = changed_files(repo_path)
+    for path in discarded:
+        run_cli(["git", "checkout", "--", path], cwd=repo_path)
+        run_cli(["git", "clean", "-fd", "--", path], cwd=repo_path)
+    return discarded
+
+
 def review_and_fix_commit(claude_bin: str, branch: str, repo_full_name: str, repo_path: Path, commit: dict) -> dict:
     tag = f"{repo_full_name}@{commit['hash'][:7]}"
     log.info("👮 Commissioner Gordon revisando... %s", tag)
@@ -173,9 +192,17 @@ def review_and_fix_commit(claude_bin: str, branch: str, repo_full_name: str, rep
     if not status.stdout.strip():
         return base
 
-    files_changed = [line[3:].strip() for line in status.stdout.splitlines() if line.strip()]
-    commit_and_push(repo_path, branch, f"fix(night-agent): correcciones de code review para {commit['hash'][:7]}")
-    return {**base, "applied": True, "files_changed": files_changed}
+    allowed = [f for f in get_commit_files(repo_path, commit["hash"]) if not is_forbidden_path(f)]
+    committed, commit_error, _ = commit_allowed_and_push(
+        repo_path, branch, f"fix(night-agent): correcciones de code review para {commit['hash'][:7]}", allowed
+    )
+    discarded = _discard_leftover_changes(repo_path)
+    if discarded:
+        log.warning("%s: cambios no comiteados descartados: %s", tag, ", ".join(discarded))
+    if not committed:
+        log.warning("%s: no se comitearon las correcciones: %s", tag, commit_error)
+        return base
+    return {**base, "applied": True, "files_changed": committed}
 
 
 def get_week_knowledge_pairs(since_days: int = 7) -> list[dict]:

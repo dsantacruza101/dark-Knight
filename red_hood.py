@@ -107,11 +107,12 @@ from modes.development import (
     AIDER_BIN,
     OLLAMA_API_BASE,
     changed_files,
-    commit_and_push,
+    commit_allowed_and_push,
     git_cmd,
     github_auth_env,
     is_forbidden_path,
     read_repo_claude_md,
+    remove_aider_artifacts,
     repo_is_clean,
     run_cli,
 )
@@ -931,6 +932,9 @@ def generate_tests_for_repo(
         test_rel = guess_node_test_path(repo_path, source_rel) if stack == "node" else guess_python_test_path(source_rel)
         message = build_aider_test_message(source_rel, test_rel, framework, claude_md)
         ok = run_aider_for_test(repo_path, model, message, source_rel, test_rel)
+        # Los .aider* no son tests: se borran antes de validar para que no
+        # descarten un test valido ni terminen en el commit.
+        remove_aider_artifacts(repo_path)
 
         if not ok or not only_test_files_changed(repo_path):
             discard_changes(repo_path)
@@ -941,8 +945,17 @@ def generate_tests_for_repo(
             run_single_node_test(repo_path, test_rel) if stack == "node" else run_single_python_test(repo_path, test_rel)
         )
         if passed:
-            commit_and_push(repo_path, branch, f"test(red-hood): add tests for {source_rel}")
-            results.append({"file": source_rel, "test_file": test_rel, "status": "committed"})
+            # Solo se stagea el test generado; cualquier otro cambio (p. ej.
+            # otro test que Aider haya tocado) se descarta tras el commit.
+            committed, commit_error, _ = commit_allowed_and_push(
+                repo_path, branch, f"test(red-hood): add tests for {source_rel}", [test_rel]
+            )
+            discard_changes(repo_path)
+            if committed:
+                results.append({"file": source_rel, "test_file": test_rel, "status": "committed"})
+            else:
+                log.error("%s: no se comiteo %s: %s", repo_path.name, test_rel, commit_error)
+                results.append({"file": source_rel, "test_file": test_rel, "status": "commit_aborted"})
         else:
             discard_changes(repo_path)
             results.append({"file": source_rel, "test_file": test_rel, "status": "discarded"})
