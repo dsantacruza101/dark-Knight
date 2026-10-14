@@ -338,7 +338,9 @@ resolvers del sistema: `/etc/resolv.conf` + upstreams de systemd-resolved):
   (o es el primer ciclo, para ver las conexiones que ya existian) agrega
   `sudo -n ss -tunpH state established` (descartando entrantes por puerto en
   escucha segun `ss -tulnH`) y `sudo -n conntrack -L -o extended`
-  (containers: TCP ESTABLISHED + UDP).
+  (TCP ESTABLISHED + UDP: containers, y flujos salientes del host que ss no
+  vio, como QUIC en sockets UDP no conectados; proceso atribuido igual que
+  en el stream, por `ss -tunpH` y puerto local en `ss -uanpH`).
 - **Identidad**: ASN y organizacion via DNS de Team Cymru (TXT a
   `<ip-invertida>.origin.asn.cymru.com` / `origin6` y `AS<n>.asn.cymru.com`,
   cliente DNS propio con stdlib) + reverse DNS solo para mostrar. Cache en
