@@ -23,14 +23,22 @@ Chequeo diario (sin tokens de Claude):
     npm, PyPI y Maven, sobre TODAS las dependencias (directas y transitivas).
   - Ultima version: registry de npm, API JSON de PyPI, Maven Central.
   - Clasificacion: `security_patch` (hay version corregida en el mismo
-    major), `security_major` (el fix exige otro major o no hay fix), y solo
-    para dependencias directas `outdated_major`, `outdated_minor`.
+    major), `security_watch` (ningun advisory tiene version corregida y la
+    dependencia es solo de desarrollo, directa o transitiva),
+    `security_major` (el fix exige otro major, o no hay fix en una
+    dependencia de produccion), y solo para dependencias directas
+    `outdated_major`, `outdated_minor`.
 
 Acciones:
   - `security_patch` -> issue (o actualizacion del existente) con labels
     `night-agent` + label del especialista + `dependencies`, con advisories,
-    versiones, comando exacto y seccion `Archivos:`; el especialista lo
-    aplica en `dev` esa noche (modo Desarrollo de Batman).
+    versiones, comando exacto, bloque ```radar-patch``` (JSON: package,
+    from, to, ecosystem, direct, dev, manifest, advisories) y seccion
+    `Archivos:`; el modo Desarrollo de Batman lo aplica esa noche en `dev`
+    de forma determinista (sin Aider ni Claude).
+  - `security_watch` -> sin issue (si habia uno abierto se cierra con un
+    comentario explicando la politica); se lista en el resumen semanal bajo
+    "Sin parche disponible (vigilando)".
   - `security_major` -> issue con `needs-human` + label del especialista +
     `dependencies` (NUNCA `night-agent`); en modo semanal incluye la nota de
     Claude con cambios incompatibles y plan de migracion.
@@ -127,9 +135,18 @@ ECOSYSTEM_MAVEN = "Maven"
 
 SECURITY_PATCH = "security_patch"
 SECURITY_MAJOR = "security_major"
+SECURITY_WATCH = "security_watch"
 OUTDATED_MAJOR = "outdated_major"
 OUTDATED_MINOR = "outdated_minor"
-CATEGORY_ORDER = (SECURITY_MAJOR, SECURITY_PATCH, OUTDATED_MAJOR, OUTDATED_MINOR)
+CATEGORY_ORDER = (SECURITY_MAJOR, SECURITY_PATCH, SECURITY_WATCH, OUTDATED_MAJOR, OUTDATED_MINOR)
+PATCH_BLOCK_LANG = "radar-patch"
+WATCH_CLOSE_COMMENT = (
+    "📡 Cerrado por la nueva politica del radar: esta vulnerabilidad no tiene ninguna version "
+    "corregida publicada y el paquete solo se usa en desarrollo (directa o transitiva), asi que "
+    "no hay nada que aplicar ni riesgo en produccion. Ya no se abren issues para estos casos: "
+    "el radar lo sigue vigilando a diario y lo lista en el resumen semanal bajo "
+    "\"Sin parche disponible (vigilando)\". Si aparece un fix, se abre un issue nuevo automaticamente."
+)
 SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MODERATE": 2, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
 
 GITHUB_REPO_RE = re.compile(r"github\.com[/:]([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/#?]|$)")
@@ -807,6 +824,10 @@ def classify(dep: Dependency, advisories: list[Advisory], latest: Optional[str])
         fixes = [a.fixed for a in advisories]
         if all(fixes) and all(major_of(eco, f) == current_major for f in fixes):
             return Finding(dep, SECURITY_PATCH, vmax(eco, fixes), latest, advisories)
+        if dep.dev and not any(fixes):
+            # Sin ninguna version corregida y solo de desarrollo: no hay nada
+            # que aplicar ni riesgo en produccion; se vigila sin abrir issue.
+            return Finding(dep, SECURITY_WATCH, None, latest, advisories)
         return Finding(dep, SECURITY_MAJOR, vmax(eco, [f for f in fixes if f]), latest, advisories)
     # Desactualizadas: solo directas (las transitivas las mueve su paquete padre).
     if not dep.direct or not latest or not is_stable(eco, latest) or not vgt(eco, latest, dep.version):
@@ -905,6 +926,23 @@ def files_to_edit(dep: Dependency) -> list[str]:
     return [dep.manifest]
 
 
+def patch_block(finding: Finding) -> str:
+    """Bloque legible por maquina que el modo Desarrollo aplica de forma
+    determinista (`modes.development.parse_radar_patch`), sin Aider ni Claude."""
+    dep = finding.dep
+    data = {
+        "package": dep.name,
+        "from": dep.version,
+        "to": finding.target,
+        "ecosystem": dep.ecosystem,
+        "direct": dep.direct,
+        "dev": dep.dev,
+        "manifest": dep.manifest,
+        "advisories": sorted(a.id for a in finding.advisories),
+    }
+    return f"```{PATCH_BLOCK_LANG}\n{json.dumps(data, ensure_ascii=False)}\n```"
+
+
 def note_path(config: dict, specialist: str, ecosystem: str, package: str, version: str) -> Path:
     knowledge_dir = resolve_project_path(config.get("specialists", {}).get("knowledge_dir", DEFAULT_KNOWLEDGE_DIR))
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", package.lstrip("@")).strip("-")
@@ -946,6 +984,9 @@ def issue_body(config: dict, profile: dict, finding: Finding) -> str:
             "```",
             "El fix existe dentro del mismo major: no deberia haber cambios incompatibles. "
             "Verificar con build + lint + tests del perfil antes de comitear.",
+            "",
+            "El modo Desarrollo lo aplica de forma determinista (sin Aider ni Claude) con este bloque:",
+            patch_block(finding),
             "",
             "Archivos:",
             *files_to_edit(dep),
@@ -1031,6 +1072,20 @@ class IssueManager:
         issue = self._repo(full).create_issue(title=title, body=body, labels=labels)
         self._issues[full].append(issue)
         return f"creado {issue.html_url}"
+
+    def close_watched(self, full: str, finding: Finding) -> Optional[str]:
+        """Cierra (con `WATCH_CLOSE_COMMENT`) el issue abierto del mismo
+        repo+paquete si el hallazgo paso a `security_watch`. Devuelve la URL
+        cerrada o None si no habia issue."""
+        prefix = marker_prefix(finding.dep.repo, finding.dep.name)
+        for issue in list(self._open_issues(full)):
+            if prefix not in (issue.body or ""):
+                continue
+            issue.create_comment(WATCH_CLOSE_COMMENT)
+            issue.edit(state="closed", state_reason="not_planned")
+            self._issues[full].remove(issue)
+            return issue.html_url
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -1153,7 +1208,8 @@ def format_digest(profile: dict, scans: list[RepoScan], state: dict, new_notes: 
     lines = [
         f"📡 <b>Radar de {name} — resumen semanal</b>",
         f"Vulnerabilidades (7 dias): {len(found)} nuevas, {len(fixed)} corregidas",
-        f"Abiertas: {len(by_cat[SECURITY_PATCH])} parche (night-agent), {len(by_cat[SECURITY_MAJOR])} major (needs-human)",
+        f"Abiertas: {len(by_cat[SECURITY_PATCH])} parche (night-agent), {len(by_cat[SECURITY_MAJOR])} major (needs-human), "
+        f"{len(by_cat[SECURITY_WATCH])} sin parche (vigilando)",
     ]
     failed = [s.repo for s in scans if not s.path]
     if failed:
@@ -1169,6 +1225,17 @@ def format_digest(profile: dict, scans: list[RepoScan], state: dict, new_notes: 
             )
         if len(pending) > DIGEST_MAX_ITEMS:
             lines.append(f"… y {len(pending) - DIGEST_MAX_ITEMS} mas")
+    watched = by_cat[SECURITY_WATCH]
+    if watched:
+        lines.append(f"\n<b>Sin parche disponible (vigilando) ({len(watched)})</b>")
+        for f in watched[:DIGEST_MAX_ITEMS]:
+            lines.append(
+                f"• [{html.escape(f.max_severity)}] <code>{html.escape(f.dep.name)}</code> {html.escape(str(f.dep.version))} "
+                f"(<code>{html.escape(f.dep.repo)}</code>, {f.dep.scope} dev; "
+                f"{html.escape(', '.join(a.id for a in f.advisories))})"
+            )
+        if len(watched) > DIGEST_MAX_ITEMS:
+            lines.append(f"… y {len(watched) - DIGEST_MAX_ITEMS} mas")
     lines.append(f"Menores/parches desactualizados: {len(by_cat[OUTDATED_MINOR])}")
     if new_notes:
         lines.append(f"\n<b>Notas de conocimiento nuevas ({len(new_notes)})</b>")
@@ -1449,6 +1516,14 @@ async def run(specialist: str, dry_run: bool, weekly: bool) -> int:
     if issues:
         for repo_scan in scans:
             for finding in repo_scan.findings:
+                if finding.category == SECURITY_WATCH:
+                    try:
+                        closed = issues.close_watched(repo_scan.full_name, finding)
+                        if closed:
+                            log.info("Issue %s:%s cerrado (sin parche, solo dev): %s", repo_scan.repo, finding.dep.name, closed)
+                    except Exception as exc:
+                        log.error("No se pudo cerrar el issue de %s en %s: %s", finding.dep.name, repo_scan.full_name, exc)
+                    continue
                 if finding.category not in (SECURITY_PATCH, SECURITY_MAJOR):
                     continue
                 labels, opposite = issue_labels(config, profile, finding)

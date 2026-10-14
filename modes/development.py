@@ -22,8 +22,22 @@ archivos permitidos, el contenido actual de esos archivos y las ultimas
 mismo candado y la misma verificacion. Maximo
 `development.max_claude_escalations` por noche (default 2); si Claude no
 esta disponible o se alcanzo el limite, se marca 'needs-review'. Quien
-resolvio cada issue (`aider-qwen`, `claude-escalation`, `none`) queda en el
-reporte, en el progreso de Telegram y en `batcave/memory/<especialista>.md`.
+resolvio cada issue (`deterministic-patch`, `aider-qwen`, `claude-escalation`,
+`none`) queda en el reporte, en el progreso de Telegram y en
+`batcave/memory/<especialista>.md`.
+
+Parches de dependencias del radar (label `dependencies` + marcador
+`<!-- radar:`): NUNCA pasan por Aider ni Claude (no consumen escalaciones).
+`process_dependency_patch` lee el bloque ```radar-patch``` (o, en issues
+viejos, las lineas Paquete/Version del cuerpo) y aplica: npm directa ->
+`npm install [-D] <pkg>@<to>` (-D segun package.json); npm transitiva ->
+`npm update <pkg>` y, si OSV aun ve una version vulnerable en el lock,
+`overrides: {<pkg>: <to>}` en package.json + `npm install`; PyPI -> fija
+`<pkg>==<to>` en requirements.txt. Luego corre la verificacion del perfil,
+re-chequea OSV (los advisories del issue ya no deben afectar a ninguna
+version del lock), stagea solo package.json/package-lock.json (o
+requirements.txt) y comitea `fix(deps): <pkg> <from> -> <to> (radar)`.
+Cualquier fallo -> `needs-review`. Log en `reports/deps-<repo>-<issue>.log`.
 
 Workspace aislado (`development.workspace_dir`, por defecto
 `~/projects/.nightwing-workspace`): Nightwing NUNCA hace checkout, pull,
@@ -153,6 +167,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import requests
 import yaml
 from dotenv import load_dotenv
 from github import Github, GithubException
@@ -180,7 +195,30 @@ MIN_ESCALATION_SECONDS = 600
 
 SOLVER_AIDER = "aider-qwen"
 SOLVER_CLAUDE = "claude-escalation"
+SOLVER_DETERMINISTIC = "deterministic-patch"
 SOLVER_NONE = "none"
+
+# Parches de dependencias del radar (`batcave/radar.py`): se aplican sin Aider ni Claude.
+DEPENDENCIES_LABEL = "dependencies"
+RADAR_MARKER = "<!-- radar:"
+RADAR_PATCH_BLOCK_RE = re.compile(r"```radar-patch[ \t]*\n(.*?)\n[ \t]*```", re.DOTALL)
+LEGACY_PACKAGE_RE = re.compile(
+    r"\*\*Paquete:\*\*\s*`([^`]+)`\s*\((\w+), dependencia (directa|transitiva) de (desarrollo|produccion), `([^`]+)`\)"
+)
+LEGACY_CURRENT_RE = re.compile(r"\*\*Version actual:\*\*\s*`([^`]+)`")
+LEGACY_TARGET_RE = re.compile(r"\*\*Version objetivo:\*\*\s*`([^`]+)`")
+LEGACY_ADVISORY_RE = re.compile(r"^- \[([A-Za-z0-9-]+)\]\(https://osv\.dev/", re.MULTILINE)
+NPM_PACKAGE_NAME_RE = re.compile(r"^(?:@[a-z0-9][\w.-]*/)?[a-z0-9][\w.-]*$", re.IGNORECASE)
+PYPI_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+PATCH_VERSION_RE = re.compile(r"^\d+(?:\.\d+)*(?:[-+.]?[A-Za-z0-9][\w.-]*)?$")
+REQ_PIN_LINE_RE = re.compile(
+    r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*"
+    r"((?:(?:===|==|~=|>=|>|<=|<|!=)\s*[^;#\s,]+\s*,?\s*)*)(.*)$"
+)
+PATCH_FILES = {"npm": ["package.json", "package-lock.json"], "PyPI": ["requirements.txt"]}
+NPM_QUIET_FLAGS = ["--no-audit", "--no-fund"]
+OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
+OSV_TIMEOUT = 30
 
 AIDER_BIN = os.path.expanduser("~/.aider-venv/bin/aider")
 OLLAMA_API_BASE = "http://localhost:11434"
@@ -917,18 +955,6 @@ def repo_is_clean(repo_path: Path) -> bool:
     return status.returncode == 0 and not status.stdout.strip()
 
 
-def commit_and_push(repo_path: Path, branch: str, message: str) -> bool:
-    status = run_cli(["git", "status", "--porcelain"], cwd=repo_path)
-    if not status.stdout.strip():
-        return False
-    run_cli(["git", "add", "-A"], cwd=repo_path)
-    run_cli(["git", "commit", "-m", message], cwd=repo_path)
-    push = run_cli(git_cmd(["push", "origin", branch]), cwd=repo_path, extra_env=github_auth_env())
-    if push.returncode != 0:
-        log.error("Fallo el push a %s: %s", branch, mask_secrets(push.stderr[-500:]))
-    return True
-
-
 def commit_allowed_and_push(
     repo_path: Path, branch: str, message: str, allowed_files: list[str]
 ) -> tuple[list[str], str, bool]:
@@ -1488,6 +1514,295 @@ def issue_result(message: str, solver: str, committed: Optional[list[str]] = Non
     return {"message": message, "solver": solver, "committed": committed or [], "tests": tests or {}}
 
 
+# --------------------------------------------------------------------------
+# Parches deterministas de dependencias (issues del radar)
+# --------------------------------------------------------------------------
+
+
+def is_dependency_patch_issue(issue: dict) -> bool:
+    """Issue de parche abierto por el radar: label `dependencies` + marcador oculto del radar."""
+    return DEPENDENCIES_LABEL in issue.get("labels", []) and RADAR_MARKER in issue.get("body", "")
+
+
+def parse_radar_patch(body: str) -> tuple[Optional[dict], str]:
+    """Lee el bloque ```radar-patch``` (JSON) del issue; si no existe (issues
+    creados antes del bloque) cae a las lineas legibles del cuerpo. Devuelve
+    (parche, error). El parche se valida aqui porque sus campos terminan como
+    argumentos de npm o en requirements.txt."""
+    match = RADAR_PATCH_BLOCK_RE.search(body)
+    if match:
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            return None, f"bloque radar-patch con JSON invalido: {exc}"
+        if not isinstance(data, dict):
+            return None, "bloque radar-patch no es un objeto JSON"
+    else:
+        package = LEGACY_PACKAGE_RE.search(body)
+        current = LEGACY_CURRENT_RE.search(body)
+        target = LEGACY_TARGET_RE.search(body)
+        if not (package and current and target):
+            return None, "el issue no tiene bloque radar-patch ni las lineas Paquete/Version del radar"
+        data = {
+            "package": package.group(1),
+            "ecosystem": package.group(2),
+            "direct": package.group(3) == "directa",
+            "dev": package.group(4) == "desarrollo",
+            "manifest": package.group(5),
+            "from": current.group(1),
+            "to": target.group(1),
+            "advisories": LEGACY_ADVISORY_RE.findall(body),
+        }
+
+    ecosystem = str(data.get("ecosystem") or "")
+    package = str(data.get("package") or "")
+    if ecosystem not in PATCH_FILES:
+        return None, f"ecosistema '{ecosystem}' sin parche determinista (solo npm y PyPI)"
+    name_re = NPM_PACKAGE_NAME_RE if ecosystem == "npm" else PYPI_PACKAGE_NAME_RE
+    if not name_re.match(package):
+        return None, f"nombre de paquete invalido: {package!r}"
+    for key in ("from", "to"):
+        if not PATCH_VERSION_RE.match(str(data.get(key) or "")):
+            return None, f"version '{key}' invalida: {data.get(key)!r}"
+    advisories = data.get("advisories") or []
+    return {
+        "package": package,
+        "ecosystem": ecosystem,
+        "from": str(data["from"]),
+        "to": str(data["to"]),
+        "direct": bool(data.get("direct", True)),
+        "dev": bool(data.get("dev", False)),
+        "manifest": str(data.get("manifest") or ""),
+        "advisories": [str(a) for a in advisories if isinstance(a, str)],
+    }, ""
+
+
+def describe_dependency_patch(patch: dict) -> str:
+    """Plan del parche en una linea (dry-run, logs)."""
+    pkg, to = patch["package"], patch["to"]
+    if patch["ecosystem"] == "npm":
+        if patch["direct"]:
+            return f"npm install {'-D ' if patch['dev'] else ''}{pkg}@{to}"
+        return f"npm update {pkg} (+ overrides {{\"{pkg}\": \"{to}\"}} y npm install si el lock sigue vulnerable)"
+    return f"fijar {pkg}=={to} en requirements.txt"
+
+
+def py_key(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def installed_versions(repo_path: Path, patch: dict) -> list[str]:
+    """Versiones del paquete que quedan en el lock (npm, anidadas incluidas)
+    o el pin de requirements.txt (PyPI)."""
+    package = patch["package"]
+    if patch["ecosystem"] == "npm":
+        # Import tardio: batcave.radar importa este modulo.
+        from batcave.radar import lock_all_packages
+
+        lock_path = repo_path / "package-lock.json"
+        try:
+            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("%s: no se pudo leer package-lock.json: %s", repo_path.name, exc)
+            return []
+        return sorted({version for name, version, _ in lock_all_packages(lock) if name == package})
+    req = repo_path / "requirements.txt"
+    if not req.exists():
+        return []
+    versions: set[str] = set()
+    for line in req.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = REQ_PIN_LINE_RE.match(line.split("#", 1)[0])
+        if match and py_key(match.group(1)) == py_key(package):
+            pin = re.search(r"===?\s*([^\s,;]+)", match.group(3))
+            if pin:
+                versions.add(pin.group(1))
+    return sorted(versions)
+
+
+def osv_vulnerable_versions(patch: dict, versions: list[str]) -> tuple[Optional[list[str]], str]:
+    """Re-chequeo OSV del paquete: cuales de `versions` siguen afectadas por
+    los advisories del issue (por cualquiera si el issue no los lista).
+    Devuelve (vulnerables, error); None si OSV no respondio (no se puede
+    confirmar, cuenta como fallo)."""
+    if not versions:
+        return [], ""
+    name = py_key(patch["package"]) if patch["ecosystem"] == "PyPI" else patch["package"]
+    queries = [{"package": {"name": name, "ecosystem": patch["ecosystem"]}, "version": v} for v in versions]
+    try:
+        resp = requests.post(OSV_QUERYBATCH_URL, json={"queries": queries}, timeout=OSV_TIMEOUT)
+        resp.raise_for_status()
+        results = resp.json().get("results") or []
+    except (requests.RequestException, ValueError) as exc:
+        return None, f"OSV no respondio: {exc}"
+    if len(results) != len(versions):
+        return None, f"OSV devolvio {len(results)} resultados para {len(versions)} versiones"
+    wanted = set(patch["advisories"])
+    vulnerable: list[str] = []
+    for version, result in zip(versions, results):
+        ids = {v.get("id") for v in result.get("vulns") or []}
+        hit = bool(ids & wanted) if wanted else bool(ids)
+        # Con mas paginas no se ve la lista completa: se asume vulnerable.
+        if hit or result.get("next_page_token"):
+            vulnerable.append(version)
+    return vulnerable, ""
+
+
+def run_logged(cmd: list[str], repo_path: Path, log_path: Path) -> subprocess.CompletedProcess:
+    proc = run_cli(cmd, cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT)
+    append_to_log(
+        log_path, f"{' '.join(cmd)} (codigo {proc.returncode})", mask_secrets((proc.stdout + proc.stderr).strip()[-6000:])
+    )
+    return proc
+
+
+def add_npm_override(repo_path: Path, package: str, version: str) -> None:
+    """Agrega `"overrides": {package: version}` a package.json conservando el orden de claves."""
+    manifest_path = repo_path / "package.json"
+    raw = manifest_path.read_text(encoding="utf-8")
+    manifest = json.loads(raw)
+    manifest.setdefault("overrides", {})[package] = version
+    indent = re.match(r"\{\s*\n([ \t]+)", raw)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=indent.group(1) if indent else 2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def apply_npm_patch(repo_path: Path, patch: dict, log_path: Path) -> str:
+    """Aplica el parche npm en el workspace. Devuelve error ('' si se aplico)."""
+    package, target = patch["package"], patch["to"]
+    try:
+        manifest = json.loads((repo_path / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"package.json ilegible: {exc}"
+    in_prod = package in (manifest.get("dependencies") or {})
+    in_dev = package in (manifest.get("devDependencies") or {})
+
+    if in_prod or in_dev:
+        # package.json manda sobre el bloque del radar para decidir -D.
+        cmd = ["npm", "install", *(["-D"] if in_dev and not in_prod else []), f"{package}@{target}", *NPM_QUIET_FLAGS]
+        if run_logged(cmd, repo_path, log_path).returncode != 0:
+            return f"`{' '.join(cmd)}` fallo"
+        return ""
+    if patch["direct"]:
+        return f"{package} figura como directa pero no esta en dependencies/devDependencies de package.json"
+
+    if run_logged(["npm", "update", package, *NPM_QUIET_FLAGS], repo_path, log_path).returncode != 0:
+        return f"`npm update {package}` fallo"
+    vulnerable, error = osv_vulnerable_versions(patch, installed_versions(repo_path, patch))
+    if vulnerable is None:
+        return error
+    if not vulnerable:
+        return ""
+    append_to_log(log_path, "npm update no alcanzo", f"siguen vulnerables: {', '.join(vulnerable)}; se agrega override")
+    try:
+        add_npm_override(repo_path, package, target)
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"no se pudo escribir el override en package.json: {exc}"
+    if run_logged(["npm", "install", *NPM_QUIET_FLAGS], repo_path, log_path).returncode != 0:
+        return f"`npm install` con overrides {{{package}: {target}}} fallo"
+    return ""
+
+
+def apply_pypi_patch(repo_path: Path, patch: dict, log_path: Path) -> str:
+    """Fija `paquete==to` en requirements.txt (conserva extras, marcadores y
+    comentario de la linea; si no estaba, lo agrega). Devuelve error o ''."""
+    if patch["manifest"] not in ("", "requirements.txt", "requirements.in"):
+        return f"el paquete viene de {patch['manifest']}: solo se parchea requirements.txt de forma determinista"
+    req = repo_path / "requirements.txt"
+    if not req.exists():
+        return "el repo no tiene requirements.txt"
+    package, target = patch["package"], patch["to"]
+    lines = req.read_text(encoding="utf-8").splitlines()
+    replaced = False
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith(("#", "-")):
+            continue
+        match = REQ_PIN_LINE_RE.match(line)
+        if not match or py_key(match.group(1)) != py_key(package):
+            continue
+        rest = match.group(4).strip()
+        if rest.startswith("@"):
+            return f"{package} se instala desde una URL en requirements.txt; no se fija version"
+        lines[idx] = f"{match.group(1)}{match.group(2) or ''}=={target}" + (f" {rest}" if rest else "")
+        replaced = True
+    if not replaced:
+        lines.append(f"{package}=={target}")
+    req.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    append_to_log(log_path, "requirements.txt", f"{'actualizado' if replaced else 'agregado'}: {package}=={target}")
+    return ""
+
+
+def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path: Path, branch: str) -> dict:
+    """Issue `dependencies` del radar: parche mecanico, sin Aider ni Claude
+    (no consume escalaciones). Aplica el comando, corre la verificacion del
+    especialista, re-chequea OSV, stagea solo los archivos del manifiesto y
+    comitea `fix(deps): ...` en la rama de trabajo."""
+    tag = f"{issue['repo']}#{issue['number']}"
+    repo_short_name = issue["repo"].split("/")[-1]
+    log_path = REPORTS_DIR / f"deps-{repo_short_name}-{issue['number']}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(f"## {tag}: {issue['title']}\n", encoding="utf-8")
+
+    def fail(reason: str) -> dict:
+        discard_changes(repo_path)
+        mark_needs_review(issue["repo_obj"], issue["issue_obj"], f"parche determinista de dependencias: {reason}", profile)
+        msg = f"🚫 {tag}: parche determinista fallo ({reason}); marcado 'needs-review'"
+        log.error(msg)
+        return issue_result(msg, SOLVER_NONE)
+
+    patch, error = parse_radar_patch(issue["body"])
+    if patch is None:
+        return fail(error)
+    package, target = patch["package"], patch["to"]
+    files = PATCH_FILES[patch["ecosystem"]]
+    append_to_log(log_path, "parche", f"{json.dumps(patch, ensure_ascii=False)}\nplan: {describe_dependency_patch(patch)}")
+    log.info("%s: parche determinista %s", tag, describe_dependency_patch(patch))
+
+    current_versions = installed_versions(repo_path, patch)
+    before, _ = osv_vulnerable_versions(patch, current_versions)
+    if current_versions and before == []:
+        msg = f"ℹ️ {tag}: OSV ya no ve {package} vulnerable en `{branch}`; nada que aplicar"
+        log.info(msg)
+        return issue_result(msg, SOLVER_NONE)
+
+    apply = apply_npm_patch if patch["ecosystem"] == "npm" else apply_pypi_patch
+    error = apply(repo_path, patch, log_path)
+    if error:
+        return fail(error)
+
+    apply_guard(repo_path, files, log_path, tag, SOLVER_DETERMINISTIC)
+    if not changed_files(repo_path):
+        return fail("el comando no cambio ningun archivo del manifiesto")
+
+    step_errors, step_full = run_verification_steps(repo_path, profile, files, [])
+    if step_errors:
+        append_to_log(log_path, "verificacion fallida", "\n\n".join(step_full + step_errors))
+        return fail("; ".join(step_errors))
+
+    remaining = installed_versions(repo_path, patch)
+    vulnerable, error = osv_vulnerable_versions(patch, remaining)
+    if vulnerable is None:
+        return fail(f"no se pudo confirmar con OSV: {error}")
+    if vulnerable:
+        return fail(f"el lock sigue con {package} vulnerable: {', '.join(vulnerable)}")
+    append_to_log(log_path, "OSV", f"{package} instalado: {', '.join(remaining) or '-'}; sin los advisories del issue")
+
+    message = (
+        f"fix(deps): {package} {patch['from']} -> {target} (radar)\n\n"
+        f"Resuelve #{issue['number']}\nResuelto por: {SOLVER_DETERMINISTIC}"
+    )
+    committed, commit_error, pushed = commit_allowed_and_push(repo_path, branch, message, files)
+    if not committed:
+        return fail(commit_error)
+    if not pushed:
+        msg = f"⚠️ {tag}: commit local `fix(deps)` en `{branch}` ({', '.join(committed)}) pero el push fallo; no cuenta como resuelto"
+        log.error(msg)
+        return issue_result(msg, SOLVER_NONE, committed)
+    msg = f"✅ {tag}: {package} {patch['from']} -> {target} en `{branch}` ({', '.join(committed)}): {issue['url']}"
+    log.info(msg)
+    return issue_result(msg, SOLVER_DETERMINISTIC, committed)
+
+
 def process_issue(config: dict, issue: dict, profile: dict, escalation_state: dict) -> dict:
     """Resuelve un issue con el especialista `profile`. Devuelve
     `issue_result`: mensaje, resolutor (`SOLVER_AIDER`/`SOLVER_CLAUDE`/
@@ -1511,6 +1826,9 @@ def process_issue(config: dict, issue: dict, profile: dict, escalation_state: di
         msg = f"⚠️ {tag}: el workspace tiene cambios sin commitear, se omite para no pisarlos"
         log.warning(msg)
         return issue_result(msg, SOLVER_NONE)
+
+    if is_dependency_patch_issue(issue):
+        return process_dependency_patch(config, issue, profile, repo_path, branch)
 
     body = relativize_paths_in_body(issue["body"], config, issue["repo"])
     allowed_files = [normalize_rel_path(f) for f in extract_allowed_files(body)]
@@ -1679,7 +1997,9 @@ def write_development_report(started_at: datetime, results: list[dict], escalati
     if results:
         solvers = Counter(r["solver"] for r in results)
         lines.extend(["## Resumen", f"- Issues procesados: {len(results)}"])
-        lines.extend(f"- Resueltos por {s}: {solvers.get(s, 0)}" for s in (SOLVER_AIDER, SOLVER_CLAUDE))
+        lines.extend(
+            f"- Resueltos por {s}: {solvers.get(s, 0)}" for s in (SOLVER_DETERMINISTIC, SOLVER_AIDER, SOLVER_CLAUDE)
+        )
         lines.append(f"- Sin resolver ({SOLVER_NONE}): {solvers.get(SOLVER_NONE, 0)}")
         if escalation_state:
             lines.append(f"- Escalaciones a Claude usadas: {escalation_state['used']}/{escalation_state['max']}")

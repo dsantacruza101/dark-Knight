@@ -65,8 +65,24 @@ Flujo por issue en `modes/development.py`:
    `Resuelto por: ...`) y en `batcave/memory/<especialista>.md` (se crea con
    la plantilla si no existe).
 
+**Parches de dependencias del radar** (label `dependencies` + marcador
+`<!-- radar:`): NUNCA pasan por Aider ni Claude y no consumen escalaciones.
+`process_dependency_patch` lee el bloque ```` ```radar-patch ```` (JSON:
+`package`, `from`, `to`, `ecosystem`, `direct`, `dev`, `manifest`,
+`advisories`; en issues viejos sin bloque, las lineas Paquete/Version del
+cuerpo) y aplica: npm directa -> `npm install [-D] <pkg>@<to>` (`-D` segun
+package.json); npm transitiva -> `npm update <pkg>` y, si OSV aun ve una
+version vulnerable en el lock, `"overrides": {<pkg>: <to>}` + `npm install`;
+PyPI -> fija `<pkg>==<to>` en requirements.txt. Despues: verificacion del
+perfil, re-chequeo OSV (ninguna version del lock afectada por los advisories
+del issue), stage solo de package.json/package-lock.json (o
+requirements.txt), commit `fix(deps): <pkg> <from> -> <to> (radar)` +
+`Resuelto por: deterministic-patch`, push a `dev`. Si falla -> `needs-review`.
+Log en `reports/deps-<repo>-<issue>.log`.
+
 `python3 night_agent.py --dry-run` muestra a que especialista iria cada
-issue abierto y que notas de conocimiento se usarian.
+issue abierto y que notas de conocimiento se usarian (o, para parches de
+dependencias, el plan determinista).
 
 ## Radar tecnologico (`batcave/radar.py`)
 
@@ -95,15 +111,21 @@ solo Nightwing tiene timers. Config en `config.yaml` (`radar:`).
   `database_specific.severity` o calculada del vector CVSS v3), y ultima
   version en npm registry / PyPI JSON / Maven Central. Clasificacion:
   `security_patch` (todos los fixes en el mismo major; en 0.x el minor
-  cuenta como major), `security_major` (algun fix exige otro major o no hay
-  fix), `outdated_major`, `outdated_minor`.
+  cuenta como major), `security_watch` (ningun advisory tiene fix y la
+  dependencia es solo de desarrollo, directa o transitiva),
+  `security_major` (algun fix exige otro major, o no hay fix en una
+  dependencia de produccion), `outdated_major`, `outdated_minor`.
 - **Issues** (dedup por marcador oculto `<!-- radar:<repo>:<paquete>:<advisories> -->`
   en issues abiertos; mismo repo+paquete = se actualiza titulo/cuerpo/labels):
   - `security_patch` → labels `night-agent` + label del especialista +
     `dependencies`, con advisories, version actual/objetivo, comando exacto
     (`npm install pkg@x.y.z`, `--save-dev` si es dev) y seccion `Archivos:`
-    (`package.json`, `package-lock.json` / manifiesto Python / `pom.xml`).
-    Batman lo enruta al especialista esa noche (modo Desarrollo, rama `dev`).
+    (`package.json`, `package-lock.json` / manifiesto Python / `pom.xml`)
+    y bloque ```` ```radar-patch ```` (JSON). Batman lo aplica esa noche de
+    forma determinista (modo Desarrollo, rama `dev`, sin Aider ni Claude).
+  - `security_watch` → sin issue; si habia uno abierto se cierra
+    (`not_planned`) con un comentario explicando la politica. Se lista en
+    el resumen semanal bajo "Sin parche disponible (vigilando)".
   - `security_major` → `needs-human` + label del especialista +
     `dependencies` (nunca `night-agent`; si un issue cambia de categoria se
     quita el label opuesto). Si existe la nota semanal del paquete, se
