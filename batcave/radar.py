@@ -116,6 +116,7 @@ DEFAULT_ALERT_SEVERITIES = ("CRITICAL", "HIGH")
 DEFAULT_OWNER = "dsantacruza101"
 DEPENDENCIES_LABEL = "dependencies"
 NEEDS_HUMAN_LABEL = "needs-human"
+IN_DEV_LABEL = "in-dev"   # parche ya aplicado en la rama de trabajo (modes/development.py)
 WORK_BRANCH_FALLBACKS = ("main", "master")
 
 CLONE_TIMEOUT = 300
@@ -1072,7 +1073,10 @@ class IssueManager:
             current_labels = {l.name for l in issue.labels}
             if (issue.body or "") == body and issue.title == title and set(labels) <= current_labels and remove not in current_labels:
                 return f"sin cambios {issue.html_url}"
-            issue.edit(title=title, body=body, labels=sorted((current_labels - {remove}) | set(labels)))
+            # Hallazgo nuevo (otro objetivo/advisory): el `in-dev` del parche
+            # anterior ya no aplica, Batman debe volver a intentarlo.
+            dropped = {remove} | ({IN_DEV_LABEL} if (issue.body or "") != body else set())
+            issue.edit(title=title, body=body, labels=sorted((current_labels - dropped) | set(labels)))
             return f"actualizado {issue.html_url}"
         issue = self._repo(full).create_issue(title=title, body=body, labels=labels)
         self._issues[full].append(issue)

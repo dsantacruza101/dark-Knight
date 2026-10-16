@@ -32,7 +32,7 @@ from batcave import memory_store
 from modes.development import (
     build_specialist_preamble,
     default_specialist_name,
-    describe_dependency_patch,
+    dependency_patch_plan_lines,
     get_github_client,
     get_open_issues,
     is_dependency_patch_issue,
@@ -214,14 +214,12 @@ def print_dry_run(config: dict, started_at: datetime) -> None:
         for issue in issues:
             name, reason = route_issue(issue, specialists, default_name, issue_label)
             profile = specialists[name]
+            branch = resolve_work_branch(config, issue["repo"], specialists, profile)
             notes = select_knowledge_notes(config, name, f"{issue['title']}\n{issue['body']}")
             print(f"[dry-run]   - {issue['repo']}#{issue['number']}: {issue['title']} ({issue['url']})")
             print(f"[dry-run]       labels: {', '.join(issue.get('labels', [])) or '-'}")
             print(f"[dry-run]       -> {specialist_display(profile)} [{name}] ({reason})")
-            print(
-                f"[dry-run]       rama de trabajo: {resolve_work_branch(config, issue['repo'], specialists, profile)}; "
-                f"test_runner: {profile.get('test_runner', 'auto')}"
-            )
+            print(f"[dry-run]       rama de trabajo: {branch}; test_runner: {profile.get('test_runner', 'auto')}")
             if is_dependency_patch_issue(issue):
                 patch, error = parse_radar_patch(issue["body"])
                 if patch is None:
@@ -233,7 +231,8 @@ def print_dry_run(config: dict, started_at: datetime) -> None:
                         f"{patch['ecosystem']} {patch['package']} {patch['from']} -> {patch['to']} "
                         f"({'directa' if patch['direct'] else 'transitiva'}{', dev' if patch['dev'] else ''})"
                     )
-                    print(f"[dry-run]       plan: {describe_dependency_patch(patch)}")
+                    for line in dependency_patch_plan_lines(config, issue, patch, branch):
+                        print(f"[dry-run]       plan: {line}")
                     print(f"[dry-run]       commit: fix(deps): {patch['package']} {patch['from']} -> {patch['to']} (radar)")
                 continue
             print(
