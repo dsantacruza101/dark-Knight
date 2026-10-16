@@ -97,13 +97,35 @@ Flujo por issue en `modes/development.py`:
 cuerpo) y aplica: npm directa -> `npm install [-D] <pkg>@<to>` (`-D` segun
 package.json); npm transitiva -> `npm update <pkg>` y, si OSV aun ve una
 version vulnerable en el lock, `"overrides": {<pkg>: <to>}` + `npm install`;
-PyPI -> fija `<pkg>==<to>` en requirements.txt. Despues: verificacion del
+PyPI -> fija `<pkg>==<to>` en requirements.txt.
+
+- **Familias** (`development.package_families` en `config.yaml`, patrones
+  fnmatch `include`/`exclude`: nestjs, angular, react, vitest, tailwind,
+  prisma, typescript-eslint): si el paquete parchado es de una familia, cada
+  miembro presente en package.json sube a la misma version objetivo (si
+  existe en el registry para ese miembro; si no, a su maxima estable del
+  mismo major >= la actual; nunca se baja de version). Un `npm install` para
+  los de produccion y uno `npm install -D` para los de desarrollo.
+- **Peers**: tras instalar (npm), `npm ls --depth=0`; si reporta
+  `invalid:`/`missing:`/`UNMET DEPENDENCY` falla con mensaje claro antes de
+  build/tests.
+
+Despues: verificacion del
 perfil, re-chequeo OSV (ninguna version del lock afectada por los advisories
 del issue), stage solo de package.json/package-lock.json (o
-requirements.txt), commit `fix(deps): <pkg> <from> -> <to> (radar)` +
-`Resuelto por: deterministic-patch`, push a la rama de trabajo del repo
-(`dev`, o `development` en my_Portfolio_React_v2). Si falla -> `needs-review`.
-Log en `reports/deps-<repo>-<issue>.log`.
+requirements.txt), commit `fix(deps): <pkg> <from> -> <to> (radar)` (+ lista
+de paquetes de la familia) + `Resuelto por: deterministic-patch`, push a la
+rama de trabajo del repo (`dev`, o `development` en my_Portfolio_React_v2).
+
+Feedback en el issue: exito -> comentario `Aplicado en <rama>: <sha>,
+verificado`, label `in-dev` (y se quita `needs-review`); `get_open_issues`
+omite los issues `in-dev` (el radar quita `in-dev` si el hallazgo cambia).
+Si OSV ya no ve el paquete vulnerable antes de aplicar -> comentario y se
+cierra como completado. Si falla -> `needs-review` con las ultimas 30 lineas
+del paso que fallo. Log en `reports/deps-<repo>-<issue>.log`: salida de cada
+comando y, al final, un resumen (comando, codigo, segundos, resultado) que
+cabe en `tail -n 40`. El dry-run lee package.json/lock de la rama via la
+API de GitHub y muestra el plan de familia.
 
 `python3 night_agent.py --dry-run` muestra a que especialista iria cada
 issue abierto, en que rama y con que `test_runner`, y que notas de

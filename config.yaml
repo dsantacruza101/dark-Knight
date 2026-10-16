@@ -42,6 +42,28 @@ development:
   aider_attempts: 3
   max_claude_escalations: 2   # escalaciones qwen -> Claude por noche
   claude_timeout: 1800        # segundos por escalacion (acotado por el limite de 3h por issue)
+  # Familias npm que se mueven juntas en los parches deterministas del radar:
+  # si el paquete parchado cae en una familia, cada miembro presente en
+  # package.json sube a la misma version objetivo (o, si no existe para ese
+  # miembro, a su maxima del mismo major >= la actual). Patrones fnmatch;
+  # `exclude` gana sobre `include`.
+  package_families:
+    nestjs:
+      # @nestjs/config, cli, schematics, mapped-types, throttler... versionan aparte.
+      include: ['@nestjs/common', '@nestjs/core', '@nestjs/microservices', '@nestjs/platform-*', '@nestjs/testing', '@nestjs/websockets']
+    angular:
+      include: ['@angular/*']
+      exclude: ['@angular/cli', '@angular-devkit/*']
+    react:
+      include: [react, react-dom]
+    vitest:
+      include: [vitest, '@vitest/*']
+    tailwind:
+      include: [tailwindcss, '@tailwindcss/*']
+    prisma:
+      include: [prisma, '@prisma/client']
+    typescript-eslint:
+      include: [typescript-eslint, '@typescript-eslint/*']
 
 # Equipo de desarrollo: perfiles en specialists.dir (esquema en su README.md).
 # Hoy: nightwing (label backend, default) y batgirl (label frontend).

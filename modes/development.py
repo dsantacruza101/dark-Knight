@@ -30,14 +30,23 @@ Parches de dependencias del radar (label `dependencies` + marcador
 `<!-- radar:`): NUNCA pasan por Aider ni Claude (no consumen escalaciones).
 `process_dependency_patch` lee el bloque ```radar-patch``` (o, en issues
 viejos, las lineas Paquete/Version del cuerpo) y aplica: npm directa ->
-`npm install [-D] <pkg>@<to>` (-D segun package.json); npm transitiva ->
-`npm update <pkg>` y, si OSV aun ve una version vulnerable en el lock,
-`overrides: {<pkg>: <to>}` en package.json + `npm install`; PyPI -> fija
+`npm install [-D] <pkg>@<to>` (-D segun package.json), y si el paquete es de
+una familia de `development.package_families` (nestjs, angular, react...)
+sube con el a todos los miembros presentes en package.json (un
+`npm install` para los de produccion y uno `-D` para los de desarrollo);
+npm transitiva -> `npm update <pkg>` y, si OSV aun ve una version
+vulnerable en el lock, `overrides: {<pkg>: <to>}` en package.json +
+`npm install`. En npm, `npm ls --depth=0` despues de instalar: peers
+invalidos o faltantes fallan antes de los tests. PyPI -> fija
 `<pkg>==<to>` en requirements.txt. Luego corre la verificacion del perfil,
 re-chequea OSV (los advisories del issue ya no deben afectar a ninguna
 version del lock), stagea solo package.json/package-lock.json (o
 requirements.txt) y comitea `fix(deps): <pkg> <from> -> <to> (radar)`.
-Cualquier fallo -> `needs-review`. Log en `reports/deps-<repo>-<issue>.log`.
+Exito -> comentario `Aplicado en <rama>: <sha>, verificado` + label `in-dev`
+(los issues `in-dev` se omiten); ya corregido segun OSV -> se cierra como
+completado; fallo -> `needs-review` con las ultimas 30 lineas del paso que
+fallo. Log en `reports/deps-<repo>-<issue>.log` (termina con un resumen de
+comandos y resultado).
 
 Workspace aislado (`development.workspace_dir`, por defecto
 `~/projects/.nightwing-workspace`): Nightwing NUNCA hace checkout, pull,
@@ -170,8 +179,10 @@ import sys
 import tempfile
 from collections import Counter
 from datetime import datetime, timedelta
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 import yaml
@@ -229,6 +240,14 @@ PATCH_FILES = {"npm": ["package.json", "package-lock.json"], "PyPI": ["requireme
 NPM_QUIET_FLAGS = ["--no-audit", "--no-fund"]
 OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_TIMEOUT = 30
+IN_DEV_LABEL = "in-dev"   # parche aplicado y verificado en la rama de trabajo: no se reprocesa
+NPM_REGISTRY_URL = "https://registry.npmjs.org"
+NPM_ABBREVIATED_ACCEPT = "application/vnd.npm.install-v1+json"
+NPM_REGISTRY_TIMEOUT = 30
+# Problemas de `npm ls` (npm 7+): "x@1 invalid: ...", "npm error missing: ...", "UNMET DEPENDENCY x".
+# Los peers opcionales ("UNMET OPTIONAL DEPENDENCY") no cuentan.
+NPM_LS_PROBLEM_RE = re.compile(r"\b(?:invalid|missing):|UNMET (?:PEER )?DEPENDENCY|peer dep missing")
+FAILURE_COMMENT_LINES = 30
 
 AIDER_BIN = os.path.expanduser("~/.aider-venv/bin/aider")
 OLLAMA_API_BASE = "http://localhost:11434"
@@ -324,6 +343,10 @@ def get_open_issues(gh: Github, config: dict) -> list[dict]:
             for issue in repo.get_issues(state="open", labels=[label]):
                 if issue.pull_request is not None:
                     continue
+                labels = [lbl.name for lbl in issue.labels]
+                if IN_DEV_LABEL in labels:
+                    log.info("%s#%d tiene '%s' (ya aplicado en la rama de trabajo), se omite", repo_name, issue.number, IN_DEV_LABEL)
+                    continue
                 found.append(
                     {
                         "repo": repo_name,
@@ -333,7 +356,7 @@ def get_open_issues(gh: Github, config: dict) -> list[dict]:
                         "title": issue.title,
                         "body": issue.body or "",
                         "url": issue.html_url,
-                        "labels": [lbl.name for lbl in issue.labels],
+                        "labels": labels,
                     }
                 )
         except GithubException as exc:
@@ -1147,11 +1170,12 @@ def verify_python_files(repo_path: Path, py_files: list[str]) -> tuple[list[str]
     return errors, full_outputs
 
 
-def npm_ci_if_needed(repo_path: Path) -> None:
+def npm_ci_if_needed(repo_path: Path) -> Optional[subprocess.CompletedProcess]:
     """Antes de verificar en repos Node, instala dependencias con `npm ci` si
     `node_modules` no existe o si `package-lock.json` cambio desde la ultima
     instalacion (hash guardado dentro de `node_modules`, que sobrevive al
-    `git clean -fd` de `setup_workspace_repo` por estar gitignoreado)."""
+    `git clean -fd` de `setup_workspace_repo` por estar gitignoreado).
+    Devuelve el resultado de `npm ci`, o None si no hizo falta."""
     lockfile = repo_path / "package-lock.json"
     node_modules = repo_path / "node_modules"
     hash_marker = node_modules / ".night-agent-lockfile-hash"
@@ -1160,12 +1184,13 @@ def npm_ci_if_needed(repo_path: Path) -> None:
     previous_hash = hash_marker.read_text(encoding="utf-8").strip() if hash_marker.exists() else None
 
     if node_modules.exists() and current_hash == previous_hash:
-        return
+        return None
 
     log.info("%s: instalando dependencias (npm ci)", repo_path.name)
-    run_cli(["npm", "ci"], cwd=repo_path, timeout=NPM_CI_TIMEOUT)
+    proc = run_cli(["npm", "ci"], cwd=repo_path, timeout=NPM_CI_TIMEOUT)
     if current_hash is not None and node_modules.exists():
         hash_marker.write_text(current_hash, encoding="utf-8")
+    return proc
 
 
 def step_condition_met(repo_path: Path, when: Optional[str]) -> bool:
@@ -1201,21 +1226,35 @@ def detected_stacks(repo_path: Path, profile: dict) -> list[tuple[str, dict]]:
 
 
 def run_verification_steps(
-    repo_path: Path, profile: dict, allowed_files: list[str], test_files: list[str]
+    repo_path: Path,
+    profile: dict,
+    allowed_files: list[str],
+    test_files: list[str],
+    step_log: Optional[list[tuple[str, bool, str, float]]] = None,
 ) -> tuple[list[str], list[str]]:
     """Corre los pasos de `verification` del perfil para cada stack detectado.
 
+    Si se pasa `step_log`, agrega (comando, ok, detalle, segundos) por cada
+    paso ejecutado (resumen del log de parches de dependencias).
     Devuelve (errores cortos para log/needs-review, salida completa de cada
     paso fallido para el log del intento y la retroalimentacion)."""
     errors: list[str] = []
     full_outputs: list[str] = []
+
+    def record(label: str, ok: bool, detail: str, started: datetime) -> None:
+        if step_log is not None:
+            step_log.append((label, ok, detail, (datetime.now() - started).total_seconds()))
+
     for stack_name, stack in detected_stacks(repo_path, profile):
         for step in stack.get("steps", []):
             if not step_condition_met(repo_path, step.get("when")):
                 continue
             builtin = step.get("builtin")
+            started = datetime.now()
             if builtin == "npm_ci_if_needed":
-                npm_ci_if_needed(repo_path)
+                ci = npm_ci_if_needed(repo_path)
+                if ci is not None:
+                    record("npm ci", ci.returncode == 0, f"codigo {ci.returncode}", started)
                 continue
             if builtin == "py_compile_changed":
                 py_files = sorted(
@@ -1225,6 +1264,7 @@ def run_verification_steps(
                 py_errors, py_full = verify_python_files(repo_path, py_files)
                 errors.extend(py_errors)
                 full_outputs.extend(py_full)
+                record(f"py_compile ({len(py_files)} archivo(s))", not py_errors, f"{len(py_errors)} error(es)", started)
                 continue
             if builtin or not step.get("cmd"):
                 log.warning("Paso de verificacion invalido en %s/%s: %s", profile["name"], stack_name, step)
@@ -1234,6 +1274,7 @@ def run_verification_steps(
             env, cmd = split_env_prefix(command)
             proc = run_cli(cmd, cwd=repo_path, timeout=int(step.get("timeout", DEFAULT_STEP_TIMEOUT)), extra_env=env or None)
             output = mask_secrets(proc.stdout + proc.stderr)
+            record(command, proc.returncode == 0, f"codigo {proc.returncode}", started)
             if proc.returncode != 0:
                 errors.append(f"{command} fallo")
                 full_outputs.append(f"=== {command} ===\n{output}")
@@ -1795,12 +1836,193 @@ def osv_vulnerable_versions(patch: dict, versions: list[str]) -> tuple[Optional[
     return vulnerable, ""
 
 
-def run_logged(cmd: list[str], repo_path: Path, log_path: Path) -> subprocess.CompletedProcess:
-    proc = run_cli(cmd, cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT)
-    append_to_log(
-        log_path, f"{' '.join(cmd)} (codigo {proc.returncode})", mask_secrets((proc.stdout + proc.stderr).strip()[-6000:])
+class PatchLog:
+    """Log de un parche de dependencias (`reports/deps-<repo>-<issue>.log`):
+    la salida de cada comando y, al cerrar (`finish`), un resumen con cada
+    comando, su resultado y el resultado final, para que `tail -n 40` baste."""
+
+    def __init__(self, path: Path, header: str) -> None:
+        self.path = path
+        self.steps: list[tuple[str, bool, str, float]] = []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"## {header}\n", encoding="utf-8")
+
+    def note(self, title: str, body: str) -> None:
+        append_to_log(self.path, title, strip_ansi(body))
+
+    def step(self, label: str, ok: bool, detail: str = "", seconds: float = 0.0) -> None:
+        self.steps.append((label, ok, detail, seconds))
+
+    def run(self, cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+        started = datetime.now()
+        proc = run_cli(cmd, cwd=cwd, timeout=DEFAULT_STEP_TIMEOUT)
+        command = " ".join(cmd)
+        self.note(f"{command} (codigo {proc.returncode})", (proc.stdout + proc.stderr).strip()[-6000:])
+        self.step(command, proc.returncode == 0, f"codigo {proc.returncode}", (datetime.now() - started).total_seconds())
+        return proc
+
+    def finish(self, outcome: str) -> None:
+        lines = [
+            f"- [{'ok' if ok else 'FALLO'}] {label} ({detail + ', ' if detail else ''}{seconds:.0f}s)"
+            for label, ok, detail, seconds in self.steps
+        ]
+        self.note("resumen: comandos y resultado", "\n".join(lines or ["- (ningun comando)"]) + f"\nresultado: {outcome}")
+
+
+def package_families(config: dict) -> dict[str, dict]:
+    """Familias de `development.package_families`: {nombre: {include, exclude}} (patrones fnmatch)."""
+    families: dict[str, dict] = {}
+    for name, spec in ((config.get("development") or {}).get("package_families") or {}).items():
+        if isinstance(spec, list):
+            spec = {"include": spec}
+        if not isinstance(spec, dict) or not spec.get("include"):
+            log.warning("Familia de paquetes '%s' invalida en config.yaml (falta include), se ignora", name)
+            continue
+        families[str(name)] = {
+            "include": [str(p) for p in spec["include"]],
+            "exclude": [str(p) for p in spec.get("exclude") or []],
+        }
+    return families
+
+
+def in_family(family: dict, package: str) -> bool:
+    return any(fnmatchcase(package, p) for p in family["include"]) and not any(
+        fnmatchcase(package, p) for p in family["exclude"]
     )
-    return proc
+
+
+def npm_registry_versions(package: str) -> tuple[Optional[list[str]], str]:
+    """Versiones publicadas de `package` (metadata abreviada del registry de npm)."""
+    url = f"{NPM_REGISTRY_URL}/{quote(package, safe='@')}"
+    try:
+        resp = requests.get(url, headers={"Accept": NPM_ABBREVIATED_ACCEPT}, timeout=NPM_REGISTRY_TIMEOUT)
+        resp.raise_for_status()
+        return list((resp.json().get("versions") or {}).keys()), ""
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        return None, f"el registry de npm no respondio para {package}: {exc}"
+
+
+def plan_npm_install(config: dict, patch: dict, manifest: dict, lock: dict) -> tuple[Optional[dict], str]:
+    """Plan de `npm install` para un parche de dependencia directa.
+
+    Si el paquete cae en una familia de `development.package_families`, cada
+    miembro presente en package.json sube con el: a la version objetivo si
+    existe en el registry para ese miembro; si no, a su maxima estable del
+    mismo major >= la actual. Los miembros que ya estan en esa version o
+    mas arriba se dejan igual. `dev` sale de package.json (no del radar).
+    Devuelve ({family, installs: [{package, from, to, dev}], notes}, error)."""
+    # Import tardio: batcave.radar importa este modulo.
+    from batcave.radar import is_stable, lock_versions, major_of, npm_version_from_spec, vgt, vmax
+
+    prod = manifest.get("dependencies") or {}
+    dev = manifest.get("devDependencies") or {}
+    installed = lock_versions(lock)
+
+    def entry(name: str, to: str) -> dict:
+        current = installed.get(name) or npm_version_from_spec(str(prod.get(name) or dev.get(name) or ""))
+        return {"package": name, "from": current or "?", "to": to, "dev": name in dev and name not in prod}
+
+    package, target = patch["package"], patch["to"]
+    plan = {"family": None, "installs": [entry(package, target)], "notes": []}
+    families = package_families(config)
+    family = next((name for name, fam in families.items() if in_family(fam, package)), None)
+    if family is None:
+        return plan, ""
+    plan["family"] = family
+
+    for name in sorted(n for n in {**prod, **dev} if n != package and in_family(families[family], n)):
+        item = entry(name, target)
+        current = None if item["from"] == "?" else item["from"]
+        versions, error = npm_registry_versions(name)
+        if versions is None:
+            return None, f"familia {family}: {error}"
+        fallback = target not in versions
+        if fallback:
+            same_major = [
+                v for v in versions
+                if current and is_stable("npm", v) and major_of("npm", v) == major_of("npm", current)
+                and not vgt("npm", current, v)
+            ]
+            item["to"] = vmax("npm", same_major)
+            if not item["to"]:
+                plan["notes"].append(f"{name}: no existe {target} ni otra version del major de {item['from']}; se deja igual")
+                continue
+        if current and not vgt("npm", item["to"], current):
+            plan["notes"].append(f"{name}: ya esta en {current} (>= {item['to']}), se deja igual")
+            continue
+        if fallback:
+            plan["notes"].append(f"{name}: no existe {target}, se usa {item['to']} (maxima del mismo major)")
+        plan["installs"].append(item)
+    return plan, ""
+
+
+def npm_install_commands(plan: dict) -> list[list[str]]:
+    """Un `npm install` para los miembros de produccion y uno `-D` para los de desarrollo."""
+    commands = []
+    for dev in (False, True):
+        specs = [f"{i['package']}@{i['to']}" for i in plan["installs"] if i["dev"] == dev]
+        if specs:
+            commands.append(["npm", "install", *(["-D"] if dev else []), *specs, *NPM_QUIET_FLAGS])
+    return commands
+
+
+def describe_npm_plan(plan: dict) -> list[str]:
+    """Lineas del plan npm (log, dry-run): familia, comandos y chequeo de peers."""
+    lines = []
+    if plan["family"]:
+        lines.append(
+            f"familia {plan['family']}: "
+            + ", ".join(f"{i['package']} {i['from']} -> {i['to']}{' (dev)' if i['dev'] else ''}" for i in plan["installs"])
+        )
+    lines.extend(plan["notes"])
+    lines.extend(" ".join(a for a in cmd if a not in NPM_QUIET_FLAGS) for cmd in npm_install_commands(plan))
+    lines.append("npm ls --depth=0 (peers invalidos/faltantes -> falla antes de los tests)")
+    return lines
+
+
+def github_json(repo_obj, path: str, ref: str) -> Optional[dict]:
+    """JSON de `path` en `ref` via la API de GitHub (sin clonar); None si no se pudo leer."""
+    try:
+        content = repo_obj.get_contents(path, ref=ref)
+        if content.encoding == "base64":
+            raw = content.decoded_content
+        else:  # > 1 MB: la API de contenidos no trae el cuerpo, se pide el blob
+            raw = base64.b64decode(repo_obj.get_git_blob(content.sha).content)
+        data = json.loads(raw)
+    except (GithubException, ValueError, AttributeError) as exc:
+        log.warning("No se pudo leer %s@%s de %s: %s", path, ref, repo_obj.full_name, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def dependency_patch_plan_lines(config: dict, issue: dict, patch: dict, branch: str) -> list[str]:
+    """Plan del parche para `--dry-run`, sin clonar: lee package.json y
+    package-lock.json de la rama de trabajo via la API de GitHub y consulta
+    el registry de npm (solo lectura)."""
+    if patch["ecosystem"] != "npm":
+        return [describe_dependency_patch(patch)]
+    manifest = github_json(issue["repo_obj"], "package.json", branch)
+    if manifest is None:
+        return [f"{describe_dependency_patch(patch)} (no se pudo leer package.json de `{branch}`)"]
+    if patch["package"] not in {**(manifest.get("dependencies") or {}), **(manifest.get("devDependencies") or {})}:
+        return [describe_dependency_patch(patch)]
+    plan, error = plan_npm_install(config, patch, manifest, github_json(issue["repo_obj"], "package-lock.json", branch) or {})
+    if plan is None:
+        return [f"NO aplicable ({error}) -> needs-review"]
+    return describe_npm_plan(plan)
+
+
+def check_npm_peers(repo_path: Path, plog: PatchLog) -> tuple[str, str]:
+    """`npm ls --depth=0` tras instalar: si reporta dependencias invalidas o
+    faltantes (p. ej. un peer que quedo en otra version), falla antes de
+    correr build/tests. Devuelve (error, salida)."""
+    proc = plog.run(["npm", "ls", "--depth=0"], repo_path)
+    output = strip_ansi(proc.stdout + proc.stderr)
+    problems = [line.strip(" │├└┬─") for line in output.splitlines() if NPM_LS_PROBLEM_RE.search(line)]
+    plog.step("chequeo de peers", not problems, f"{len(problems)} problema(s)" if problems else "sin invalidos ni faltantes")
+    if problems:
+        return "`npm ls --depth=0` reporta dependencias invalidas o faltantes: " + "; ".join(problems[:5]), output
+    return "", ""
 
 
 def add_npm_override(repo_path: Path, package: str, version: str) -> None:
@@ -1815,45 +2037,67 @@ def add_npm_override(repo_path: Path, package: str, version: str) -> None:
     )
 
 
-def apply_npm_patch(repo_path: Path, patch: dict, log_path: Path) -> str:
-    """Aplica el parche npm en el workspace. Devuelve error ('' si se aplico)."""
+def apply_npm_patch(config: dict, repo_path: Path, patch: dict, plog: PatchLog) -> tuple[str, str, list[str]]:
+    """Aplica el parche npm en el workspace: directa -> `plan_npm_install`
+    (familia incluida); transitiva -> `npm update` y, si no alcanza,
+    override. Siempre termina con `check_npm_peers`. Devuelve (error, salida
+    del paso que fallo, cambios legibles `pkg from -> to`); error '' si se aplico."""
     package, target = patch["package"], patch["to"]
+    changes = [f"{package} {patch['from']} -> {target}"]
     try:
         manifest = json.loads((repo_path / "package.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return f"package.json ilegible: {exc}"
-    in_prod = package in (manifest.get("dependencies") or {})
-    in_dev = package in (manifest.get("devDependencies") or {})
+        return f"package.json ilegible: {exc}", "", []
 
-    if in_prod or in_dev:
-        # package.json manda sobre el bloque del radar para decidir -D.
-        cmd = ["npm", "install", *(["-D"] if in_dev and not in_prod else []), f"{package}@{target}", *NPM_QUIET_FLAGS]
-        if run_logged(cmd, repo_path, log_path).returncode != 0:
-            return f"`{' '.join(cmd)}` fallo"
-        return ""
+    if package in {**(manifest.get("dependencies") or {}), **(manifest.get("devDependencies") or {})}:
+        try:
+            lock = json.loads((repo_path / "package-lock.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            lock = {}
+        plan, error = plan_npm_install(config, patch, manifest, lock)
+        if plan is None:
+            return error, "", []
+        plog.note("plan npm", "\n".join(describe_npm_plan(plan)))
+        changes = [f"{i['package']} {i['from']} -> {i['to']}" for i in plan["installs"]]
+        for cmd in npm_install_commands(plan):
+            proc = plog.run(cmd, repo_path)
+            if proc.returncode != 0:
+                return f"`{' '.join(cmd)}` fallo", proc.stdout + proc.stderr, changes
+        error, output = check_npm_peers(repo_path, plog)
+        return error, output, changes
     if patch["direct"]:
-        return f"{package} figura como directa pero no esta en dependencies/devDependencies de package.json"
+        return f"{package} figura como directa pero no esta en dependencies/devDependencies de package.json", "", []
 
-    if run_logged(["npm", "update", package, *NPM_QUIET_FLAGS], repo_path, log_path).returncode != 0:
-        return f"`npm update {package}` fallo"
+    proc = plog.run(["npm", "update", package, *NPM_QUIET_FLAGS], repo_path)
+    if proc.returncode != 0:
+        return f"`npm update {package}` fallo", proc.stdout + proc.stderr, changes
     vulnerable, error = osv_vulnerable_versions(patch, installed_versions(repo_path, patch))
     if vulnerable is None:
-        return error
-    if not vulnerable:
-        return ""
-    append_to_log(log_path, "npm update no alcanzo", f"siguen vulnerables: {', '.join(vulnerable)}; se agrega override")
-    try:
-        add_npm_override(repo_path, package, target)
-    except (OSError, json.JSONDecodeError) as exc:
-        return f"no se pudo escribir el override en package.json: {exc}"
-    if run_logged(["npm", "install", *NPM_QUIET_FLAGS], repo_path, log_path).returncode != 0:
-        return f"`npm install` con overrides {{{package}: {target}}} fallo"
-    return ""
+        return error, "", changes
+    if vulnerable:
+        plog.note("npm update no alcanzo", f"siguen vulnerables: {', '.join(vulnerable)}; se agrega override")
+        try:
+            add_npm_override(repo_path, package, target)
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"no se pudo escribir el override en package.json: {exc}", "", changes
+        plog.step(f"overrides {{{package}: {target}}} en package.json", True)
+        proc = plog.run(["npm", "install", *NPM_QUIET_FLAGS], repo_path)
+        if proc.returncode != 0:
+            return f"`npm install` con overrides {{{package}: {target}}} fallo", proc.stdout + proc.stderr, changes
+    error, output = check_npm_peers(repo_path, plog)
+    return error, output, changes
 
 
-def apply_pypi_patch(repo_path: Path, patch: dict, log_path: Path) -> str:
+def apply_pypi_patch(config: dict, repo_path: Path, patch: dict, plog: PatchLog) -> tuple[str, str, list[str]]:
     """Fija `paquete==to` en requirements.txt (conserva extras, marcadores y
-    comentario de la linea; si no estaba, lo agrega). Devuelve error o ''."""
+    comentario de la linea; si no estaba, lo agrega). Misma firma y retorno
+    que `apply_npm_patch`."""
+    error = pin_requirement(repo_path, patch, plog)
+    plog.step(f"fijar {patch['package']}=={patch['to']} en requirements.txt", not error, error)
+    return error, "", [] if error else [f"{patch['package']} {patch['from']} -> {patch['to']}"]
+
+
+def pin_requirement(repo_path: Path, patch: dict, plog: PatchLog) -> str:
     if patch["manifest"] not in ("", "requirements.txt", "requirements.in"):
         return f"el paquete viene de {patch['manifest']}: solo se parchea requirements.txt de forma determinista"
     req = repo_path / "requirements.txt"
@@ -1876,7 +2120,7 @@ def apply_pypi_patch(repo_path: Path, patch: dict, log_path: Path) -> str:
     if not replaced:
         lines.append(f"{package}=={target}")
     req.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    append_to_log(log_path, "requirements.txt", f"{'actualizado' if replaced else 'agregado'}: {package}=={target}")
+    plog.note("requirements.txt", f"{'actualizado' if replaced else 'agregado'}: {package}=={target}")
     return ""
 
 
@@ -1884,16 +2128,29 @@ def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path
     """Issue `dependencies` del radar: parche mecanico, sin Aider ni Claude
     (no consume escalaciones). Aplica el comando, corre la verificacion del
     especialista, re-chequea OSV, stagea solo los archivos del manifiesto y
-    comitea `fix(deps): ...` en la rama de trabajo."""
+    comitea `fix(deps): ...` en la rama de trabajo.
+
+    Feedback en el issue: exito -> comentario `Aplicado en <rama>: <sha>,
+    verificado` + label `in-dev` (las corridas siguientes lo omiten); OSV ya
+    no lo ve vulnerable -> comentario y se cierra como completado; fallo ->
+    `needs-review` con las ultimas `FAILURE_COMMENT_LINES` lineas del paso
+    que fallo. El log termina con un resumen de comandos y resultado."""
     tag = f"{issue['repo']}#{issue['number']}"
     repo_short_name = issue["repo"].split("/")[-1]
-    log_path = REPORTS_DIR / f"deps-{repo_short_name}-{issue['number']}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(f"## {tag}: {issue['title']}\n", encoding="utf-8")
+    issue_obj = issue["issue_obj"]
+    plog = PatchLog(REPORTS_DIR / f"deps-{repo_short_name}-{issue['number']}.log", f"{tag}: {issue['title']}")
 
-    def fail(reason: str) -> dict:
+    def fail(reason: str, output: str = "") -> dict:
         discard_changes(repo_path)
-        mark_needs_review(issue["repo_obj"], issue["issue_obj"], f"parche determinista de dependencias: {reason}", profile)
+        detail = reason
+        tail = last_lines(strip_ansi(mask_secrets(output)).strip(), FAILURE_COMMENT_LINES)
+        if tail:
+            detail += (
+                f"\n\nUltimas {FAILURE_COMMENT_LINES} lineas del paso que fallo:\n"
+                f"```\n{tail.replace('```', chr(39) * 3)}\n```"
+            )
+        mark_needs_review(issue["repo_obj"], issue_obj, f"parche determinista de dependencias: {detail}", profile)
+        plog.finish(f"FALLO -> needs-review: {reason}")
         msg = f"🚫 {tag}: parche determinista fallo ({reason}); marcado 'needs-review'"
         log.error(msg)
         return issue_result(msg, SOLVER_NONE)
@@ -1903,50 +2160,79 @@ def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path
         return fail(error)
     package, target = patch["package"], patch["to"]
     files = PATCH_FILES[patch["ecosystem"]]
-    append_to_log(log_path, "parche", f"{json.dumps(patch, ensure_ascii=False)}\nplan: {describe_dependency_patch(patch)}")
+    plog.note("parche", f"{json.dumps(patch, ensure_ascii=False)}\nplan base: {describe_dependency_patch(patch)}")
     log.info("%s: parche determinista %s", tag, describe_dependency_patch(patch))
 
     current_versions = installed_versions(repo_path, patch)
     before, _ = osv_vulnerable_versions(patch, current_versions)
     if current_versions and before == []:
-        msg = f"ℹ️ {tag}: OSV ya no ve {package} vulnerable en `{branch}`; nada que aplicar"
+        installed = ", ".join(current_versions)
+        plog.step("OSV antes de aplicar", True, f"{package} {installed} ya sin los advisories del issue")
+        try:
+            issue_obj.create_comment(
+                f"OSV ya no ve `{package}` vulnerable en `{branch}` (instalado: {installed}); "
+                f"nada que aplicar, se cierra como completado."
+            )
+            issue_obj.edit(state="closed", state_reason="completed")
+            outcome = "ya corregido; issue cerrado como completado"
+        except GithubException as exc:
+            log.error("No se pudo cerrar el issue %s: %s", tag, exc)
+            outcome = f"ya corregido, pero no se pudo cerrar el issue: {exc}"
+        plog.finish(outcome)
+        msg = f"ℹ️ {tag}: OSV ya no ve {package} vulnerable en `{branch}`; {outcome}"
         log.info(msg)
         return issue_result(msg, SOLVER_NONE)
 
     apply = apply_npm_patch if patch["ecosystem"] == "npm" else apply_pypi_patch
-    error = apply(repo_path, patch, log_path)
+    error, output, changes = apply(config, repo_path, patch, plog)
     if error:
-        return fail(error)
+        return fail(error, output)
 
-    apply_guard(repo_path, files, log_path, tag, SOLVER_DETERMINISTIC)
+    apply_guard(repo_path, files, plog.path, tag, SOLVER_DETERMINISTIC)
     if not changed_files(repo_path):
         return fail("el comando no cambio ningun archivo del manifiesto")
 
-    step_errors, step_full = run_verification_steps(repo_path, profile, files, [])
+    step_errors, step_full = run_verification_steps(repo_path, profile, files, [], plog.steps)
     if step_errors:
-        append_to_log(log_path, "verificacion fallida", "\n\n".join(step_full + step_errors))
-        return fail("; ".join(step_errors))
+        plog.note("verificacion fallida", "\n\n".join(step_full + step_errors))
+        return fail("; ".join(step_errors), step_full[0] if step_full else "")
 
     remaining = installed_versions(repo_path, patch)
     vulnerable, error = osv_vulnerable_versions(patch, remaining)
     if vulnerable is None:
         return fail(f"no se pudo confirmar con OSV: {error}")
+    plog.step("re-chequeo OSV", not vulnerable, f"{package} instalado: {', '.join(remaining) or '-'}")
     if vulnerable:
         return fail(f"el lock sigue con {package} vulnerable: {', '.join(vulnerable)}")
-    append_to_log(log_path, "OSV", f"{package} instalado: {', '.join(remaining) or '-'}; sin los advisories del issue")
 
-    message = (
-        f"fix(deps): {package} {patch['from']} -> {target} (radar)\n\n"
-        f"Resuelve #{issue['number']}\nResuelto por: {SOLVER_DETERMINISTIC}"
-    )
+    message = f"fix(deps): {package} {patch['from']} -> {target} (radar)\n\n"
+    if len(changes) > 1:
+        message += "Paquetes actualizados juntos:\n" + "\n".join(f"- {c}" for c in changes) + "\n\n"
+    message += f"Resuelve #{issue['number']}\nResuelto por: {SOLVER_DETERMINISTIC}"
     committed, commit_error, pushed = commit_allowed_and_push(repo_path, branch, message, files)
     if not committed:
         return fail(commit_error)
+    sha = run_cli(["git", "rev-parse", "HEAD"], cwd=repo_path).stdout.strip()
+    plog.step(f"commit {sha[:12]} + push a {branch}", pushed, "push ok" if pushed else "push fallo")
     if not pushed:
+        plog.finish(f"commit local {sha} sin push; el issue queda igual")
         msg = f"⚠️ {tag}: commit local `fix(deps)` en `{branch}` ({', '.join(committed)}) pero el push fallo; no cuenta como resuelto"
         log.error(msg)
         return issue_result(msg, SOLVER_NONE, committed)
-    msg = f"✅ {tag}: {package} {patch['from']} -> {target} en `{branch}` ({', '.join(committed)}): {issue['url']}"
+
+    try:
+        issue_obj.create_comment(
+            f"Aplicado en `{branch}`: {sha}, verificado\n\n" + "\n".join(f"- {c}" for c in changes)
+        )
+        issue_obj.add_to_labels(IN_DEV_LABEL)
+        if "needs-review" in issue.get("labels", []):
+            issue_obj.remove_from_labels("needs-review")
+        outcome = f"OK: {sha} en {branch}, verificado; label '{IN_DEV_LABEL}'"
+    except GithubException as exc:
+        log.error("No se pudo comentar/etiquetar el issue %s: %s", tag, exc)
+        outcome = f"OK: {sha} en {branch}, verificado; pero fallo el feedback en el issue: {exc}"
+    plog.finish(outcome)
+    msg = f"✅ {tag}: {', '.join(changes)} en `{branch}` ({', '.join(committed)}): {issue['url']}"
     log.info(msg)
     return issue_result(msg, SOLVER_DETERMINISTIC, committed)
 
