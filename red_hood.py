@@ -15,8 +15,10 @@ copia clonada en `workspace_dir/<nombre-repo>`:
 
   - Si la copia no existe: `git clone` desde la URL que devuelve
     `git -C <repo_prod> remote get-url origin`.
-  - Si ya existe: `git fetch origin`, `checkout dev` (o `main` en modo
-    solo-lectura si no hay `dev`), `git reset --hard origin/<rama>`.
+  - Si ya existe: `git fetch origin`, `checkout <rama de trabajo>` (la del
+    repo segun los perfiles de especialista, `work_branch`; default `dev`,
+    `development` en my_Portfolio_React_v2), o `main` en modo solo-lectura
+    si no existe; `git reset --hard origin/<rama>`.
   - `npm ci`, tests, lint, auditoria, Aider, commits y push ocurren solo
     en esa copia; el directorio de produccion nunca se modifica.
 
@@ -47,7 +49,10 @@ Por repo (fuera de `--dry-run`):
      sobre el workspace aislado. Solo se tocan archivos de test
      (`*.spec.ts`, `*.test.ts`, `test_*.py`); si Aider toca algo mas, o el
      test generado falla al correrlo, se descarta con `git checkout` y se
-     registra en memoria. Si pasa, se comitea y se pushea a `dev` (contra
+     registra en memoria. El test se corre solo con el runner por archivo
+     del modo Desarrollo (`run_test_file`: vitest/jest con reporte JSON,
+     exige > 0 tests ejecutados y 0 fallidos). Si pasa, se comitea y se
+     pushea a la rama de trabajo (contra
      el remoto de GitHub, no contra el directorio de produccion).
   6. Reporta: issues en GitHub (labels `red-hood` + `bug`, buscando
      duplicados primero -- por un marcador oculto `<!-- red-hood:<categoria>:
@@ -105,16 +110,21 @@ from batcave import memory_store
 from batcave.secrets import mask_secrets
 from modes.development import (
     AIDER_BIN,
+    DEFAULT_WORK_BRANCH,
     OLLAMA_API_BASE,
+    PROTECTED_BRANCHES,
     changed_files,
     commit_allowed_and_push,
     git_cmd,
     github_auth_env,
     is_forbidden_path,
+    load_specialists,
     read_repo_claude_md,
     remove_aider_artifacts,
     repo_is_clean,
+    resolve_work_branch,
     run_cli,
+    run_test_file,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -306,7 +316,7 @@ def update_memory(event: str, **kwargs) -> None:
             memory_store.append_success(
                 "red_hood",
                 problema=f"Sin tests o cobertura baja en {kwargs['file']}",
-                como_se_resolvio=f"Tests generados con Aider ({kwargs['framework']}) y commiteados en dev",
+                como_se_resolvio=f"Tests generados con Aider ({kwargs['framework']}) y commiteados en {kwargs.get('branch', 'dev')}",
             )
             memory_store.bump_stat("red_hood", "reparaciones")
         elif event == "test_generated_failed":
@@ -376,7 +386,23 @@ def get_origin_url(prod_repo_path: Path) -> Optional[str]:
     return url or None
 
 
-def setup_workspace_repo(prod_repo_path: Path, workspace_dir: Path) -> tuple[Optional[Path], str, bool]:
+def repo_work_branch(config: dict, prod_repo_path: Path, specialists: dict[str, dict]) -> str:
+    """Rama de trabajo del repo de produccion `prod_repo_path`: se busca su
+    nombre de GitHub en `repo_paths` (si no esta, el nombre del directorio)
+    y se resuelve con `resolve_work_branch` (work_branch del perfil, default
+    `github.work_branch`)."""
+    resolved = prod_repo_path.expanduser().resolve()
+    repo_name = prod_repo_path.name
+    for name, raw in (config.get("repo_paths") or {}).items():
+        if Path(raw).expanduser().resolve() == resolved:
+            repo_name = name
+            break
+    return resolve_work_branch(config, repo_name, specialists)
+
+
+def setup_workspace_repo(
+    prod_repo_path: Path, workspace_dir: Path, work_branch: str = DEFAULT_WORK_BRANCH
+) -> tuple[Optional[Path], str, bool]:
     """Prepara una copia aislada de prod_repo_path en workspace_dir.
 
     Red Hood NUNCA hace checkout/pull/npm ci sobre prod_repo_path (regla
@@ -384,8 +410,9 @@ def setup_workspace_repo(prod_repo_path: Path, workspace_dir: Path) -> tuple[Opt
     copia no existe se clona desde el 'origin' del repo de produccion; si ya
     existe se hace `fetch` + `reset --hard` para dejarla identica al remoto.
 
-    Se posiciona en 'dev' si existe; si no, audita 'main' en modo
-    solo-lectura (nunca crea una rama 'dev' nueva, nunca comitea en main).
+    Se posiciona en `work_branch` (la del repo, `repo_work_branch`: `dev`, o
+    p. ej. `development` en my_Portfolio_React_v2) si existe; si no, audita
+    'main' en modo solo-lectura (nunca crea la rama, nunca comitea en main).
 
     Devuelve (workspace_repo_path, branch, read_only). workspace_repo_path
     es None si no se pudo preparar el workspace (repo se omite).
@@ -410,12 +437,16 @@ def setup_workspace_repo(prod_repo_path: Path, workspace_dir: Path) -> tuple[Opt
     else:
         run_cli(git_cmd(["fetch", "origin"]), cwd=workspace_repo_path, extra_env=github_auth_env())
 
-    if run_cli(["git", "checkout", "dev"], cwd=workspace_repo_path).returncode == 0:
-        run_cli(["git", "reset", "--hard", "origin/dev"], cwd=workspace_repo_path)
-        return workspace_repo_path, "dev", False
-    if run_cli(["git", "checkout", "-b", "dev", "origin/dev"], cwd=workspace_repo_path).returncode == 0:
-        run_cli(["git", "reset", "--hard", "origin/dev"], cwd=workspace_repo_path)
-        return workspace_repo_path, "dev", False
+    if work_branch in PROTECTED_BRANCHES:
+        log.error("%s: rama de trabajo '%s' prohibida, se audita en solo lectura", prod_repo_path.name, work_branch)
+    elif run_cli(["git", "checkout", work_branch], cwd=workspace_repo_path).returncode == 0:
+        run_cli(["git", "reset", "--hard", f"origin/{work_branch}"], cwd=workspace_repo_path)
+        return workspace_repo_path, work_branch, False
+    elif run_cli(
+        ["git", "checkout", "-b", work_branch, f"origin/{work_branch}"], cwd=workspace_repo_path
+    ).returncode == 0:
+        run_cli(["git", "reset", "--hard", f"origin/{work_branch}"], cwd=workspace_repo_path)
+        return workspace_repo_path, work_branch, False
 
     run_cli(["git", "checkout", "main"], cwd=workspace_repo_path)
     run_cli(["git", "reset", "--hard", "origin/main"], cwd=workspace_repo_path)
@@ -903,9 +934,12 @@ def discard_changes(repo_path: Path) -> None:
 
 
 def run_single_node_test(repo_path: Path, test_rel: str) -> bool:
-    runner = node_test_runner(repo_path)
-    cmd = ["npx", "vitest", "run", test_rel] if runner == "vitest" else ["npx", "jest", test_rel]
-    return run_cli(cmd, cwd=repo_path, timeout=SINGLE_TEST_TIMEOUT).returncode == 0
+    """Runner por archivo compartido con el modo Desarrollo
+    (`modes.development.run_test_file`: vitest con `--reporter=json`, jest
+    con `--json`): el test generado debe ejecutar > 0 tests y 0 fallidos."""
+    executed, failed, _ = run_test_file(repo_path, test_rel, node_test_runner(repo_path))
+    log.info("%s: %s -> %d test(s) ejecutados, %d fallido(s)", repo_path.name, test_rel, executed, failed)
+    return executed > 0 and failed == 0
 
 
 def run_single_python_test(repo_path: Path, test_rel: str) -> bool:
@@ -1180,7 +1214,7 @@ def format_repo_summary(summary: dict) -> str:
         if generated
         else "ninguno"
     )
-    read_only_tag = " (solo lectura, sin rama dev)" if summary["read_only"] else ""
+    read_only_tag = " (solo lectura, sin rama de trabajo)" if summary["read_only"] else ""
 
     return (
         f"🔴 <b>Red Hood</b> — <code>{html.escape(summary['repo'])}</code>{read_only_tag}\n"
@@ -1261,6 +1295,7 @@ async def audit_repo(
     notifier,
     state: dict,
     dry_run: bool,
+    specialists: Optional[dict[str, dict]] = None,
 ) -> Optional[dict]:
     if not repo_path.exists():
         log.warning("Repo no encontrado en %s, se omite", repo_path)
@@ -1268,12 +1303,14 @@ async def audit_repo(
 
     repo_name = display_repo_name(repo_path)
     state_entry = state.setdefault(str(repo_path), {})
+    work_branch = repo_work_branch(config, repo_path, specialists or {})
 
     if dry_run:
+        log.info("[dry-run] %s: rama de trabajo -> %s", repo_name, work_branch)
         return await audit_repo_dry_run(repo_path, repo_name, state_entry)
 
     workspace_dir = get_workspace_dir(config)
-    repo_path, branch, read_only = setup_workspace_repo(repo_path, workspace_dir)
+    repo_path, branch, read_only = setup_workspace_repo(repo_path, workspace_dir, work_branch)
     if repo_path is None:
         log.warning("%s: no se pudo preparar el workspace aislado, se omite", repo_name)
         return {"repo": repo_name, "skipped": True}
@@ -1373,7 +1410,7 @@ async def audit_repo(
                 generated = generate_tests_for_repo(repo_path, stack, branch, candidates, model, max_files)
                 for item in generated:
                     if item["status"] == "committed":
-                        update_memory("test_generated_success", file=item["file"], framework=stack)
+                        update_memory("test_generated_success", file=item["file"], framework=stack, branch=branch)
                     else:
                         update_memory("test_generated_failed", file=item["file"])
 
@@ -1491,11 +1528,18 @@ async def main() -> None:
     gh = None if args.dry_run else get_github_client()
     state = load_state()
     summaries: list[dict] = []
+    try:
+        specialists = load_specialists(config)
+    except Exception as exc:  # noqa: BLE001 - sin perfiles se usa github.work_branch para todos
+        log.warning("No se pudieron cargar los perfiles de especialista (%s); rama de trabajo por defecto", exc)
+        specialists = {}
 
     async def run_all(client: Optional[AsyncTypeSafeClient]) -> None:
         for raw_path in repo_paths:
             try:
-                summary = await audit_repo(Path(raw_path).expanduser(), config, gh, client, notifier, state, args.dry_run)
+                summary = await audit_repo(
+                    Path(raw_path).expanduser(), config, gh, client, notifier, state, args.dry_run, specialists
+                )
             except Exception as exc:  # noqa: BLE001 - un repo no debe tumbar el resto de la auditoria
                 log.exception("Fallo inesperado auditando %s", raw_path)
                 summary = {"repo": raw_path, "skipped": True, "error": str(exc)}

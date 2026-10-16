@@ -53,7 +53,11 @@ en `workspace_dir/<nombre-repo>`:
     guardado en `.git/config`.
   - Si ya existe: `git fetch origin` + `checkout <work_branch>` +
     `reset --hard origin/<work_branch>`.
-  - Si `origin` no tiene la rama de trabajo (`github.work_branch`), se crea
+  - La rama de trabajo es por repo (`resolve_work_branch`): el `work_branch`
+    de la entrada del repo en `repos` de un perfil (p. ej.
+    `my_Portfolio_React_v2` -> `development`), o `github.work_branch`
+    (`dev`). Nunca main/master.
+  - Si `origin` no tiene la rama de trabajo, se crea
     en el workspace desde `origin/main` y se pushea con `-u origin <rama>`.
 
 Flujo por issue:
@@ -104,8 +108,10 @@ Flujo por issue:
      (p. ej. Node: npm ci si hace falta, build, lint, test; Python:
      py_compile + pytest). Cada archivo de test permitido (`*.spec.ts`,
      `*.test.ts`, `test_*.py`) se corre aparte con su runner apuntando solo a
-     ese archivo (`run_test_file`: jest `--runTestsByPath` con `--json`, o
-     `pytest <archivo>`): debe ejecutar mas de 0 tests y 0 fallidos.
+     ese archivo (`run_test_file`, runner segun `test_runner` del perfil o
+     detectado: `npx vitest run <archivo> --reporter=json`, jest
+     `--runTestsByPath` con `--json`, o `pytest <archivo>`): debe ejecutar
+     mas de 0 tests y 0 fallidos.
      Si falla, el intento cuenta
      como fallido: la salida COMPLETA del comando que fallo queda en
      `reports/aider-<repo>-<issue>-<intento>.log`,
@@ -186,6 +192,10 @@ PREAMBLE_MAX_LINES = 25
 MAX_KNOWLEDGE_NOTES = 3
 MAX_KNOWLEDGE_NOTE_LINES = 60
 DEFAULT_STEP_TIMEOUT = 600
+DEFAULT_WORK_BRANCH = "dev"
+PROTECTED_BRANCHES = ("main", "master")
+TEST_RUNNERS = ("auto", "vitest", "jest", "pytest")
+VITEST_CONFIG_GLOBS = ("vitest.config.*", "vitest.workspace.*")
 
 DEFAULT_MAX_CLAUDE_ESCALATIONS = 2
 DEFAULT_CLAUDE_TIMEOUT = 1800
@@ -238,7 +248,7 @@ PROGRESS_INTERVAL = timedelta(minutes=30)
 FORBIDDEN_NAME_SUBSTRINGS = (".env", "docker-compose")
 FORBIDDEN_PATH_SEGMENTS = ("nginx", "fail2ban", "cloudflared", ".cloudflared", ".ssh", "ufw")
 
-FILE_MENTION_RE = re.compile(r"(?<![\w/])[\w./\-]+\.(?:py|ts|service|timer|md|yaml)(?![\w])")
+FILE_MENTION_RE = re.compile(r"(?<![\w/])[\w./\-]+\.(?:py|ts|tsx|jsx|css|scss|html|service|timer|md|yaml)(?![\w])")
 FILES_SECTION_HEADER_RE = re.compile(r"^\s*archivos\s*:\s*$", re.IGNORECASE)
 SERVICE_CHECK_LINE_RE = re.compile(r"systemctl|is-active|docker", re.IGNORECASE)
 TEST_FILE_NAME_RE = re.compile(r"^test_.+\.py$|.+\.(?:spec|test)\.[jt]sx?$")
@@ -248,6 +258,10 @@ PYTEST_FAILED_RE = re.compile(r"(\d+)\s+failed")
 PYTEST_ERRORS_RE = re.compile(r"(\d+)\s+errors?\b")
 PYTEST_SUMMARY_LINE_RE = re.compile(r"^.*\bin [\d.]+s\b.*$", re.MULTILINE)
 JEST_TESTS_LINE_RE =re.compile(r"^Tests:\s+(.+)$", re.MULTILINE)
+# Resumen de vitest: " Tests  1 failed | 103 passed (104)" (sin dos puntos).
+VITEST_TESTS_LINE_RE = re.compile(r"^\s*Tests\s+(\d+ (?:failed|passed|skipped|todo).*)$", re.MULTILINE)
+# vitest/picocolors colorean la salida si `CI` esta en el entorno, aun sin TTY.
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 AIDER_ARTIFACT_PREFIX = ".aider"
 ARTIFACT_SCAN_SKIP_DIRS = {".git", "node_modules"}
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -269,7 +283,12 @@ COMMENT_PREFIXES_BY_SUFFIX = {
     ".service": ("#", ";"),
     ".timer": ("#", ";"),
     ".ts": ("//", "/*", "*"),
+    ".tsx": ("//", "/*", "*"),
     ".js": ("//", "/*", "*"),
+    ".jsx": ("//", "/*", "*"),
+    ".css": ("/*", "*"),
+    ".scss": ("//", "/*", "*"),
+    ".html": ("<!--",),
     ".md": (),
 }
 
@@ -347,10 +366,62 @@ def load_specialists(config: dict) -> dict[str, dict]:
             continue
         if profile["name"] != path.stem:
             log.warning("Perfil %s: name '%s' no coincide con el nombre del archivo", path.name, profile["name"])
+        if not validate_profile_repos(path.name, profile):
+            continue
+        runner = str(profile.get("test_runner", "auto")).lower()
+        if runner not in TEST_RUNNERS:
+            log.warning("Perfil %s: test_runner '%s' desconocido, se usa 'auto'", path.name, runner)
+            runner = "auto"
+        profile["test_runner"] = runner
         specialists[profile["name"]] = profile
     if not specialists:
         raise RuntimeError(f"No hay perfiles de especialista validos en {specialists_dir}")
     return specialists
+
+
+def validate_profile_repos(file_name: str, profile: dict) -> bool:
+    """Cada entrada de `repos` es un nombre (str) o `{name, work_branch}`.
+    Un `work_branch` main/master invalida el perfil (regla dura)."""
+    for entry in profile.get("repos") or []:
+        if isinstance(entry, str):
+            continue
+        if not isinstance(entry, dict) or not entry.get("name"):
+            log.error("Perfil %s: entrada de repos invalida (%r), se omite el perfil", file_name, entry)
+            return False
+        branch = entry.get("work_branch")
+        if branch is not None and str(branch) in PROTECTED_BRANCHES:
+            log.error(
+                "Perfil %s: work_branch '%s' para %s esta prohibido (main/master), se omite el perfil",
+                file_name, branch, entry["name"],
+            )
+            return False
+    return True
+
+
+def profile_repos(profile: dict) -> list[str]:
+    """Nombres de repo (sin owner) del perfil, sea la entrada str o dict."""
+    return [
+        str(entry["name"] if isinstance(entry, dict) else entry)
+        for entry in profile.get("repos") or []
+        if isinstance(entry, str) or (isinstance(entry, dict) and entry.get("name"))
+    ]
+
+
+def resolve_work_branch(
+    config: dict, repo: str, specialists: Optional[dict[str, dict]] = None, preferred: Optional[dict] = None
+) -> str:
+    """Rama de integracion de `repo` (`owner/repo` o nombre corto): el
+    `work_branch` de su entrada en `repos` de un perfil (primero `preferred`,
+    luego el resto), o `github.work_branch` (default `dev`). La rama es del
+    repo, no del especialista: un issue de Nightwing en un repo de Batgirl
+    usa la rama de ese repo."""
+    short = repo.split("/")[-1].lower()
+    profiles = ([preferred] if preferred else []) + list((specialists or {}).values())
+    for profile in profiles:
+        for entry in profile.get("repos") or []:
+            if isinstance(entry, dict) and str(entry.get("name", "")).lower() == short and entry.get("work_branch"):
+                return str(entry["work_branch"])
+    return str(config.get("github", {}).get("work_branch") or DEFAULT_WORK_BRANCH)
 
 
 def default_specialist_name(config: dict, specialists: dict[str, dict]) -> str:
@@ -386,7 +457,7 @@ def route_issue(issue: dict, specialists: dict[str, dict], default_name: str, is
         name = default_name
         reason = "default, sin label de especialidad"
     repo_short_name = issue["repo"].split("/")[-1]
-    owned = specialists[name].get("repos") or []
+    owned = profile_repos(specialists[name])
     if owned and repo_short_name not in owned:
         reason += f"; ojo: {repo_short_name} no esta en sus repos"
     return name, reason
@@ -398,7 +469,10 @@ def build_specialist_preamble(profile: dict) -> str:
         f"Actuas como {profile.get('display_name') or profile['name']}, "
         f"especialista {profile['role']} del equipo de desarrollo."
     ]
-    for key, title in (("languages", "Lenguajes"), ("frameworks", "Frameworks"), ("orms", "ORMs"), ("messaging", "Mensajeria")):
+    for key, title in (
+        ("languages", "Lenguajes"), ("frameworks", "Frameworks"), ("ui", "UI"), ("testing", "Testing"),
+        ("orms", "ORMs"), ("messaging", "Mensajeria"),
+    ):
         if profile.get(key):
             lines.append(f"{title}: {', '.join(str(v) for v in profile[key])}")
     if profile.get("conventions"):
@@ -863,7 +937,7 @@ def validate_allowed_file_content(repo_path: Path, allowed_files: list[str]) -> 
                 errors.append(f"{rel}: falta la seccion [Timer]")
             elif not TIMER_SCHEDULE_RE.search(content):
                 errors.append(f"{rel}: falta OnCalendar= u OnUnitActiveSec=")
-        elif name.endswith(".spec.ts") or name.endswith(".test.ts"):
+        elif TEST_FILE_NAME_RE.match(name) and not name.endswith(".py"):
             if not TEST_BODY_RE.search(content):
                 errors.append(f"{rel}: no contiene describe(/it(/test(")
     return errors
@@ -901,7 +975,7 @@ def setup_workspace_repo(repo_full_name: str, workspace_dir: Path, branch: str) 
     Devuelve la ruta del workspace, o None si no se pudo preparar (el
     llamador debe omitir el repo en ese caso).
     """
-    if branch in ("main", "master"):
+    if branch in PROTECTED_BRANCHES:
         log.error("work_branch configurado como '%s': el modo se niega a usarlo", branch)
         return None
 
@@ -1009,11 +1083,29 @@ def commit_allowed_and_push(
     return committed, "", push.returncode == 0
 
 
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def vitest_summary_counts(output: str) -> Optional[tuple[int, int]]:
+    """(passed, failed) de la linea `Tests  ...` de vitest, o None si no esta."""
+    matches = VITEST_TESTS_LINE_RE.findall(strip_ansi(output))
+    if not matches:
+        return None
+    summary = matches[-1]
+    passed = sum(int(n) for n in re.findall(r"(\d+) passed", summary))
+    failed = sum(int(n) for n in re.findall(r"(\d+) failed", summary))
+    return passed, failed
+
+
 def count_node_tests_detected(output: str) -> int:
-    match = NODE_TEST_COUNT_RE.search(output)
-    if not match:
-        return 0
-    return int(match.group(1) or 0) + int(match.group(3) or 0)
+    """Tests ejecutados (passed + failed) segun el resumen de jest o de vitest."""
+    clean = strip_ansi(output)
+    match = NODE_TEST_COUNT_RE.search(clean)
+    if match:
+        return int(match.group(1) or 0) + int(match.group(3) or 0)
+    vitest = vitest_summary_counts(clean)
+    return sum(vitest) if vitest else 0
 
 
 def node_has_script(repo_path: Path, script: str) -> bool:
@@ -1194,13 +1286,67 @@ def parse_jest_json(report_path: Path, test_path: Path) -> Optional[tuple[int, i
     return None
 
 
-def run_test_file(repo_path: Path, rel: str) -> tuple[int, int, str]:
-    """Corre el runner apuntando SOLO a `rel`. Devuelve (tests ejecutados,
-    fallidos, salida). Node: `npm test -- --runTestsByPath <rel>` con
-    `--json` a un archivo temporal fuera del repo (fallback: linea `Tests:`
-    del texto, exigiendo que el archivo aparezca en la salida). Python:
-    `pytest <rel>`; ejecutados = passed + failed + errors."""
+def detect_test_runner(repo_path: Path, rel: str, configured: str = "auto") -> str:
+    """Runner para el archivo de test `rel`. `.py` siempre pytest. Para tests
+    JS/TS: `vitest`/`jest` del perfil (`test_runner`) si se fijo uno; con
+    `auto` (o `pytest`, que no aplica a JS), vitest si esta en las
+    dependencias de package.json o hay `vitest.config.*`, si no jest."""
     if rel.endswith(".py"):
+        return "pytest"
+    if configured in ("vitest", "jest"):
+        return configured
+    package_json = repo_path / "package.json"
+    try:
+        pkg = json.loads(package_json.read_text(encoding="utf-8")) if package_json.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        pkg = {}
+    deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+    if "vitest" in deps or any(any(repo_path.glob(pattern)) for pattern in VITEST_CONFIG_GLOBS):
+        return "vitest"
+    return "jest"
+
+
+def run_vitest_file(repo_path: Path, rel: str) -> tuple[int, int, str]:
+    """`npx vitest run <rel> --reporter=json --outputFile=<tmp>`. El reporte
+    JSON de vitest es compatible con el de jest (`parse_jest_json`); fallback:
+    linea `Tests  ...` del texto, exigiendo que el archivo aparezca en la
+    salida. Ojo: el posicional de vitest es un filtro por substring, por eso
+    el reporte se filtra por la ruta exacta."""
+    with tempfile.TemporaryDirectory(prefix="night-agent-vitest-") as tmp:
+        report_path = Path(tmp) / "vitest.json"
+        proc = run_cli(
+            ["npx", "vitest", "run", rel, "--reporter=json", f"--outputFile={report_path}"],
+            cwd=repo_path,
+            timeout=DEFAULT_STEP_TIMEOUT,
+            extra_env={"CI": "true"},
+        )
+        output = mask_secrets(proc.stdout + proc.stderr)
+        parsed = parse_jest_json(report_path, repo_path / rel)
+    if parsed is not None:
+        executed, failed = parsed
+    else:
+        counts = vitest_summary_counts(output)
+        if counts is None or Path(rel).name not in strip_ansi(output):
+            return 0, 0, output
+        passed, failed = counts
+        executed = passed + failed
+    if proc.returncode != 0 and failed == 0:
+        failed = 1
+    return executed, failed, output
+
+
+def run_test_file(repo_path: Path, rel: str, runner: str = "auto") -> tuple[int, int, str]:
+    """Corre el runner apuntando SOLO a `rel`. Devuelve (tests ejecutados,
+    fallidos, salida). El runner sale de `detect_test_runner` (`test_runner`
+    del perfil: auto|vitest|jest|pytest). Vitest: `run_vitest_file`. Jest:
+    `npm test -- --runTestsByPath <rel>` con `--json` a un archivo temporal
+    fuera del repo (fallback: linea `Tests:` del texto, exigiendo que el
+    archivo aparezca en la salida). Python: `pytest <rel>`; ejecutados =
+    passed + failed + errors."""
+    runner = detect_test_runner(repo_path, rel, runner)
+    if runner == "vitest":
+        return run_vitest_file(repo_path, rel)
+    if runner == "pytest":
         proc = run_cli(
             ["python3", "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"], cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT
         )
@@ -1242,18 +1388,20 @@ def run_test_file(repo_path: Path, rel: str) -> tuple[int, int, str]:
     return executed, failed, output
 
 
-def verify_test_files(repo_path: Path, test_files: list[str]) -> tuple[list[str], list[str], dict[str, dict]]:
+def verify_test_files(
+    repo_path: Path, test_files: list[str], runner: str = "auto"
+) -> tuple[list[str], list[str], dict[str, dict]]:
     """Cada archivo de test permitido debe ejecutar > 0 tests y 0 fallidos
     corriendo su runner apuntado a ese archivo. Devuelve (errores, salidas
-    completas de los fallidos, {archivo: {"executed", "failed"}})."""
+    completas de los fallidos, {archivo: {"executed", "failed", "runner"}})."""
     errors: list[str] = []
     full_outputs: list[str] = []
     counts: dict[str, dict] = {}
     for rel in test_files:
         if not (repo_path / rel).is_file():
             continue
-        executed, failed, output = run_test_file(repo_path, rel)
-        counts[rel] = {"executed": executed, "failed": failed}
+        executed, failed, output = run_test_file(repo_path, rel, runner)
+        counts[rel] = {"executed": executed, "failed": failed, "runner": detect_test_runner(repo_path, rel, runner)}
         if executed == 0 or failed > 0:
             errors.append(f"{rel}: {executed} test(s) ejecutados, {failed} fallido(s) (se exige > 0 y 0)")
             full_outputs.append(f"=== tests de {rel} ===\n{output}")
@@ -1300,7 +1448,7 @@ def verify_changes(
     errors.extend(step_errors)
     full_outputs.extend(step_full)
 
-    test_errors, test_full, test_counts = verify_test_files(repo_path, test_files)
+    test_errors, test_full, test_counts = verify_test_files(repo_path, test_files, profile.get("test_runner", "auto"))
     errors.extend(test_errors)
     full_outputs.extend(test_full)
 
@@ -1803,14 +1951,14 @@ def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path
     return issue_result(msg, SOLVER_DETERMINISTIC, committed)
 
 
-def process_issue(config: dict, issue: dict, profile: dict, escalation_state: dict) -> dict:
-    """Resuelve un issue con el especialista `profile`. Devuelve
-    `issue_result`: mensaje, resolutor (`SOLVER_AIDER`/`SOLVER_CLAUDE`/
-    `SOLVER_NONE`), archivos exactos del commit y tests por archivo de test
-    (para la autoverificacion del reporte)."""
+def process_issue(config: dict, issue: dict, profile: dict, escalation_state: dict, branch: str) -> dict:
+    """Resuelve un issue con el especialista `profile` en la rama de trabajo
+    del repo (`resolve_work_branch`). Devuelve `issue_result`: mensaje,
+    resolutor (`SOLVER_AIDER`/`SOLVER_CLAUDE`/`SOLVER_NONE`), archivos
+    exactos del commit y tests por archivo de test (para la
+    autoverificacion del reporte)."""
     tag = f"{issue['repo']}#{issue['number']}"
     repo_short_name = issue["repo"].split("/")[-1]
-    branch = config["github"]["work_branch"]
     aider_model = config["models"]["aider"]
     workspace_dir = get_workspace_dir(config)
     aider_timeout = config.get("development", {}).get("aider_timeout", DEFAULT_AIDER_TIMEOUT)
@@ -2020,7 +2168,7 @@ def write_development_report(started_at: datetime, results: list[dict], escalati
             tests = r.get("tests") or {}
             if tests:
                 lines.extend(
-                    f"- Tests `{f}`: {c['executed']} ejecutado(s), {c['failed']} fallido(s)"
+                    f"- Tests `{f}` ({c.get('runner', '?')}): {c['executed']} ejecutado(s), {c['failed']} fallido(s)"
                     + ("" if c["executed"] > 0 and c["failed"] == 0 else " ❌")
                     for f, c in tests.items()
                 )
@@ -2065,17 +2213,18 @@ async def run_development_mode(config: dict, notifier) -> str:
     for idx, (issue, name, reason) in enumerate(routed, start=1):
         profile = specialists[name]
         tag = f"{issue['repo']}#{issue['number']}"
+        branch = resolve_work_branch(config, issue["repo"], specialists, profile)
         log.info(
-            "%s trabajando en issue #%d (%d/%d): %s (%s)",
-            specialist_display(profile), issue["number"], idx, len(issues), tag, reason,
+            "%s trabajando en issue #%d (%d/%d): %s (%s, rama %s)",
+            specialist_display(profile), issue["number"], idx, len(issues), tag, reason, branch,
         )
         try:
-            outcome = process_issue(config, issue, profile, escalation_state)
+            outcome = process_issue(config, issue, profile, escalation_state, branch)
         except Exception as exc:  # noqa: BLE001 - un issue no debe tumbar el resto de la corrida
             log.exception("Fallo inesperado procesando %s", tag)
             outcome = issue_result(f"❌ {tag}: error inesperado: {exc}", SOLVER_NONE)
         message, solver = outcome["message"], outcome["solver"]
-        record_specialist_memory(profile, issue, message, solver, config["github"]["work_branch"])
+        record_specialist_memory(profile, issue, message, solver, branch)
         worked.add(name)
         results.append(
             {

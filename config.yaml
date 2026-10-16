@@ -21,6 +21,9 @@ github:
     - dsantacruza101/NodeMailer_MicroService
     - dsantacruza101/dark-Knight
   issue_label: night-agent
+  # Rama de integracion por defecto. Un repo puede fijar la suya con
+  # `work_branch` en su entrada de `repos` del perfil de especialista
+  # (my_Portfolio_React_v2 -> development, en batgirl.yaml). Nunca main/master.
   work_branch: dev
 
 # Mapeo repo remoto -> ruta local de produccion. SOLO se usa para leer el
@@ -41,6 +44,7 @@ development:
   claude_timeout: 1800        # segundos por escalacion (acotado por el limite de 3h por issue)
 
 # Equipo de desarrollo: perfiles en specialists.dir (esquema en su README.md).
+# Hoy: nightwing (label backend, default) y batgirl (label frontend).
 # Un issue va al especialista cuyo label tenga; sin label de especialidad, al default.
 specialists:
   dir: batcave/specialists
@@ -49,6 +53,7 @@ specialists:
 
 # Radar tecnologico (batcave/radar.py): inventario de dependencias, OSV y
 # ultimas versiones por especialista. Workspace de solo lectura, nunca produccion.
+# Timers: radar-nightwing (07:00, lunes 01:00) y radar-batgirl (07:10, lunes 01:20).
 radar:
   workspace_dir: ~/projects/.radar-workspace
   github_owner: dsantacruza101     # owner para repos de un perfil que no esten en github.repos

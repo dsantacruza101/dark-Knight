@@ -124,6 +124,8 @@ CATALOG: list[ServiceCheck] = [
     ServiceCheck("ace.timer", "systemd", "medium", "Ace, health check horario de la Batifamilia"),
     ServiceCheck("radar-nightwing.timer", "systemd", "medium", "Radar diario de Nightwing (07:00): OSV + ultimas versiones, abre issues de parches"),
     ServiceCheck("radar-nightwing-weekly.timer", "systemd", "medium", "Radar semanal de Nightwing (lunes 01:00): notas de Claude sobre majors + resumen"),
+    ServiceCheck("radar-batgirl.timer", "systemd", "medium", "Radar diario de Batgirl (07:10): OSV + ultimas versiones del frontend, abre issues de parches"),
+    ServiceCheck("radar-batgirl-weekly.timer", "systemd", "medium", "Radar semanal de Batgirl (lunes 01:20): notas de Claude sobre majors + resumen"),
     ServiceCheck("webhook-portfolio", "systemd", "high", "Servidor de webhooks que dispara los deploys via Docker"),
     ServiceCheck("signal.service", "systemd", "high", "Vigilante diurno Signal, complemento de Batman en horario diurno"),
     ServiceCheck("batwoman.service", "systemd", "high", "Batwoman — analista de seguridad"),

@@ -7,8 +7,10 @@ las dependencias de sus repos y dispara parches proactivos:
 
 Inventario: por cada repo de `repos` del perfil se usa una copia de SOLO
 LECTURA en `radar.workspace_dir/<repo>` (default `~/projects/.radar-workspace`):
-`git clone` si no existe, si no `fetch` + `reset --hard origin/dev` (o
-`origin/main` si no hay `dev`). Nunca se tocan los directorios de produccion
+`git clone` si no existe, si no `fetch` + `reset --hard origin/<rama>`, con
+la rama de trabajo del repo (`work_branch` de su entrada en `repos` del
+perfil, default `github.work_branch` = `dev`; si no existe en origin,
+`main`/`master`). Nunca se tocan los directorios de produccion
 (`repo_paths`), nunca se comitea ni se pushea.
 
 Dependencias directas: `package.json` (+ version instalada de
@@ -34,8 +36,8 @@ Acciones:
     `night-agent` + label del especialista + `dependencies`, con advisories,
     versiones, comando exacto, bloque ```radar-patch``` (JSON: package,
     from, to, ecosystem, direct, dev, manifest, advisories) y seccion
-    `Archivos:`; el modo Desarrollo de Batman lo aplica esa noche en `dev`
-    de forma determinista (sin Aider ni Claude).
+    `Archivos:`; el modo Desarrollo de Batman lo aplica esa noche en la
+    rama de trabajo del repo de forma determinista (sin Aider ni Claude).
   - `security_watch` -> sin issue (si habia uno abierto se cierra con un
     comentario explicando la politica); se lista en el resumen semanal bajo
     "Sin parche disponible (vigilando)".
@@ -92,7 +94,9 @@ from modes.development import (
     github_auth_env,
     load_env,
     load_specialists,
+    profile_repos,
     resolve_project_path,
+    resolve_work_branch,
     run_cli,
     specialist_display,
 )
@@ -331,9 +335,11 @@ def get_workspace_dir(config: dict) -> Path:
     return workspace
 
 
-def sync_workspace_repo(config: dict, full_name: str, workspace_dir: Path) -> Optional[tuple[Path, str]]:
-    """Copia de solo lectura: clone o fetch + reset --hard a origin/dev (o
-    main/master). Devuelve (ruta, rama) o None. Nunca comitea ni pushea."""
+def sync_workspace_repo(full_name: str, workspace_dir: Path, work_branch: str) -> Optional[tuple[Path, str]]:
+    """Copia de solo lectura: clone o fetch + reset --hard a
+    origin/<work_branch> (la del repo segun el perfil, `resolve_work_branch`;
+    si no existe, main/master). Devuelve (ruta, rama) o None. Nunca comitea
+    ni pushea."""
     path = workspace_dir / full_name.split("/")[-1]
     auth = github_auth_env()
     if not (path / ".git").exists():
@@ -347,7 +353,6 @@ def sync_workspace_repo(config: dict, full_name: str, workspace_dir: Path) -> Op
         if fetch.returncode != 0:
             log.warning("fetch fallo en %s (se usa la copia local): %s", full_name, mask_secrets(fetch.stderr[-300:]))
 
-    work_branch = config.get("github", {}).get("work_branch", "dev")
     for branch in (work_branch, *WORK_BRANCH_FALLBACKS):
         if run_cli(["git", "rev-parse", "--verify", "--quiet", f"origin/{branch}"], cwd=path, timeout=GIT_TIMEOUT).returncode != 0:
             continue
@@ -851,9 +856,9 @@ def scan(config: dict, profile: dict, session: requests.Session) -> tuple[list[R
     timeout = http_timeout(config)
     workspace_dir = get_workspace_dir(config)
     scans: list[RepoScan] = []
-    for repo in profile.get("repos") or []:
+    for repo in profile_repos(profile):
         full = repo_full_name(config, repo)
-        synced = sync_workspace_repo(config, full, workspace_dir)
+        synced = sync_workspace_repo(full, workspace_dir, resolve_work_branch(config, repo, preferred=profile))
         if not synced:
             scans.append(RepoScan(repo, full, None, None))
             continue
@@ -978,7 +983,7 @@ def issue_body(config: dict, profile: dict, finding: Finding) -> str:
     if finding.category == SECURITY_PATCH:
         lines += [
             "",
-            "### Como aplicarlo (rama `dev`)",
+            f"### Como aplicarlo (rama `{resolve_work_branch(config, dep.repo, preferred=profile)}`)",
             "```bash",
             apply_command(finding),
             "```",

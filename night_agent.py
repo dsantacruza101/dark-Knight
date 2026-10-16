@@ -32,10 +32,15 @@ from batcave import memory_store
 from modes.development import (
     build_specialist_preamble,
     default_specialist_name,
+    describe_dependency_patch,
     get_github_client,
     get_open_issues,
+    is_dependency_patch_issue,
     load_env,
     load_specialists,
+    parse_radar_patch,
+    profile_repos,
+    resolve_work_branch,
     route_issue,
     run_development_mode,
     select_knowledge_notes,
@@ -195,6 +200,14 @@ def print_dry_run(config: dict, started_at: datetime) -> None:
         specialists = load_specialists(config)
         default_name = default_specialist_name(config, specialists)
         print(f"[dry-run] Especialistas cargados: {', '.join(specialists)} (default: {default_name})")
+        for spec_name, spec in specialists.items():
+            repos = ", ".join(
+                f"{repo}@{resolve_work_branch(config, repo, specialists, spec)}" for repo in profile_repos(spec)
+            )
+            print(
+                f"[dry-run]   {specialist_display(spec)} [{spec_name}] label '{spec['label']}', "
+                f"test_runner {spec.get('test_runner', 'auto')}: {repos or 'sin repos'}"
+            )
         max_escalations = config.get("development", {}).get("max_claude_escalations", 2)
         print(f"[dry-run] Escalaciones a Claude permitidas esta noche: {max_escalations}")
         print(f"[dry-run] {len(issues)} issue(s) con label '{issue_label}' encontrados:")
@@ -205,6 +218,24 @@ def print_dry_run(config: dict, started_at: datetime) -> None:
             print(f"[dry-run]   - {issue['repo']}#{issue['number']}: {issue['title']} ({issue['url']})")
             print(f"[dry-run]       labels: {', '.join(issue.get('labels', [])) or '-'}")
             print(f"[dry-run]       -> {specialist_display(profile)} [{name}] ({reason})")
+            print(
+                f"[dry-run]       rama de trabajo: {resolve_work_branch(config, issue['repo'], specialists, profile)}; "
+                f"test_runner: {profile.get('test_runner', 'auto')}"
+            )
+            if is_dependency_patch_issue(issue):
+                patch, error = parse_radar_patch(issue["body"])
+                if patch is None:
+                    print(f"[dry-run]       parche determinista: NO aplicable ({error}) -> needs-review")
+                else:
+                    origen = "bloque radar-patch" if "```radar-patch" in issue["body"] else "cuerpo legado del radar"
+                    print(
+                        f"[dry-run]       parche determinista (sin Aider/Claude, {origen}): "
+                        f"{patch['ecosystem']} {patch['package']} {patch['from']} -> {patch['to']} "
+                        f"({'directa' if patch['direct'] else 'transitiva'}{', dev' if patch['dev'] else ''})"
+                    )
+                    print(f"[dry-run]       plan: {describe_dependency_patch(patch)}")
+                    print(f"[dry-run]       commit: fix(deps): {patch['package']} {patch['from']} -> {patch['to']} (radar)")
+                continue
             print(
                 f"[dry-run]       preambulo: {len(build_specialist_preamble(profile).splitlines())} lineas; "
                 f"notas: {', '.join(stem for stem, _ in notes) or 'ninguna'}"

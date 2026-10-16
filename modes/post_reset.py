@@ -4,12 +4,13 @@ Claude estan frescos, asi que este modo lo usa intensivamente para auditar la
 semana que dejo el modo Desarrollo (que solo usa Ollama):
 
   1. Por cada repo de config.yaml, se listan los commits de night-agent de los
-     ultimos 7 dias en la rama de trabajo (`github.work_branch`):
+     ultimos 7 dias en la rama de trabajo del repo (`work_branch` de su
+     entrada en un perfil de especialista, o `github.work_branch`):
      `git log --author='night-agent' --since='7 days ago'`.
   2. Cada commit se pasa a `claude -p` para un code review de solo lectura
      (`git show <hash>` como diff de entrada).
   3. Si el review encuentra algo accionable, se le pide a claude que lo
-     implemente (--permission-mode acceptEdits) y se commitea/pushea a dev.
+     implemente (--permission-mode acceptEdits) y se commitea/pushea a esa rama.
   4. Se comparan los pares Claude/Ollama guardados en knowledge/ durante la
      semana: claude puntua cada respuesta de Ollama contra la de Claude
      (0-1) y se promedia, ademas de sintetizar mejoras y vacios de ejemplos.
@@ -48,8 +49,10 @@ from modes.development import (
     get_workspace_dir,
     is_forbidden_path,
     load_env,
+    load_specialists,
     normalize_rel_path,
     repo_is_clean,
+    resolve_work_branch,
     run_cli,
     setup_workspace_repo,
 )
@@ -383,8 +386,12 @@ async def run_post_reset_mode(config: dict, notifier) -> str:
     """Punto de entrada del modo Post-Reset: audita la semana usando Claude a fondo."""
     load_env()
     started_at = datetime.now()
-    branch = config["github"]["work_branch"]
     claude_bin = config["models"]["claude"]
+    try:
+        specialists = load_specialists(config)
+    except Exception as exc:  # noqa: BLE001 - sin perfiles se usa github.work_branch para todos
+        log.warning("No se pudieron cargar los perfiles de especialista (%s); rama de trabajo por defecto", exc)
+        specialists = {}
 
     await notifier.send(
         "👮 *Commissioner Gordon revisando...*\nCommits de night-agent de la ultima semana, "
@@ -396,6 +403,9 @@ async def run_post_reset_mode(config: dict, notifier) -> str:
 
     workspace_dir = get_workspace_dir(config)
     for repo_full_name in config["github"]["repos"]:
+        # Rama por repo (work_branch del perfil): p. ej. `development` en
+        # my_Portfolio_React_v2; con `dev` fijo se crearia una rama `dev` nueva.
+        branch = resolve_work_branch(config, repo_full_name, specialists)
         repo_path = setup_workspace_repo(repo_full_name, workspace_dir, branch)
         if repo_path is None:
             log.warning("No se pudo preparar el workspace aislado para %s, se omite", repo_full_name)

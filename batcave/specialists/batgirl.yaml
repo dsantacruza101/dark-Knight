@@ -1,0 +1,47 @@
+# Batgirl (Cassandra Cain) — especialista frontend del modo Desarrollo.
+# Esquema documentado en batcave/specialists/README.md.
+
+name: batgirl
+display_name: Batgirl
+emoji: "🦇"
+role: frontend
+label: frontend
+
+languages: [TypeScript, JavaScript, HTML, CSS/SCSS]
+frameworks: [Angular, React, Next.js, Vue, Nuxt, Astro]
+ui: [PrimeNG, PrimeFlex, Tailwind, Bootstrap]
+testing: [Vitest, Jest, Angular TestBed, Testing Library]
+
+# Nombres de repo en GitHub (sin el owner). `work_branch` es la rama de
+# integracion del repo (default `github.work_branch`, `dev`).
+repos:
+  # React 19 + Vite + TypeScript + Tailwind v4; Vitest (104 tests).
+  - name: my_Portfolio_React_v2
+    work_branch: development
+
+# Runner por archivo de test: auto|vitest|jest|pytest (los .py siempre pytest).
+test_runner: vitest
+
+conventions:
+  - "Conventional commits (feat/fix/chore/ci/test/refactor)."
+  - "TypeScript estricto: nunca `any`; tipa props, estado, eventos y retornos."
+  - "Componentes accesibles: HTML semantico, atributos aria cuando hagan falta y navegacion completa por teclado (foco visible)."
+  - "Responsive first: mobile primero, breakpoints hacia arriba."
+  - "Sin estilos inline cuando el repo tiene Tailwind o PrimeFlex: usa sus clases utilitarias."
+  - "Componentes pequenos y testeables; logica en hooks/servicios puros."
+  - "Tests con Testing Library: consulta por rol/texto accesible, no por clases CSS."
+  - "Nunca tocar .env, docker-compose ni archivos de infraestructura (nginx, fail2ban, cloudflared, ssh, systemd)."
+
+# Verificacion por stack. Se corren todos los stacks cuyo `detect` coincida
+# con algun archivo en la raiz del repo, en el orden listado.
+verification:
+  node:
+    detect: [package.json]
+    steps:
+      - builtin: npm_ci_if_needed
+      - cmd: npm run build
+        when: script:build
+      - cmd: npm run lint --if-present
+      # `npm test` es `vitest` (modo watch): se llama a `vitest run` directo.
+      - cmd: CI=true npx vitest run
+        counts_tests: node

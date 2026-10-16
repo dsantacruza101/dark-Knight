@@ -13,7 +13,7 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 | **Lucius Fox** | `lucius_fox.py` (`lucius-fox.service` + `lucius-fox.timer`, cada 30 min) | Guardian de infraestructura. Vigila servicios/containers/binarios criticos, usa TypeSafe (Jev) para decidir si auto-repararlos, y escala lo que no puede resolver. |
 | **Red Hood** | `red_hood.py` (`red-hood.service` + `red-hood.timer`, diario a las 02:00 America/El_Salvador) | QA brutal, sin piedad. Audita tests, cobertura, lint, vulnerabilidades y secretos hardcodeados en los repos locales, genera tests faltantes con Aider y reporta todo sin filtro. |
 | **Batwoman** (Kate Kane) | `batwoman.py` (`batwoman.service`, `Type=simple`, poll cada `batwoman.poll_interval` s) | Analista de seguridad. Lee las alertas de Wazuh, hace triage (allowlist, rutas criticas, nivel), las evalua con TypeSafe (Jev) y avisa a Alfred/Batman de las amenazas reales; digest diario a las 08:00. |
-| **Radar** | `batcave/radar.py` (`radar-nightwing.timer` diario 07:00, `radar-nightwing-weekly.timer` lunes 01:00) | Radar tecnologico por especialista: inventario de dependencias, vulnerabilidades (OSV) y ultimas versiones; abre issues de parches para que el especialista los aplique de noche. |
+| **Radar** | `batcave/radar.py` (`radar-nightwing.timer` diario 07:00 y `radar-nightwing-weekly.timer` lunes 01:00; `radar-batgirl.timer` diario 07:10 y `radar-batgirl-weekly.timer` lunes 01:20) | Radar tecnologico por especialista: inventario de dependencias, vulnerabilidades (OSV) y ultimas versiones; abre issues de parches para que el especialista los aplique de noche. |
 
 ## Modos de Batman (`modes/`)
 
@@ -25,11 +25,33 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 
 Cada especialista del modo Desarrollo es un perfil YAML en
 `batcave/specialists/` (esquema en `batcave/specialists/README.md`; agregar a
-Batgirl, Red Robin, Robin o Spoiler = agregar su YAML, sin tocar codigo).
-Hoy existe **Nightwing** (`nightwing.yaml`): backend (`label: backend`),
-TypeScript/JavaScript/Python/Java, NestJS, Express, FastAPI, Spring Boot,
-TypeORM/Prisma, NATS; dueño de `dsantacruz-client-gateway`,
-`NodeMailer_MicroService`, `telegram-bot` y `dark-Knight`.
+Red Robin, Robin o Spoiler = agregar su YAML, sin tocar codigo).
+Hoy existen:
+
+- **Nightwing** (`nightwing.yaml`, default): backend (`label: backend`),
+  TypeScript/JavaScript/Python/Java, NestJS, Express, FastAPI, Spring Boot,
+  TypeORM/Prisma, NATS; dueño de `dsantacruz-client-gateway`,
+  `NodeMailer_MicroService`, `telegram-bot` y `dark-Knight` (rama `dev`).
+- **Batgirl** (Cassandra Cain, `batgirl.yaml`): frontend (`label: frontend`),
+  TypeScript/JavaScript/HTML/CSS-SCSS, Angular, React, Next.js, Vue, Nuxt,
+  Astro; UI PrimeNG/PrimeFlex/Tailwind/Bootstrap; tests Vitest/Jest/Angular
+  TestBed/Testing Library; `test_runner: vitest`. Dueña de
+  `my_Portfolio_React_v2` (React 19 + Vite + TS + Tailwind v4, Vitest),
+  cuya rama de integracion es `development` (no `dev`). Notas semilla en
+  `batcave/knowledge/batgirl/` (React 19 + Vitest, Tailwind v4, Angular
+  standalone + signals + PrimeNG).
+
+**Rama de trabajo por repo**: una entrada de `repos` del perfil puede ser
+`{name, work_branch}`; `resolve_work_branch` (en `modes/development.py`)
+devuelve la del repo (buscando en todos los perfiles) o `github.work_branch`
+(`dev`). La usan el modo Desarrollo, el Post-Reset, el radar y Red Hood.
+`main`/`master` como `work_branch` invalida el perfil.
+
+**Runner por archivo de test** (`test_runner` del perfil: `auto|vitest|jest|pytest`):
+cada test permitido se corre solo y debe ejecutar > 0 tests y 0 fallidos:
+vitest -> `npx vitest run <archivo> --reporter=json --outputFile=<tmp>`;
+jest -> `npm test -- --runTestsByPath <archivo> --json`; `.py` -> pytest.
+`auto` elige vitest si esta en package.json o hay `vitest.config.*`.
 
 Flujo por issue en `modes/development.py`:
 
@@ -47,8 +69,10 @@ Flujo por issue en `modes/development.py`:
    detectado (Nightwing: Node -> `npm ci` si hace falta, `npm run build`,
    `npm run lint --if-present`, `CI=true npm test -- --passWithNoTests
    --watchAll=false`; Python -> `py_compile` de los cambiados + `pytest -q`
-   si hay `tests/`; Spring Boot -> `./mvnw -q test` si hay `mvnw`), mas la
-   validacion por archivo permitido de siempre.
+   si hay `tests/`; Spring Boot -> `./mvnw -q test` si hay `mvnw`; Batgirl:
+   `npm ci` si hace falta, `npm run build`, `npm run lint --if-present`,
+   `CI=true npx vitest run`), mas la validacion por archivo permitido de
+   siempre y el runner por archivo de cada test permitido.
 4. **Escalacion qwen -> Claude**: si los `development.aider_attempts`
    intentos fallan, se llama UNA vez a `claude -p --permission-mode
    acceptEdits` (prompt por stdin) en el mismo workspace con el issue, el
@@ -77,22 +101,26 @@ PyPI -> fija `<pkg>==<to>` en requirements.txt. Despues: verificacion del
 perfil, re-chequeo OSV (ninguna version del lock afectada por los advisories
 del issue), stage solo de package.json/package-lock.json (o
 requirements.txt), commit `fix(deps): <pkg> <from> -> <to> (radar)` +
-`Resuelto por: deterministic-patch`, push a `dev`. Si falla -> `needs-review`.
+`Resuelto por: deterministic-patch`, push a la rama de trabajo del repo
+(`dev`, o `development` en my_Portfolio_React_v2). Si falla -> `needs-review`.
 Log en `reports/deps-<repo>-<issue>.log`.
 
 `python3 night_agent.py --dry-run` muestra a que especialista iria cada
-issue abierto y que notas de conocimiento se usarian (o, para parches de
-dependencias, el plan determinista).
+issue abierto, en que rama y con que `test_runner`, y que notas de
+conocimiento se usarian (o, para parches de dependencias, el plan
+determinista); tambien lista cada especialista con sus repos@rama.
 
 ## Radar tecnologico (`batcave/radar.py`)
 
 `python3 -m batcave.radar --specialist <nombre> [--dry-run] [--weekly]`
 (con el venv). Sirve para cualquier perfil de `batcave/specialists/`; hoy
-solo Nightwing tiene timers. Config en `config.yaml` (`radar:`).
+tienen timers Nightwing (07:00 / lunes 01:00) y Batgirl (07:10 / lunes
+01:20). Config en `config.yaml` (`radar:`).
 
 - **Inventario**: por cada repo de `repos` del perfil, copia de SOLO
   LECTURA en `radar.workspace_dir/<repo>` (`~/projects/.radar-workspace`):
-  `clone` o `fetch` + `reset --hard origin/dev` (si no hay `dev`,
+  `clone` o `fetch` + `reset --hard origin/<rama de trabajo del repo>`
+  (`dev`, `development` en my_Portfolio_React_v2; si no existe,
   `main`/`master`). Se niega a correr si el workspace se cruza con un
   directorio de produccion (`repo_paths`, `red_hood.local_repos`). Auth de
   git con `github_auth_env()` (header por entorno). Nunca comitea ni pushea.
@@ -122,7 +150,8 @@ solo Nightwing tiene timers. Config en `config.yaml` (`radar:`).
     (`npm install pkg@x.y.z`, `--save-dev` si es dev) y seccion `Archivos:`
     (`package.json`, `package-lock.json` / manifiesto Python / `pom.xml`)
     y bloque ```` ```radar-patch ```` (JSON). Batman lo aplica esa noche de
-    forma determinista (modo Desarrollo, rama `dev`, sin Aider ni Claude).
+    forma determinista (modo Desarrollo, rama de trabajo del repo, que el
+    cuerpo del issue indica en "Como aplicarlo"; sin Aider ni Claude).
   - `security_watch` → sin issue; si habia uno abierto se cierra
     (`not_planned`) con un comentario explicando la politica. Se lista en
     el resumen semanal bajo "Sin parche disponible (vigilando)".
@@ -134,8 +163,8 @@ solo Nightwing tiene timers. Config en `config.yaml` (`radar:`).
 - **Telegram** ("📡 Radar de <Especialista>", HTML escapado): inmediato solo
   para advisories `radar.alert_severities` (CRITICAL/HIGH) en dependencias
   de produccion, una vez por advisory. Todo lo demas va al resumen semanal.
-- **Modo semanal** (`--weekly`, lunes 01:00 tras el reset del domingo
-  23:00): repite el chequeo y, para hasta `radar.max_weekly_summaries` (5)
+- **Modo semanal** (`--weekly`, lunes 01:00 Nightwing / 01:20 Batgirl, tras
+  el reset del domingo 23:00): repite el chequeo y, para hasta `radar.max_weekly_summaries` (5)
   paquetes `security_major`/`outdated_major` sin nota previa, baja las
   release notes de GitHub (repo resuelto desde la metadata de npm/PyPI;
   fallback `CHANGELOG.md`) y llama `claude -p` (solo `Read,Grep,Glob`;
@@ -153,8 +182,9 @@ solo Nightwing tiene timers. Config en `config.yaml` (`radar:`).
 - `--dry-run`: sincroniza el workspace e imprime inventario por repo y
   hallazgos clasificados; sin issues, Telegram, Claude ni estado. Con
   `--weekly` muestra que notas se pedirian y el tamano de sus release notes.
-- **Otro especialista**: copiar `radar-nightwing*.service/.timer` cambiando
-  `--specialist`, y agregar los timers al `CATALOG` de Lucius.
+- **Otro especialista**: copiar `radar-batgirl*.service/.timer` cambiando
+  `--specialist` y la hora (escalonada 10-20 min), y agregar los timers al
+  `CATALOG` de Lucius (medium).
 
 ## Comunicacion: `batcave/comms.json`
 
@@ -214,8 +244,9 @@ reparar ni alertar) mientras esten en mantenimiento:
 Catalogo de `ServiceCheck` (`kind` → chequeo/reparacion):
 
 - **systemd**: `telegram-bot`, `cloudflared`, `night-agent.timer`,
-  `webhook-portfolio`, `ollama`, `radar-nightwing.timer` y
-  `radar-nightwing-weekly.timer` (medium) → `systemctl is-active` / `systemctl restart`
+  `webhook-portfolio`, `ollama`, `radar-nightwing.timer`,
+  `radar-nightwing-weekly.timer`, `radar-batgirl.timer` y
+  `radar-batgirl-weekly.timer` (medium) → `systemctl is-active` / `systemctl restart`
   (para `*.timer`, `systemctl enable --now` en vez de solo `restart`, para
   que la reparacion sobreviva reinicios del servidor).
 - **docker**: `daniel-portfolio-app`, `portfolioservicelauncher-client-gateway-1`,
@@ -250,8 +281,11 @@ Audita los repos de `config.yaml` (`red_hood.local_repos`): `my_Portfolio_React_
 `telegram-bot` y el propio `night-agent`. Detecta el stack por archivos
 (`package.json` -> Node, `requirements.txt`/`*.py` -> Python).
 
-Por repo: `git fetch` + se posiciona en `dev` si existe (local u `origin/dev`);
-si no existe, audita `main` en modo solo-lectura (nunca comitea ahi). Compara
+Por repo: `git fetch` + se posiciona en la rama de trabajo del repo si existe
+(local u `origin/<rama>`; `repo_work_branch`: nombre de GitHub via
+`repo_paths` + `resolve_work_branch` de los perfiles: `dev`, o `development`
+en my_Portfolio_React_v2); si no existe, audita `main` en modo solo-lectura
+(nunca comitea ahi). Compara
 el HEAD contra el ultimo hash auditado en
 `batcave/memory/red_hood_state.json`; sin commits nuevos, se omite.
 
@@ -273,7 +307,10 @@ genera tests para hasta `red_hood.max_tests_per_repo` archivos con Aider
 (backend Ollama). Solo se tocan archivos de test (`*.spec.ts`, `*.test.ts`,
 `test_*.py`, validado con `modes.development.is_forbidden_path`); si Aider
 toca algo mas o el test generado falla, se descarta con `git checkout` y se
-registra en memoria. Si pasa, se comitea (y pushea) a `dev`.
+registra en memoria. El test generado se valida con el runner por archivo
+del modo Desarrollo (`run_test_file`: vitest/jest con reporte JSON; exige
+> 0 tests ejecutados y 0 fallidos). Si pasa, se comitea (y pushea) a la rama
+de trabajo del repo.
 
 Reporta hallazgos high/critical y tests fallidos como issues en GitHub
 (labels `red-hood` + `bug`, buscando duplicados antes; `night-agent` si
@@ -425,10 +462,11 @@ Los `.service`/`.timer` viven en este repo pero se instalan a mano en
 
 ```bash
 sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer red-hood.service red-hood.timer batwoman.service \
-  radar-nightwing.service radar-nightwing.timer radar-nightwing-weekly.service radar-nightwing-weekly.timer /etc/systemd/system/
+  radar-nightwing.service radar-nightwing.timer radar-nightwing-weekly.service radar-nightwing-weekly.timer \
+  radar-batgirl.service radar-batgirl.timer radar-batgirl-weekly.service radar-batgirl-weekly.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer batwoman.service \
-  radar-nightwing.timer radar-nightwing-weekly.timer
+  radar-nightwing.timer radar-nightwing-weekly.timer radar-batgirl.timer radar-batgirl-weekly.timer
 ```
 
 ## Convenciones
