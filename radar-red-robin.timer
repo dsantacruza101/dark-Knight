@@ -1,0 +1,9 @@
+[Unit]
+Description=Radar de Red Robin — chequeo diario a las 7:20 AM (10 min despues del de Batgirl)
+
+[Timer]
+OnCalendar=*-*-* 07:20:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target

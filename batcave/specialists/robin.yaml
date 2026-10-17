@@ -1,0 +1,47 @@
+# Robin (Damian Wayne) — especialista mobile del modo Desarrollo.
+# Esquema documentado en batcave/specialists/README.md.
+
+name: robin
+display_name: Robin
+emoji: "🐤"
+role: mobile
+label: mobile
+
+languages: [Dart, Kotlin (futuro), Swift (futuro)]
+frameworks: [Flutter]
+backend: [Firebase]
+testing: [flutter_test, integration_test, mocktail]
+
+# Sin repos asignados todavia: el enrutamiento por label `mobile` funciona y el
+# radar termina sin hacer nada. Ver reports/robin-setup.md.
+repos: []
+
+# Runner por archivo de test: los `*_test.dart` corren con
+# `flutter test --machine <archivo>` (auto tambien lo elige si hay pubspec.yaml).
+test_runner: flutter
+
+conventions:
+  - "Conventional commits (feat/fix/chore/ci/test/refactor)."
+  - "Sound null safety: nada de `!` sin justificar ni `dynamic` innecesario; Dart 3 (records, patterns, sealed)."
+  - "Constructores `const` siempre que se pueda (widgets y modelos inmutables)."
+  - "Un solo enfoque de manejo de estado por app (Riverpod o Bloc): no mezclarlos."
+  - "Sin URLs de API ni llaves hardcodeadas: `--dart-define`/`--dart-define-from-file` o configuracion por flavor."
+  - "Accesibilidad: `Semantics` (label/button/excludeSemantics) en widgets interactivos e imagenes con significado."
+  - "Nunca tocar .env, google-services.json, GoogleService-Info.plist, firebase_options.dart ni keystores."
+
+# Verificacion por stack. Se corren todos los stacks cuyo `detect` coincida
+# con algun archivo en la raiz del repo, en el orden listado.
+verification:
+  flutter:
+    detect: [pubspec.yaml]
+    steps:
+      - cmd: flutter pub get
+        timeout: 600
+      # `--output=none`: solo verifica, no reescribe archivos del workspace.
+      - cmd: dart format --output=none --set-exit-if-changed .
+      - cmd: flutter analyze
+        timeout: 900
+      - cmd: flutter test
+        when: exists:test
+        timeout: 1200
+        counts_tests: flutter

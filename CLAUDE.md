@@ -13,7 +13,7 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 | **Lucius Fox** | `lucius_fox.py` (`lucius-fox.service` + `lucius-fox.timer`, cada 30 min) | Guardian de infraestructura. Vigila servicios/containers/binarios criticos, usa TypeSafe (Jev) para decidir si auto-repararlos, y escala lo que no puede resolver. |
 | **Red Hood** | `red_hood.py` (`red-hood.service` + `red-hood.timer`, diario a las 02:00 America/El_Salvador) | QA brutal, sin piedad. Audita tests, cobertura, lint, vulnerabilidades y secretos hardcodeados en los repos locales, genera tests faltantes con Aider y reporta todo sin filtro. |
 | **Batwoman** (Kate Kane) | `batwoman.py` (`batwoman.service`, `Type=simple`, poll cada `batwoman.poll_interval` s) | Analista de seguridad. Lee las alertas de Wazuh, hace triage (allowlist, rutas criticas, nivel), las evalua con TypeSafe (Jev) y avisa a Alfred/Batman de las amenazas reales; digest diario a las 08:00. |
-| **Radar** | `batcave/radar.py` (`radar-nightwing.timer` diario 07:00 y `radar-nightwing-weekly.timer` lunes 01:00; `radar-batgirl.timer` diario 07:10 y `radar-batgirl-weekly.timer` lunes 01:20) | Radar tecnologico por especialista: inventario de dependencias, vulnerabilidades (OSV) y ultimas versiones; abre issues de parches para que el especialista los aplique de noche. |
+| **Radar** | `batcave/radar.py` (`radar-nightwing.timer` diario 07:00 y `radar-nightwing-weekly.timer` lunes 01:00; `radar-batgirl.timer` diario 07:10 y `radar-batgirl-weekly.timer` lunes 01:20; `radar-red-robin.timer` diario 07:20 y `radar-red-robin-weekly.timer` lunes 01:40; `radar-robin.timer` diario 07:30 y `radar-robin-weekly.timer` lunes 02:00; `radar-spoiler.timer` diario 07:40 y `radar-spoiler-weekly.timer` lunes 02:20) | Radar tecnologico por especialista: inventario de dependencias, vulnerabilidades (OSV) y ultimas versiones; abre issues de parches para que el especialista los aplique de noche. Spoiler: GitHub Actions + imagenes base de Docker. |
 
 ## Modos de Batman (`modes/`)
 
@@ -24,8 +24,8 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 ## Equipo de desarrollo: especialistas (`batcave/specialists/`)
 
 Cada especialista del modo Desarrollo es un perfil YAML en
-`batcave/specialists/` (esquema en `batcave/specialists/README.md`; agregar a
-Red Robin, Robin o Spoiler = agregar su YAML, sin tocar codigo).
+`batcave/specialists/` (esquema en `batcave/specialists/README.md`; agregar un
+miembro = agregar su YAML, sin tocar codigo).
 Hoy existen:
 
 - **Nightwing** (`nightwing.yaml`, default): backend (`label: backend`),
@@ -40,6 +40,50 @@ Hoy existen:
   cuya rama de integracion es `development` (no `dev`). Notas semilla en
   `batcave/knowledge/batgirl/` (React 19 + Vitest, Tailwind v4, Angular
   standalone + signals + PrimeNG).
+- **Red Robin** (Tim Drake, `red_robin.yaml`): datos e IA (`label: data`),
+  Python/SQL; PostgreSQL (+pgvector), MongoDB, Firebase; Prisma/TypeORM/
+  Alembic; RAG, embeddings, Ollama; `test_runner: auto`. Convenciones:
+  migraciones reversibles, ningun cambio de datos sin migracion, solo
+  queries parametrizadas, sin secretos en codigo, revisar indices de cada
+  query nueva. Verificacion: Python -> `py_compile` de los cambiados +
+  `pytest -q` si hay `tests/`; Node -> `npm ci` si hace falta, `npm run
+  build`, `npm test`. **Sin repos asignados** (`repos: []`): el label `data`
+  enruta igual y el radar termina sin hacer nada. Notas semilla en
+  `batcave/knowledge/red_robin/` (indices + EXPLAIN, migraciones seguras,
+  RAG con pgvector + Ollama).
+- **Robin** (Damian Wayne, `robin.yaml`): mobile (`label: mobile`), Dart
+  (Kotlin/Swift a futuro); Flutter; backend Firebase; tests flutter_test,
+  integration_test, mocktail; `test_runner: flutter`. Convenciones: sound
+  null safety, constructores `const`, un solo manejo de estado por app
+  (Riverpod o Bloc), sin URLs de API ni llaves hardcodeadas, `Semantics`
+  para accesibilidad. Verificacion (stack `flutter`, detect `pubspec.yaml`):
+  `flutter pub get`, `dart format --output=none --set-exit-if-changed .`,
+  `flutter analyze`, `flutter test` si hay `test/` (`counts_tests:
+  flutter`). **Sin repos asignados** (`repos: []`). Requiere el SDK de
+  Flutter en el PATH de los servicios (hoy NO esta instalado). Notas
+  semilla en `batcave/knowledge/robin/` (Dart 3 records/patterns/sealed,
+  Riverpod vs Bloc, reglas de seguridad de Firebase).
+- **Spoiler** (Stephanie Brown, `spoiler.yaml`): DevOps (`label: devops`),
+  Bash/YAML/Python/HCL; herramientas Docker, Docker Compose, GitHub
+  Actions, Nginx, Cloudflare Tunnel, systemd (a futuro Terraform,
+  Kubernetes, Helm). Convenciones: `uses:` fijado a version completa o SHA,
+  `permissions` minimos, nunca imprimir secretos, healthcheck + restart en
+  compose, contenedores sin root, imagenes base pequenas. Repos:
+  `portfolioServiceLauncher` (rama `dev`; produccion sigue en `main`, Spoiler
+  solo trabaja en el workspace aislado) y, con `paths:
+  [".github/workflows/**"]`, los repos de los demas especialistas
+  (client-gateway, NodeMailer, telegram-bot, dark-Knight,
+  my_Portfolio_React_v2 con la rama de su dueño). Verificacion (stack
+  `devops`, `detect: ["*"]`, cada paso solo si la herramienta esta
+  instalada; si no, se omite con aviso y el resultado lista las que faltan):
+  builtin `compose_config` (`docker compose [--env-file .env.template] -f
+  <archivo> config -q`), `shellcheck`/`actionlint`/`hadolint` sobre los
+  archivos permitidos tocados, `terraform fmt -check` + `init
+  -backend=false` + `validate` si hay `*.tf` en la raiz. Hoy solo `docker`
+  esta instalado. El candado duro sigue: no puede editar `docker-compose*`,
+  `.env`, nginx, cloudflared... (lo propone en el issue). Notas semilla en
+  `batcave/knowledge/spoiler/` (endurecimiento de Actions, checklist de
+  Compose en produccion, Cloudflare Tunnel + Nginx con IP real).
 
 **Rama de trabajo por repo**: una entrada de `repos` del perfil puede ser
 `{name, work_branch}`; `resolve_work_branch` (en `modes/development.py`)
@@ -47,11 +91,26 @@ devuelve la del repo (buscando en todos los perfiles) o `github.work_branch`
 (`dev`). La usan el modo Desarrollo, el Post-Reset, el radar y Red Hood.
 `main`/`master` como `work_branch` invalida el perfil.
 
-**Runner por archivo de test** (`test_runner` del perfil: `auto|vitest|jest|pytest`):
+**Alcance por repo** (`paths` opcional en la entrada `{name, work_branch,
+paths}`, lista de globs fnmatch; con `/` contra la ruta completa, sin `/`
+contra el nombre): `repo_scope_paths` devuelve el alcance del especialista
+en ese repo (de ESE perfil; no se hereda). Modo Desarrollo: los archivos del
+issue fuera del alcance salen de la lista permitida y el candado de siempre
+los revierte; si no queda ninguno -> `needs-review`. Tambien filtra la
+verificacion (`files`, `compose_config`) y el inventario del radar.
+
+**Pasos de verificacion** (ademas de `cmd`/`when`/`timeout`/`counts_tests`):
+`requires` (herramienta en el PATH; si falta se omite con aviso),
+`files` (globs; `{files}` / `{file}` en el comando), `changed_only` (solo
+archivos permitidos tocados), `when: glob:<patron>` y `when` en lista.
+
+**Runner por archivo de test** (`test_runner` del perfil: `auto|vitest|jest|pytest|flutter`):
 cada test permitido se corre solo y debe ejecutar > 0 tests y 0 fallidos:
 vitest -> `npx vitest run <archivo> --reporter=json --outputFile=<tmp>`;
-jest -> `npm test -- --runTestsByPath <archivo> --json`; `.py` -> pytest.
-`auto` elige vitest si esta en package.json o hay `vitest.config.*`.
+jest -> `npm test -- --runTestsByPath <archivo> --json`; `.py` -> pytest;
+`*_test.dart` -> `flutter test --machine <archivo>` (cuenta eventos
+`testDone` no ocultos ni omitidos; fallback: linea `+N ~S -F:` del
+resumen). `auto` elige vitest si esta en package.json o hay `vitest.config.*`.
 
 Flujo por issue en `modes/development.py`:
 
@@ -130,14 +189,23 @@ API de GitHub y muestra el plan de familia.
 `python3 night_agent.py --dry-run` muestra a que especialista iria cada
 issue abierto, en que rama y con que `test_runner`, y que notas de
 conocimiento se usarian (o, para parches de dependencias, el plan
-determinista); tambien lista cada especialista con sus repos@rama.
+determinista); tambien lista cada especialista con sus repos@rama (y
+`[paths]` si tiene alcance) y las herramientas de verificacion que faltan.
 
 ## Radar tecnologico (`batcave/radar.py`)
 
 `python3 -m batcave.radar --specialist <nombre> [--dry-run] [--weekly]`
 (con el venv). Sirve para cualquier perfil de `batcave/specialists/`; hoy
-tienen timers Nightwing (07:00 / lunes 01:00) y Batgirl (07:10 / lunes
-01:20). Config en `config.yaml` (`radar:`).
+tienen timers Nightwing (07:00 / lunes 01:00), Batgirl (07:10 / lunes
+01:20), Red Robin (07:20 / lunes 01:40), Robin (07:30 / lunes 02:00) y
+Spoiler (07:40 / lunes 02:20).
+Config en `config.yaml` (`radar:`). Ecosistemas por perfil:
+`radar_ecosystems` (default npm, PyPI, Maven, Pub; Spoiler: `GitHub
+Actions` y `Docker`, que ningun otro radar inventaria, asi no hay issues
+duplicados). Con `paths` en la entrada del repo solo cuentan los
+manifiestos dentro del alcance.
+Un perfil sin repos (Red Robin y Robin hoy) termina de inmediato con codigo 0: sin
+workspace, OSV, issues, Telegram, Claude, estado ni reporte.
 
 - **Inventario**: por cada repo de `repos` del perfil, copia de SOLO
   LECTURA en `radar.workspace_dir/<repo>` (`~/projects/.radar-workspace`):
@@ -150,16 +218,40 @@ tienen timers Nightwing (07:00 / lunes 01:00) y Batgirl (07:10 / lunes
   hay lock, la base del rango), `requirements.in` si existe (paquetes
   realmente importados; la version sale del pin de `requirements.txt` /
   `requirements*.lock`) o si no `requirements.txt`, `requirements-dev.txt`
-  (dev), `pyproject.toml` (PEP 621 + Poetry) y `pom.xml` (con
-  `${propiedades}`). Transitivas: el resto de `package-lock.json` (anidadas
-  incluidas), de `requirements.txt` (pip freeze) y de `requirements*.lock`.
-  `devDependencies`, extras opcionales y scope `test` cuentan como dev. Sin
+  (dev), `pyproject.toml` (PEP 621 + Poetry), `pom.xml` (con
+  `${propiedades}`) y `pubspec.yaml` (`dependencies` / `dev_dependencies`,
+  version de `pubspec.lock`; se omiten `sdk:`, `path:` y `git:`).
+  Transitivas: el resto de `package-lock.json` (anidadas incluidas), de
+  `requirements.txt` (pip freeze), de `requirements*.lock` y los paquetes
+  `hosted` de `pubspec.lock` (como produccion). `devDependencies`,
+  `dev_dependencies`, extras opcionales y scope `test` cuentan como dev. Sin
   version fija no se consulta. Vulnerabilidades se revisan en TODAS;
   `outdated_*` solo en directas. Cada hallazgo indica `directa`/`transitiva`.
+- **GitHub Actions** (Spoiler): `uses: owner/repo[/ruta]@ref` de
+  `.github/workflows/*.y*ml` y `.github/actions/*/action.y*ml` (se omiten
+  `./...` y `docker://`; mismo ref en varios archivos = un hallazgo con
+  todos los archivos). `@v4.2.2` exacta; `@v4`/`@v4.2` flotante, resuelta
+  a la ultima release de ese major/minor; SHA de 40 con la version del
+  comentario (`# v4.2.2`); rama o SHA sin comentario = "sin version fija"
+  (listado aparte en el reporte, sin OSV). Todas cuentan como produccion.
+  Ultima version: releases (o tags) via API de GitHub. OSV (`GitHub
+  Actions`) no ordena versiones de este ecosistema: se piden todos los
+  advisories del paquete y los rangos se evaluan localmente
+  (`osv_affects`). Sin parche determinista: `security_patch` lleva
+  `needs-human` (como Pub) con el cambio de `uses:` sugerido (SHA del tag).
+- **Docker** (Spoiler, solo reporte): `FROM` de Dockerfiles (ARG por
+  defecto resueltos; se omiten `scratch` y etapas propias) e `image:` de
+  servicios de compose sin `build:` (`${VAR:-default}` resuelto). Solo
+  imagenes oficiales de Docker Hub (`node`, `library/x`) se comparan:
+  tags de la misma familia (variante + precision: `21-alpine3.19` ->
+  `26-alpine3.24`, `alpine3.21` -> `alpine3.22`) en los 300 tags mas
+  recientes. Sin OSV, sin issues, sin notas de Claude, nunca se parchan.
+  Tags mutables (`latest`, `stable-alpine`) van a "sin version fija".
 - **Chequeo diario (sin tokens de Claude)**: OSV `querybatch` + `/vulns/{id}`
-  (npm, PyPI, Maven; los alias PYSEC/GHSA se deduplican; severidad de
+  (npm, PyPI, Maven, Pub; los alias PYSEC/GHSA se deduplican; severidad de
   `database_specific.severity` o calculada del vector CVSS v3), y ultima
-  version en npm registry / PyPI JSON / Maven Central. Clasificacion:
+  version en npm registry / PyPI JSON / Maven Central /
+  `https://pub.dev/api/packages/<nombre>` (`latest`). Clasificacion:
   `security_patch` (todos los fixes en el mismo major; en 0.x el minor
   cuenta como major), `security_watch` (ningun advisory tiene fix y la
   dependencia es solo de desarrollo, directa o transitiva),
@@ -174,6 +266,11 @@ tienen timers Nightwing (07:00 / lunes 01:00) y Batgirl (07:10 / lunes
     y bloque ```` ```radar-patch ```` (JSON). Batman lo aplica esa noche de
     forma determinista (modo Desarrollo, rama de trabajo del repo, que el
     cuerpo del issue indica en "Como aplicarlo"; sin Aider ni Claude).
+    Excepcion: Pub no tiene parche determinista (`MANUAL_PATCH_ECOSYSTEMS`):
+    su `security_patch` lleva `needs-human` en vez de `night-agent`, con
+    el comando sugerido (`flutter pub add [dev:]pkg:^x.y.z`, o `flutter pub
+    upgrade pkg` / `dependency_overrides` si es transitiva) y `Archivos:`
+    `pubspec.yaml`, `pubspec.lock`, sin bloque `radar-patch`.
   - `security_watch` → sin issue; si habia uno abierto se cierra
     (`not_planned`) con un comentario explicando la politica. Se lista en
     el resumen semanal bajo "Sin parche disponible (vigilando)".
@@ -185,10 +282,10 @@ tienen timers Nightwing (07:00 / lunes 01:00) y Batgirl (07:10 / lunes
 - **Telegram** ("📡 Radar de <Especialista>", HTML escapado): inmediato solo
   para advisories `radar.alert_severities` (CRITICAL/HIGH) en dependencias
   de produccion, una vez por advisory. Todo lo demas va al resumen semanal.
-- **Modo semanal** (`--weekly`, lunes 01:00 Nightwing / 01:20 Batgirl, tras
+- **Modo semanal** (`--weekly`, lunes 01:00 Nightwing / 01:20 Batgirl / 01:40 Red Robin / 02:00 Robin / 02:20 Spoiler, tras
   el reset del domingo 23:00): repite el chequeo y, para hasta `radar.max_weekly_summaries` (5)
   paquetes `security_major`/`outdated_major` sin nota previa, baja las
-  release notes de GitHub (repo resuelto desde la metadata de npm/PyPI;
+  release notes de GitHub (repo resuelto desde la metadata de npm/PyPI/pub.dev;
   fallback `CHANGELOG.md`) y llama `claude -p` (solo `Read,Grep,Glob`;
   `Bash/Edit/Write` prohibidos; timeout `radar.claude_timeout`) con los
   usos del paquete en nuestro codigo. Guarda la nota en
@@ -204,7 +301,7 @@ tienen timers Nightwing (07:00 / lunes 01:00) y Batgirl (07:10 / lunes
 - `--dry-run`: sincroniza el workspace e imprime inventario por repo y
   hallazgos clasificados; sin issues, Telegram, Claude ni estado. Con
   `--weekly` muestra que notas se pedirian y el tamano de sus release notes.
-- **Otro especialista**: copiar `radar-batgirl*.service/.timer` cambiando
+- **Otro especialista**: copiar `radar-spoiler*.service/.timer` cambiando
   `--specialist` y la hora (escalonada 10-20 min), y agregar los timers al
   `CATALOG` de Lucius (medium).
 
@@ -267,8 +364,11 @@ Catalogo de `ServiceCheck` (`kind` → chequeo/reparacion):
 
 - **systemd**: `telegram-bot`, `cloudflared`, `night-agent.timer`,
   `webhook-portfolio`, `ollama`, `radar-nightwing.timer`,
-  `radar-nightwing-weekly.timer`, `radar-batgirl.timer` y
-  `radar-batgirl-weekly.timer` (medium) → `systemctl is-active` / `systemctl restart`
+  `radar-nightwing-weekly.timer`, `radar-batgirl.timer`,
+  `radar-batgirl-weekly.timer`, `radar-red-robin.timer`,
+  `radar-red-robin-weekly.timer`, `radar-robin.timer`,
+  `radar-robin-weekly.timer`, `radar-spoiler.timer` y
+  `radar-spoiler-weekly.timer` (medium) → `systemctl is-active` / `systemctl restart`
   (para `*.timer`, `systemctl enable --now` en vez de solo `restart`, para
   que la reparacion sobreviva reinicios del servidor).
 - **docker**: `daniel-portfolio-app`, `portfolioservicelauncher-client-gateway-1`,
@@ -485,10 +585,15 @@ Los `.service`/`.timer` viven en este repo pero se instalan a mano en
 ```bash
 sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.timer red-hood.service red-hood.timer batwoman.service \
   radar-nightwing.service radar-nightwing.timer radar-nightwing-weekly.service radar-nightwing-weekly.timer \
-  radar-batgirl.service radar-batgirl.timer radar-batgirl-weekly.service radar-batgirl-weekly.timer /etc/systemd/system/
+  radar-batgirl.service radar-batgirl.timer radar-batgirl-weekly.service radar-batgirl-weekly.timer \
+  radar-red-robin.service radar-red-robin.timer radar-red-robin-weekly.service radar-red-robin-weekly.timer \
+  radar-robin.service radar-robin.timer radar-robin-weekly.service radar-robin-weekly.timer \
+  radar-spoiler.service radar-spoiler.timer radar-spoiler-weekly.service radar-spoiler-weekly.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer batwoman.service \
-  radar-nightwing.timer radar-nightwing-weekly.timer radar-batgirl.timer radar-batgirl-weekly.timer
+  radar-nightwing.timer radar-nightwing-weekly.timer radar-batgirl.timer radar-batgirl-weekly.timer \
+  radar-red-robin.timer radar-red-robin-weekly.timer radar-robin.timer radar-robin-weekly.timer \
+  radar-spoiler.timer radar-spoiler-weekly.timer
 ```
 
 ## Convenciones

@@ -1,0 +1,81 @@
+# Spoiler (Stephanie Brown) — especialista DevOps del modo Desarrollo.
+# Esquema documentado en batcave/specialists/README.md.
+
+name: spoiler
+display_name: Spoiler
+emoji: "💜"
+role: devops
+label: devops
+
+languages: [Bash, YAML, Python, HCL]
+tools: [Docker, Docker Compose, GitHub Actions, Nginx, Cloudflare Tunnel, systemd]
+future: [Terraform, Kubernetes, Helm]
+
+# Nombres de repo en GitHub (sin el owner). `work_branch` es la rama de
+# integracion del repo (default `github.work_branch`, `dev`); `paths` limita
+# lo que Spoiler puede tocar en ese repo (globs, ver README.md). Los repos de
+# otros especialistas solo por sus workflows: su rama sale del perfil dueño
+# (my_Portfolio_React_v2 -> development, en batgirl.yaml).
+repos:
+  # Launcher de produccion (docker compose + NATS + submodulos). Produccion
+  # sigue en main; Spoiler solo trabaja en el workspace aislado, rama dev.
+  - name: portfolioServiceLauncher
+    work_branch: dev
+  - name: dsantacruz-client-gateway
+    paths: [".github/workflows/**"]
+  - name: NodeMailer_MicroService
+    paths: [".github/workflows/**"]
+  - name: telegram-bot
+    paths: [".github/workflows/**"]
+  - name: dark-Knight
+    paths: [".github/workflows/**"]
+  - name: my_Portfolio_React_v2
+    paths: [".github/workflows/**"]
+
+# El radar de Spoiler solo mira infraestructura: las dependencias npm/PyPI de
+# esos repos son de Nightwing/Batgirl (evita issues duplicados).
+radar_ecosystems: [GitHub Actions, Docker]
+
+conventions:
+  - "Conventional commits (feat/fix/chore/ci/test/refactor)."
+  - "GitHub Actions: fija cada `uses:` a una version completa (`@v4.2.2`) o a un SHA de 40 caracteres con comentario `# v4.2.2`; nunca `@main`/`@master` ni solo el major."
+  - "Workflows con permisos minimos: `permissions: contents: read` a nivel de workflow y ampliar solo en el job que lo necesite."
+  - "Nunca imprimir secretos: nada de `echo ${{ secrets.X }}`, `set -x` con secretos ni `env`/`printenv` en logs; usa `::add-mask::` si un valor derivado es sensible."
+  - "Compose: cada servicio con `healthcheck` real (no `node --version`) y `restart: unless-stopped`/`always`; `depends_on` con `condition: service_healthy`."
+  - "Contenedores sin root: `USER` no-root en el Dockerfile (p. ej. `USER node`); nada de `privileged` ni montar el socket de Docker."
+  - "Imagenes base pequenas y con tag fijo (`-alpine`/`-slim`/distroless, nunca `latest`), multi-stage y `.dockerignore`."
+  - "Bash: `set -euo pipefail`, variables entre comillas, sin `curl | bash`; que pase shellcheck."
+  - "Nunca tocar .env, docker-compose*, nginx, fail2ban, cloudflared ni ssh: candado duro, se revierte; propon el cambio en el issue para un humano."
+
+# Verificacion por stack. `detect: ["*"]` = siempre (el repo tenga lo que
+# tenga); cada paso se condiciona por `requires` (herramienta instalada, si no
+# se omite con aviso), `files` (globs) y `changed_only` (solo los archivos
+# permitidos que se tocaron). `{files}` se reemplaza por los archivos.
+verification:
+  devops:
+    detect: ["*"]
+    steps:
+      # docker compose [--env-file .env.template] -f <archivo> config -q, por compose.
+      - builtin: compose_config
+      - cmd: shellcheck {files}
+        requires: shellcheck
+        files: ["*.sh"]
+        changed_only: true
+      - cmd: actionlint {files}
+        requires: actionlint
+        files: [".github/workflows/*.yml", ".github/workflows/*.yaml"]
+        changed_only: true
+      - cmd: hadolint {files}
+        requires: hadolint
+        files: ["Dockerfile", "Dockerfile.*", "*.Dockerfile", "dockerfile", "dockerfile.*", "*.dockerfile"]
+        changed_only: true
+      # Terraform: solo el modulo de la raiz (si tiene *.tf).
+      - cmd: terraform fmt -check -recursive
+        requires: terraform
+        when: glob:*.tf
+      - cmd: terraform init -backend=false -input=false -no-color
+        requires: terraform
+        when: glob:*.tf
+      - cmd: terraform validate -no-color
+        requires: terraform
+        when: glob:*.tf

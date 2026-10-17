@@ -83,9 +83,14 @@ Flujo por issue:
      si el issue tiene una seccion `Archivos:` (una ruta por linea), se usa
      esa lista tal cual; si no, se cae a la extraccion por mencion de
      nombre de archivo (`*.py`, `*.ts`, `*.service`, `*.timer`, `*.md`,
-     `*.yaml`), excluyendo los que aparecen en lineas de verificacion de
-     servicios (`systemctl`, `is-active`, `docker`). Esa lista se pasa a
-     Aider como argumentos posicionales.
+     `*.yaml`, `*.yml`, `*.sh`, `*.tf`), excluyendo los que aparecen en
+     lineas de verificacion de servicios (`systemctl`, `is-active`,
+     `docker`) y las rutas prohibidas. Si la entrada del repo en `repos` del
+     perfil tiene `paths` (globs, p. ej. Spoiler: `.github/workflows/**` en
+     los repos de otros especialistas), los archivos fuera de ese alcance
+     salen de la lista (el candado los revierte); si no queda ninguno, el
+     issue va a needs-review. Esa lista se pasa a Aider como argumentos
+     posicionales.
   4. Se arma un mensaje minimo (preambulo del especialista + notas de
      `batcave/knowledge/<especialista>/`, nunca ejemplos de knowledge/) y se pasa a
      Aider (`--message`, stdin en `/dev/null`), que edita los archivos
@@ -111,15 +116,19 @@ Flujo por issue:
      minima segun su tipo (`validate_allowed_file_content`): `.py` debe
      tener al menos un `def`/`class`; `.service`
      debe tener `[Unit]`/`[Service]` y `ExecStart=`; `.timer` debe tener
-     `[Timer]` y `OnCalendar=`/`OnUnitActiveSec=`; `.spec.ts`/`.test.ts`
-     debe tener `describe(`/`it(`/`test(`. Ademas se corren los pasos de
+     `[Timer]` y `OnCalendar=`/`OnUnitActiveSec=`; `.spec.ts`/`.test.ts`/
+     `_test.dart` debe tener `describe(`/`it(`/`test(`/`testWidgets(`/`group(`. Ademas se corren los pasos de
      `verification` del perfil del especialista para cada stack detectado
      (p. ej. Node: npm ci si hace falta, build, lint, test; Python:
-     py_compile + pytest). Cada archivo de test permitido (`*.spec.ts`,
-     `*.test.ts`, `test_*.py`) se corre aparte con su runner apuntando solo a
+     py_compile + pytest; Spoiler: `docker compose config -q`, shellcheck,
+     actionlint, hadolint, terraform; un paso con `requires` cuya
+     herramienta no esta instalada se omite con un aviso, y el resultado
+     del issue lista las que faltan). Cada archivo de test permitido (`*.spec.ts`,
+     `*.test.ts`, `test_*.py`, `*_test.dart`) se corre aparte con su runner apuntando solo a
      ese archivo (`run_test_file`, runner segun `test_runner` del perfil o
      detectado: `npx vitest run <archivo> --reporter=json`, jest
-     `--runTestsByPath` con `--json`, o `pytest <archivo>`): debe ejecutar
+     `--runTestsByPath` con `--json`, `pytest <archivo>` o, para
+     `*_test.dart`, `flutter test --machine <archivo>`): debe ejecutar
      mas de 0 tests y 0 fallidos.
      Si falla, el intento cuenta
      como fallido: la salida COMPLETA del comando que fallo queda en
@@ -205,7 +214,7 @@ MAX_KNOWLEDGE_NOTE_LINES = 60
 DEFAULT_STEP_TIMEOUT = 600
 DEFAULT_WORK_BRANCH = "dev"
 PROTECTED_BRANCHES = ("main", "master")
-TEST_RUNNERS = ("auto", "vitest", "jest", "pytest")
+TEST_RUNNERS = ("auto", "vitest", "jest", "pytest", "flutter")
 VITEST_CONFIG_GLOBS = ("vitest.config.*", "vitest.workspace.*")
 
 DEFAULT_MAX_CLAUDE_ESCALATIONS = 2
@@ -267,10 +276,10 @@ PROGRESS_INTERVAL = timedelta(minutes=30)
 FORBIDDEN_NAME_SUBSTRINGS = (".env", "docker-compose")
 FORBIDDEN_PATH_SEGMENTS = ("nginx", "fail2ban", "cloudflared", ".cloudflared", ".ssh", "ufw")
 
-FILE_MENTION_RE = re.compile(r"(?<![\w/])[\w./\-]+\.(?:py|ts|tsx|jsx|css|scss|html|service|timer|md|yaml)(?![\w])")
+FILE_MENTION_RE = re.compile(r"(?<![\w/])[\w./\-]+\.(?:py|ts|tsx|jsx|css|scss|html|service|timer|md|yaml|yml|sh|tf|dart)(?![\w])")
 FILES_SECTION_HEADER_RE = re.compile(r"^\s*archivos\s*:\s*$", re.IGNORECASE)
 SERVICE_CHECK_LINE_RE = re.compile(r"systemctl|is-active|docker", re.IGNORECASE)
-TEST_FILE_NAME_RE = re.compile(r"^test_.+\.py$|.+\.(?:spec|test)\.[jt]sx?$")
+TEST_FILE_NAME_RE = re.compile(r"^test_.+\.py$|.+\.(?:spec|test)\.[jt]sx?$|.+_test\.dart$")
 NODE_TEST_COUNT_RE = re.compile(r"Tests:\s*(?:(\d+) failed,\s*)?(?:(\d+) skipped,\s*)?(\d+) passed")
 PYTEST_PASSED_RE = re.compile(r"(\d+)\s+passed")
 PYTEST_FAILED_RE = re.compile(r"(\d+)\s+failed")
@@ -281,6 +290,8 @@ JEST_TESTS_LINE_RE =re.compile(r"^Tests:\s+(.+)$", re.MULTILINE)
 VITEST_TESTS_LINE_RE = re.compile(r"^\s*Tests\s+(\d+ (?:failed|passed|skipped|todo).*)$", re.MULTILINE)
 # vitest/picocolors colorean la salida si `CI` esta en el entorno, aun sin TTY.
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Resumen de `flutter test` (reporter de package:test): "00:03 +12 ~1 -2: Some tests failed."
+FLUTTER_SUMMARY_RE = re.compile(r"\d+:\d+\s+\+(\d+)(?:\s+~(\d+))?(?:\s+-(\d+))?:")
 AIDER_ARTIFACT_PREFIX = ".aider"
 ARTIFACT_SCAN_SKIP_DIRS = {".git", "node_modules"}
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -293,7 +304,7 @@ UNIT_SECTION_RE = re.compile(r"^\s*\[(?:Unit|Service)\]\s*$", re.MULTILINE)
 EXEC_START_RE = re.compile(r"^\s*ExecStart\s*=", re.MULTILINE)
 TIMER_SECTION_RE = re.compile(r"^\s*\[Timer\]\s*$", re.MULTILINE)
 TIMER_SCHEDULE_RE = re.compile(r"^\s*(?:OnCalendar|OnUnitActiveSec)\s*=", re.MULTILINE)
-TEST_BODY_RE = re.compile(r"\b(?:describe|it|test)\s*\(")
+TEST_BODY_RE = re.compile(r"\b(?:describe|it|test|testWidgets|group)\s*\(")
 
 COMMENT_PREFIXES_BY_SUFFIX = {
     ".py": ("#",),
@@ -305,11 +316,20 @@ COMMENT_PREFIXES_BY_SUFFIX = {
     ".tsx": ("//", "/*", "*"),
     ".js": ("//", "/*", "*"),
     ".jsx": ("//", "/*", "*"),
+    ".dart": ("//", "/*", "*"),
     ".css": ("/*", "*"),
     ".scss": ("//", "/*", "*"),
     ".html": ("<!--",),
     ".md": (),
+    ".sh": ("#",),
+    ".tf": ("#", "//", "/*", "*"),
 }
+# Pasos de verificacion con `files:` (globs, ver `matches_globs`): archivos que
+# nunca se consideran al expandir `{files}`/`{file}`.
+VERIFY_SKIP_DIRS = {".git", "node_modules", ".terraform", "venv", ".venv", "dist", "build", "coverage"}
+COMPOSE_FILE_GLOBS = ("docker-compose*.yml", "docker-compose*.yaml", "compose.yml", "compose.yaml", "compose.*.yml", "compose.*.yaml")
+# Plantillas versionadas para interpolar `${VAR}` al validar un compose (nunca el .env real).
+COMPOSE_ENV_TEMPLATES = (".env.template", ".env.example", ".env.sample")
 
 log = logging.getLogger("night_agent.development")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -403,8 +423,9 @@ def load_specialists(config: dict) -> dict[str, dict]:
 
 
 def validate_profile_repos(file_name: str, profile: dict) -> bool:
-    """Cada entrada de `repos` es un nombre (str) o `{name, work_branch}`.
-    Un `work_branch` main/master invalida el perfil (regla dura)."""
+    """Cada entrada de `repos` es un nombre (str) o `{name, work_branch, paths}`.
+    Un `work_branch` main/master invalida el perfil (regla dura); `paths`, si
+    esta, debe ser una lista no vacia de globs (strings)."""
     for entry in profile.get("repos") or []:
         if isinstance(entry, str):
             continue
@@ -418,7 +439,42 @@ def validate_profile_repos(file_name: str, profile: dict) -> bool:
                 file_name, branch, entry["name"],
             )
             return False
+        paths = entry.get("paths")
+        if paths is not None and (
+            not isinstance(paths, list) or not paths or not all(isinstance(p, str) and p.strip() for p in paths)
+        ):
+            log.error(
+                "Perfil %s: paths de %s debe ser una lista no vacia de globs (%r), se omite el perfil",
+                file_name, entry["name"], paths,
+            )
+            return False
     return True
+
+
+def repo_scope_paths(profile: dict, repo: str) -> Optional[list[str]]:
+    """Globs `paths` de la entrada de `repo` (`owner/repo` o nombre corto) en
+    ESTE perfil, o None si el especialista puede tocar todo el repo. El
+    alcance es del especialista (Spoiler solo `.github/workflows/**` en los
+    repos de otros), no del repo: otro perfil que trabaje el mismo repo no
+    hereda la restriccion."""
+    short = repo.split("/")[-1].lower()
+    for entry in profile.get("repos") or []:
+        if isinstance(entry, dict) and str(entry.get("name", "")).lower() == short and entry.get("paths"):
+            return [normalize_rel_path(str(p)) for p in entry["paths"]]
+    return None
+
+
+def matches_globs(rel_path: str, globs) -> bool:
+    """fnmatch al estilo .gitignore: un patron con `/` se compara con la ruta
+    relativa completa (`*` y `**` cruzan directorios: `.github/workflows/**`);
+    uno sin `/` con el nombre del archivo a cualquier profundidad (`*.sh`)."""
+    rel = normalize_rel_path(rel_path)
+    name = Path(rel).name
+    return any(fnmatchcase(rel if "/" in glob else name, glob) for glob in globs)
+
+
+def in_repo_scope(rel_path: str, scope: Optional[list[str]]) -> bool:
+    return scope is None or matches_globs(rel_path, scope)
 
 
 def profile_repos(profile: dict) -> list[str]:
@@ -481,8 +537,14 @@ def route_issue(issue: dict, specialists: dict[str, dict], default_name: str, is
         reason = "default, sin label de especialidad"
     repo_short_name = issue["repo"].split("/")[-1]
     owned = profile_repos(specialists[name])
-    if owned and repo_short_name not in owned:
+    if not owned:
+        # Perfil sin repos asignados (p. ej. Red Robin recien creado): el label manda.
+        reason += "; perfil sin repos asignados"
+    elif repo_short_name not in owned:
         reason += f"; ojo: {repo_short_name} no esta en sus repos"
+    scope = repo_scope_paths(specialists[name], repo_short_name)
+    if scope:
+        reason += f"; solo {', '.join(scope)}"
     return name, reason
 
 
@@ -494,7 +556,8 @@ def build_specialist_preamble(profile: dict) -> str:
     ]
     for key, title in (
         ("languages", "Lenguajes"), ("frameworks", "Frameworks"), ("ui", "UI"), ("testing", "Testing"),
-        ("orms", "ORMs"), ("messaging", "Mensajeria"),
+        ("orms", "ORMs"), ("messaging", "Mensajeria"), ("databases", "Bases de datos"), ("ai", "IA"),
+        ("backend", "Backend"), ("tools", "Herramientas"), ("future", "A futuro"),
     ):
         if profile.get(key):
             lines.append(f"{title}: {', '.join(str(v) for v in profile[key])}")
@@ -672,12 +735,14 @@ def extract_mentioned_files_excluding_service_lines(text: str) -> list[str]:
     """Extraccion actual por mencion de archivo, excluyendo nombres que
     aparecen en lineas de verificacion de servicios (systemctl, is-active,
     docker), que suelen nombrar unidades systemd o containers y no archivos
-    a editar."""
+    a editar, y las rutas prohibidas (una mencion de `docker-compose.yml` en
+    el texto nunca se podria comitear; una seccion `Archivos:` explicita si
+    las conserva para que el issue termine en needs-review)."""
     service_mentions: set[str] = set()
     for line in text.splitlines():
         if SERVICE_CHECK_LINE_RE.search(line):
             service_mentions.update(FILE_MENTION_RE.findall(line))
-    return [f for f in extract_mentioned_files(text) if f not in service_mentions]
+    return [f for f in extract_mentioned_files(text) if f not in service_mentions and not is_forbidden_path(f)]
 
 
 def extract_allowed_files(text: str) -> list[str]:
@@ -962,7 +1027,7 @@ def validate_allowed_file_content(repo_path: Path, allowed_files: list[str]) -> 
                 errors.append(f"{rel}: falta OnCalendar= u OnUnitActiveSec=")
         elif TEST_FILE_NAME_RE.match(name) and not name.endswith(".py"):
             if not TEST_BODY_RE.search(content):
-                errors.append(f"{rel}: no contiene describe(/it(/test(")
+                errors.append(f"{rel}: no contiene describe(/it(/test(/testWidgets(/group(")
     return errors
 
 
@@ -1121,6 +1186,54 @@ def vitest_summary_counts(output: str) -> Optional[tuple[int, int]]:
     return passed, failed
 
 
+def flutter_summary_counts(output: str) -> Optional[tuple[int, int]]:
+    """(passed, failed) de la ultima linea de progreso de `flutter test`
+    (`00:03 +12 ~1 -2: ...`; `~` son los omitidos), o None si no esta. El
+    reporter compacto redibuja la linea con `\\r`, por eso se toma la ultima."""
+    matches = FLUTTER_SUMMARY_RE.findall(strip_ansi(output))
+    if not matches:
+        return None
+    passed, _skipped, failed = matches[-1]
+    return int(passed), int(failed or 0)
+
+
+def parse_flutter_machine(output: str) -> Optional[tuple[int, int]]:
+    """(ejecutados, fallidos) de los eventos JSON de `flutter test --machine`
+    (reporter JSON de package:test, un evento por linea). Cuenta los
+    `testDone` no ocultos y no omitidos; el test interno "loading <archivo>"
+    solo es oculto si cargo bien, asi que un error de compilacion cuenta como
+    fallido. None si no hubo ningun evento `testDone` (salida no JSON)."""
+    executed = failed = 0
+    seen = False
+    for line in strip_ansi(output).splitlines():
+        line = line.strip()
+        if not line.startswith(("{", "[")):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for event in data if isinstance(data, list) else [data]:
+            if not isinstance(event, dict) or event.get("type") != "testDone":
+                continue
+            seen = True
+            if event.get("hidden") or event.get("skipped"):
+                continue
+            executed += 1
+            if event.get("result") != "success":
+                failed += 1
+    return (executed, failed) if seen else None
+
+
+def count_flutter_tests_detected(output: str) -> int:
+    """Tests ejecutados (passed + failed) segun la salida de `flutter test`."""
+    machine = parse_flutter_machine(output)
+    if machine is not None:
+        return machine[0]
+    summary = flutter_summary_counts(output)
+    return sum(summary) if summary else 0
+
+
 def count_node_tests_detected(output: str) -> int:
     """Tests ejecutados (passed + failed) segun el resumen de jest o de vitest."""
     clean = strip_ansi(output)
@@ -1193,17 +1306,97 @@ def npm_ci_if_needed(repo_path: Path) -> Optional[subprocess.CompletedProcess]:
     return proc
 
 
-def step_condition_met(repo_path: Path, when: Optional[str]) -> bool:
-    """Condicion `when` de un paso de verificacion: `script:<n>`, `exists:<ruta>` o ninguna."""
+def step_condition_met(repo_path: Path, when) -> bool:
+    """Condicion `when` de un paso de verificacion: `script:<n>`,
+    `exists:<ruta>`, `glob:<patron>` (Path.glob desde la raiz: `*.tf` solo la
+    raiz, `**/*.tf` recursivo), una lista de ellas (todas deben cumplirse) o
+    ninguna."""
     if not when:
         return True
+    if isinstance(when, list):
+        return all(step_condition_met(repo_path, cond) for cond in when)
     kind, _, arg = str(when).partition(":")
     if kind == "script":
         return node_has_script(repo_path, arg)
     if kind == "exists":
         return (repo_path / arg).exists()
+    if kind == "glob":
+        return any(
+            not (set(p.relative_to(repo_path).parts) & VERIFY_SKIP_DIRS) for p in repo_path.glob(arg)
+        )
     log.warning("Condicion 'when' desconocida en perfil de especialista: %s (se omite el paso)", when)
     return False
+
+
+def tool_available(tool: str) -> bool:
+    """`requires` de un paso: el binario esta en el PATH (para `docker`,
+    ademas el plugin `docker compose` responde)."""
+    if shutil.which(tool) is None:
+        return False
+    if tool == "docker":
+        return run_cli(["docker", "compose", "version"], timeout=30).returncode == 0
+    return True
+
+
+def step_requires(step: dict) -> list[str]:
+    raw = step.get("requires") or []
+    tools = [raw] if isinstance(raw, str) else list(raw)
+    if step.get("builtin") == "compose_config":
+        tools.append("docker")
+    return [str(t) for t in tools]
+
+
+def missing_verification_tools(profile: dict) -> list[str]:
+    """Herramientas de `requires` de cualquier paso del perfil que no estan
+    instaladas (sus pasos se omiten con un aviso, no fallan)."""
+    tools = {t for stack in (profile.get("verification") or {}).values() for s in stack.get("steps", []) for t in step_requires(s)}
+    return sorted(t for t in tools if not tool_available(t))
+
+
+def repo_files_matching(repo_path: Path, globs, scope: Optional[list[str]] = None) -> list[str]:
+    """Archivos del repo (rutas relativas, ordenadas) que coinciden con
+    `globs` (`matches_globs`) y caen en el alcance `scope` del especialista;
+    se omiten `VERIFY_SKIP_DIRS`."""
+    found: list[str] = []
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = sorted(d for d in dirs if d not in VERIFY_SKIP_DIRS)
+        for name in files:
+            rel = str((Path(root) / name).relative_to(repo_path))
+            if matches_globs(rel, globs) and in_repo_scope(rel, scope):
+                found.append(rel)
+    return sorted(found)
+
+
+def run_compose_config(repo_path: Path, scope: Optional[list[str]]) -> list[tuple[str, subprocess.CompletedProcess]]:
+    """Builtin `compose_config`: `docker compose [--env-file <plantilla>] -f
+    <archivo> config -q` por cada compose del repo (en el alcance). Las
+    variables se interpolan con la plantilla versionada junto al archivo
+    (`COMPOSE_ENV_TEMPLATES`), nunca con un `.env` real; sin plantilla, las
+    faltantes quedan vacias (docker solo avisa)."""
+    results: list[tuple[str, subprocess.CompletedProcess]] = []
+    for rel in repo_files_matching(repo_path, COMPOSE_FILE_GLOBS, scope):
+        compose_dir = (repo_path / rel).parent
+        cmd = ["docker", "compose"]
+        template = next((t for t in COMPOSE_ENV_TEMPLATES if (compose_dir / t).is_file()), None)
+        if template:
+            cmd += ["--env-file", template]
+        cmd += ["-f", Path(rel).name, "config", "-q"]
+        results.append((" ".join(cmd) + (f"  (en {compose_dir.relative_to(repo_path)})" if compose_dir != repo_path else ""),
+                        run_cli(cmd, cwd=compose_dir, timeout=120)))
+    return results
+
+
+def expand_step_command(cmd: list[str], files: list[str]) -> list[list[str]]:
+    """`{files}` -> todos los archivos en un solo comando; `{file}` -> un
+    comando por archivo; sin marcador -> el comando tal cual (una vez)."""
+    if "{file}" in cmd:
+        return [[rel if token == "{file}" else token for token in cmd] for rel in files]
+    if "{files}" in cmd:
+        expanded: list[str] = []
+        for token in cmd:
+            expanded.extend(files if token == "{files}" else [token])
+        return [expanded]
+    return [cmd]
 
 
 def split_env_prefix(command: str) -> tuple[dict, list[str]]:
@@ -1245,12 +1438,31 @@ def run_verification_steps(
         if step_log is not None:
             step_log.append((label, ok, detail, (datetime.now() - started).total_seconds()))
 
+    # El workspace se llama como el repo (`setup_workspace_repo`): de ahi sale el alcance.
+    scope = repo_scope_paths(profile, repo_path.name)
+    allowed = {normalize_rel_path(f) for f in allowed_files}
     for stack_name, stack in detected_stacks(repo_path, profile):
         for step in stack.get("steps", []):
             if not step_condition_met(repo_path, step.get("when")):
                 continue
             builtin = step.get("builtin")
+            label = str(step.get("cmd") or builtin)
+            missing = [t for t in step_requires(step) if not tool_available(t)]
+            if missing:
+                log.warning(
+                    "%s: paso '%s' omitido, falta %s en el PATH (instalarlo para verificarlo)",
+                    repo_path.name, label, ", ".join(missing),
+                )
+                record(label, True, f"omitido: falta {', '.join(missing)}", datetime.now())
+                continue
             started = datetime.now()
+            if builtin == "compose_config":
+                for compose_label, proc in run_compose_config(repo_path, scope):
+                    record(compose_label, proc.returncode == 0, f"codigo {proc.returncode}", started)
+                    if proc.returncode != 0:
+                        errors.append(f"{compose_label} fallo")
+                        full_outputs.append(f"=== {compose_label} ===\n{mask_secrets(proc.stdout + proc.stderr)}")
+                continue
             if builtin == "npm_ci_if_needed":
                 ci = npm_ci_if_needed(repo_path)
                 if ci is not None:
@@ -1272,18 +1484,34 @@ def run_verification_steps(
 
             command = str(step["cmd"])
             env, cmd = split_env_prefix(command)
-            proc = run_cli(cmd, cwd=repo_path, timeout=int(step.get("timeout", DEFAULT_STEP_TIMEOUT)), extra_env=env or None)
-            output = mask_secrets(proc.stdout + proc.stderr)
-            record(command, proc.returncode == 0, f"codigo {proc.returncode}", started)
-            if proc.returncode != 0:
-                errors.append(f"{command} fallo")
-                full_outputs.append(f"=== {command} ===\n{output}")
+            files: list[str] = []
+            if step.get("files"):
+                files = repo_files_matching(repo_path, step["files"], scope)
+                if step.get("changed_only"):
+                    files = [f for f in files if normalize_rel_path(f) in allowed]
+                if not files:
+                    log.info("%s: paso '%s' omitido, ningun archivo coincide con %s", repo_path.name, command, step["files"])
+                    continue
+            output = ""
+            for run in expand_step_command(cmd, files):
+                proc = run_cli(run, cwd=repo_path, timeout=int(step.get("timeout", DEFAULT_STEP_TIMEOUT)), extra_env=env or None)
+                run_output = mask_secrets(proc.stdout + proc.stderr)
+                output += run_output
+                run_label = " ".join(run) if run is not cmd else command
+                record(run_label, proc.returncode == 0, f"codigo {proc.returncode}", started)
+                if proc.returncode != 0:
+                    errors.append(f"{run_label} fallo")
+                    full_outputs.append(f"=== {run_label} ===\n{run_output}")
 
             counts = step.get("counts_tests")
             if counts == "node":
                 node_tests = [f for f in test_files if Path(f).suffix in NODE_SOURCE_SUFFIXES]
                 if node_tests and count_node_tests_detected(output) == 0:
                     errors.append("Los archivos de test no fueron detectados por jest/vitest (0 tests encontrados)")
+            elif counts == "flutter":
+                dart_tests = [f for f in test_files if f.endswith(".dart")]
+                if dart_tests and count_flutter_tests_detected(output) == 0:
+                    errors.append("flutter test no ejecuto ningun test (0 tests encontrados)")
             elif counts == "pytest":
                 py_tests = [f for f in test_files if f.endswith(".py")]
                 match = PYTEST_PASSED_RE.search(output)
@@ -1328,12 +1556,17 @@ def parse_jest_json(report_path: Path, test_path: Path) -> Optional[tuple[int, i
 
 
 def detect_test_runner(repo_path: Path, rel: str, configured: str = "auto") -> str:
-    """Runner para el archivo de test `rel`. `.py` siempre pytest. Para tests
+    """Runner para el archivo de test `rel`. `.py` siempre pytest; `.dart`
+    (`*_test.dart`, repos con `pubspec.yaml`) siempre flutter. Para tests
     JS/TS: `vitest`/`jest` del perfil (`test_runner`) si se fijo uno; con
-    `auto` (o `pytest`, que no aplica a JS), vitest si esta en las
+    `auto` (o `pytest`/`flutter`, que no aplican a JS), vitest si esta en las
     dependencias de package.json o hay `vitest.config.*`, si no jest."""
     if rel.endswith(".py"):
         return "pytest"
+    if rel.endswith(".dart"):
+        if not (repo_path / "pubspec.yaml").exists():
+            log.warning("%s: test Dart sin pubspec.yaml en la raiz; flutter test probablemente falle", rel)
+        return "flutter"
     if configured in ("vitest", "jest"):
         return configured
     package_json = repo_path / "package.json"
@@ -1376,6 +1609,27 @@ def run_vitest_file(repo_path: Path, rel: str) -> tuple[int, int, str]:
     return executed, failed, output
 
 
+def run_flutter_file(repo_path: Path, rel: str) -> tuple[int, int, str]:
+    """`flutter test --machine <rel>`: cuenta los eventos `testDone`
+    (`parse_flutter_machine`); fallback: ultima linea de progreso
+    `+N ~S -F:` del texto (`flutter_summary_counts`). Un codigo de salida
+    != 0 sin fallidos contados (p. ej. no compilo) cuenta como 1 fallido."""
+    proc = run_cli(["flutter", "test", "--machine", rel], cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT)
+    output = mask_secrets(proc.stdout + proc.stderr)
+    parsed = parse_flutter_machine(output)
+    if parsed is not None:
+        executed, failed = parsed
+    else:
+        counts = flutter_summary_counts(output)
+        if counts is None:
+            return 0, 0, output
+        passed, failed = counts
+        executed = passed + failed
+    if proc.returncode != 0 and failed == 0:
+        failed = 1
+    return executed, failed, output
+
+
 def run_test_file(repo_path: Path, rel: str, runner: str = "auto") -> tuple[int, int, str]:
     """Corre el runner apuntando SOLO a `rel`. Devuelve (tests ejecutados,
     fallidos, salida). El runner sale de `detect_test_runner` (`test_runner`
@@ -1387,6 +1641,8 @@ def run_test_file(repo_path: Path, rel: str, runner: str = "auto") -> tuple[int,
     runner = detect_test_runner(repo_path, rel, runner)
     if runner == "vitest":
         return run_vitest_file(repo_path, rel)
+    if runner == "flutter":
+        return run_flutter_file(repo_path, rel)
     if runner == "pytest":
         proc = run_cli(
             ["python3", "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"], cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT
@@ -2160,6 +2416,9 @@ def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path
         return fail(error)
     package, target = patch["package"], patch["to"]
     files = PATCH_FILES[patch["ecosystem"]]
+    scope = repo_scope_paths(profile, repo_short_name)
+    if not all(in_repo_scope(f, scope) for f in files):
+        return fail(f"{', '.join(files)} fuera del alcance de {profile['name']} en {repo_short_name} ({', '.join(scope or [])})")
     plog.note("parche", f"{json.dumps(patch, ensure_ascii=False)}\nplan base: {describe_dependency_patch(patch)}")
     log.info("%s: parche determinista %s", tag, describe_dependency_patch(patch))
 
@@ -2267,6 +2526,26 @@ def process_issue(config: dict, issue: dict, profile: dict, escalation_state: di
     body = relativize_paths_in_body(issue["body"], config, issue["repo"])
     allowed_files = [normalize_rel_path(f) for f in extract_allowed_files(body)]
     specialist_context = build_specialist_context(config, profile, f"{issue['title']}\n{body}")
+
+    # Alcance del especialista en este repo (`paths` de su entrada en `repos`):
+    # lo de fuera sale de la lista permitida, asi el candado lo revierte.
+    scope = repo_scope_paths(profile, repo_short_name)
+    out_of_scope = [f for f in allowed_files if not in_repo_scope(f, scope)]
+    if out_of_scope:
+        allowed_files = [f for f in allowed_files if in_repo_scope(f, scope)]
+        log.warning(
+            "%s: %s solo puede tocar %s en %s; fuera de la lista permitida: %s",
+            tag, specialist_display(profile), ", ".join(scope or []), repo_short_name, ", ".join(out_of_scope),
+        )
+        if not allowed_files:
+            reason = (
+                f"todos los archivos del issue ({', '.join(out_of_scope)}) estan fuera del alcance de "
+                f"{profile.get('display_name') or profile['name']} en {repo_short_name} ({', '.join(scope or [])})"
+            )
+            mark_needs_review(issue["repo_obj"], issue["issue_obj"], reason, profile)
+            msg = f"🚫 {tag}: {reason}; marcado 'needs-review'"
+            log.error(msg)
+            return issue_result(msg, SOLVER_NONE)
 
     if not allowed_files:
         reason = "el issue no declara archivos (seccion `Archivos:` o rutas mencionadas); sin lista permitida no se puede comitear"
@@ -2495,6 +2774,7 @@ async def run_development_mode(config: dict, notifier) -> str:
 
     results: list[dict] = []
     worked: set[str] = set()
+    missing_tools: dict[str, list[str]] = {}
     last_notified = datetime.now()
     for idx, (issue, name, reason) in enumerate(routed, start=1):
         profile = specialists[name]
@@ -2510,6 +2790,10 @@ async def run_development_mode(config: dict, notifier) -> str:
             log.exception("Fallo inesperado procesando %s", tag)
             outcome = issue_result(f"❌ {tag}: error inesperado: {exc}", SOLVER_NONE)
         message, solver = outcome["message"], outcome["solver"]
+        if name not in missing_tools:
+            missing_tools[name] = missing_verification_tools(profile)
+        if missing_tools[name]:
+            message += f" (verificacion sin {', '.join(missing_tools[name])}: no instalados, pasos omitidos)"
         record_specialist_memory(profile, issue, message, solver, branch)
         worked.add(name)
         results.append(

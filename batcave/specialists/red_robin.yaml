@@ -1,0 +1,48 @@
+# Red Robin (Tim Drake) — especialista de datos e IA del modo Desarrollo.
+# Esquema documentado en batcave/specialists/README.md.
+
+name: red_robin
+display_name: Red Robin
+emoji: "🔴"
+role: data
+label: data
+
+languages: [Python, SQL]
+databases: [PostgreSQL (+pgvector), MongoDB, Firebase]
+orms: [Prisma, TypeORM, Alembic]
+ai: [RAG, embeddings, Ollama]
+
+# Sin repos asignados todavia: el enrutamiento por label `data` funciona y el
+# radar termina sin hacer nada. Candidatos en reports/red_robin-setup.md.
+repos: []
+
+# Runner por archivo de test: auto|vitest|jest|pytest (los .py siempre pytest).
+test_runner: auto
+
+conventions:
+  - "Conventional commits (feat/fix/chore/ci/test/refactor)."
+  - "Migraciones siempre reversibles (up + down / upgrade + downgrade)."
+  - "Nunca cambiar esquema ni datos sin una migracion versionada."
+  - "Solo queries parametrizadas: nunca interpolar valores en SQL (ni f-strings ni concatenacion)."
+  - "Sin secretos en el codigo: credenciales y URLs de conexion por variables de entorno."
+  - "Toda query nueva revisa sus indices (EXPLAIN) antes de comitear."
+  - "Nunca tocar .env, docker-compose ni archivos de infraestructura (nginx, fail2ban, cloudflared, ssh, systemd)."
+
+# Verificacion por stack. Se corren todos los stacks cuyo `detect` coincida
+# con algun archivo en la raiz del repo, en el orden listado.
+verification:
+  python:
+    detect: [requirements.txt, pyproject.toml, setup.py]
+    steps:
+      - builtin: py_compile_changed
+      - cmd: python3 -m pytest -q
+        when: exists:tests
+  node:
+    detect: [package.json]
+    steps:
+      - builtin: npm_ci_if_needed
+      - cmd: npm run build
+        when: script:build
+      - cmd: CI=true npm test -- --passWithNoTests --watchAll=false
+        when: script:test
+        counts_tests: node

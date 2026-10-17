@@ -38,8 +38,10 @@ from modes.development import (
     is_dependency_patch_issue,
     load_env,
     load_specialists,
+    missing_verification_tools,
     parse_radar_patch,
     profile_repos,
+    repo_scope_paths,
     resolve_work_branch,
     route_issue,
     run_development_mode,
@@ -202,12 +204,17 @@ def print_dry_run(config: dict, started_at: datetime) -> None:
         print(f"[dry-run] Especialistas cargados: {', '.join(specialists)} (default: {default_name})")
         for spec_name, spec in specialists.items():
             repos = ", ".join(
-                f"{repo}@{resolve_work_branch(config, repo, specialists, spec)}" for repo in profile_repos(spec)
+                f"{repo}@{resolve_work_branch(config, repo, specialists, spec)}"
+                + (f" [{', '.join(scope)}]" if (scope := repo_scope_paths(spec, repo)) else "")
+                for repo in profile_repos(spec)
             )
             print(
                 f"[dry-run]   {specialist_display(spec)} [{spec_name}] label '{spec['label']}', "
                 f"test_runner {spec.get('test_runner', 'auto')}: {repos or 'sin repos'}"
             )
+            missing = missing_verification_tools(spec)
+            if missing:
+                print(f"[dry-run]       verificacion sin {', '.join(missing)} (no instalados: esos pasos se omiten)")
         max_escalations = config.get("development", {}).get("max_claude_escalations", 2)
         print(f"[dry-run] Escalaciones a Claude permitidas esta noche: {max_escalations}")
         print(f"[dry-run] {len(issues)} issue(s) con label '{issue_label}' encontrados:")

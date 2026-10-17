@@ -66,7 +66,11 @@ development:
       include: [typescript-eslint, '@typescript-eslint/*']
 
 # Equipo de desarrollo: perfiles en specialists.dir (esquema en su README.md).
-# Hoy: nightwing (label backend, default) y batgirl (label frontend).
+# Hoy: nightwing (label backend, default), batgirl (label frontend),
+# red_robin (label data, datos + IA), robin (label mobile, Flutter/Dart;
+# test_runner flutter) y spoiler (label devops: portfolioServiceLauncher en dev
+# + solo `.github/workflows/**` de los repos de los demas, via `paths`).
+# red_robin y robin aun sin repos asignados.
 # Un issue va al especialista cuyo label tenga; sin label de especialidad, al default.
 specialists:
   dir: batcave/specialists
@@ -75,11 +79,18 @@ specialists:
 
 # Radar tecnologico (batcave/radar.py): inventario de dependencias, OSV y
 # ultimas versiones por especialista. Workspace de solo lectura, nunca produccion.
-# Timers: radar-nightwing (07:00, lunes 01:00) y radar-batgirl (07:10, lunes 01:20).
+# Timers: radar-nightwing (07:00, lunes 01:00), radar-batgirl (07:10, lunes 01:20),
+# radar-red-robin (07:20, lunes 01:40), radar-robin (07:30, lunes 02:00) y
+# radar-spoiler (07:40, lunes 02:20).
+# Un perfil sin repos termina sin hacer nada. Ecosistemas: npm, PyPI, Maven y Pub
+# (pubspec.yaml/pubspec.lock; Pub sin parche determinista -> needs-human) por
+# defecto; `radar_ecosystems` del perfil los cambia (Spoiler: GitHub Actions,
+# via OSV + API de GitHub, needs-human; y Docker, imagenes base oficiales via
+# Docker Hub, solo reporte).
 radar:
   workspace_dir: ~/projects/.radar-workspace
   github_owner: dsantacruza101     # owner para repos de un perfil que no esten en github.repos
-  http_timeout: 15                 # segundos por llamada HTTP (OSV, npm, PyPI, Maven, GitHub)
+  http_timeout: 15                 # segundos por llamada HTTP (OSV, npm, PyPI, Maven, pub.dev, GitHub, Docker Hub)
   alert_severities: [CRITICAL, HIGH]   # Telegram inmediato solo para estas, en dependencias de produccion
   max_weekly_summaries: 5          # notas de Claude por semana (protege el presupuesto semanal)
   claude_timeout: 600              # segundos por nota en modo --weekly

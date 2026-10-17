@@ -1,0 +1,9 @@
+[Unit]
+Description=Radar de Robin semanal — lunes 2:00 AM, tras el reset de tokens del domingo 23:00
+
+[Timer]
+OnCalendar=Mon *-*-* 02:00:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target

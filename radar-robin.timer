@@ -1,0 +1,9 @@
+[Unit]
+Description=Radar de Robin — chequeo diario a las 7:30 AM (10 min despues del de Red Robin)
+
+[Timer]
+OnCalendar=*-*-* 07:30:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target

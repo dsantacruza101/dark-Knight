@@ -1,0 +1,9 @@
+[Unit]
+Description=Radar de Spoiler — chequeo diario a las 7:40 AM (10 min despues del de Robin)
+
+[Timer]
+OnCalendar=*-*-* 07:40:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target

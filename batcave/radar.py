@@ -16,14 +16,27 @@ perfil, default `github.work_branch` = `dev`; si no existe en origin,
 Dependencias directas: `package.json` (+ version instalada de
 `package-lock.json`), `requirements.in` si existe (version tomada del pin de
 `requirements.txt`/`requirements*.lock`; si no existe, `requirements.txt`),
-`requirements-dev.txt` (dev), `pyproject.toml` y `pom.xml`. Transitivas:
-todo lo demas de `package-lock.json`, `requirements.txt` (pip freeze) y
-`requirements*.lock` (pip-compile).
+`requirements-dev.txt` (dev), `pyproject.toml`, `pom.xml` y `pubspec.yaml`
+(+ version resuelta de `pubspec.lock`). Transitivas: todo lo demas de
+`package-lock.json`, `requirements.txt` (pip freeze), `requirements*.lock`
+(pip-compile) y `pubspec.lock`.
+
+Ecosistemas por perfil (`radar_ecosystems`, default npm/PyPI/Maven/Pub).
+Spoiler agrega:
+  - `GitHub Actions`: `uses:` de los workflows (ref exacto, flotante `@v4`
+    resuelto a su ultima release, SHA con `# vX.Y.Z`); ultima version por la
+    API de GitHub; OSV sin version + rangos evaluados aqui (`osv_affects`).
+    Sin parche determinista: `needs-human`.
+  - `Docker`: imagenes base (`FROM`, `image:` de compose); tags nuevos de la
+    misma familia en Docker Hub, solo imagenes oficiales. Solo reporte: sin
+    OSV, issues ni notas de Claude.
+Con `paths` en la entrada del repo (alcance del especialista) solo cuentan los
+manifiestos dentro de esos globs.
 
 Chequeo diario (sin tokens de Claude):
   - Vulnerabilidades: OSV (`/v1/querybatch` + `/v1/vulns/{id}`), ecosistemas
-    npm, PyPI y Maven, sobre TODAS las dependencias (directas y transitivas).
-  - Ultima version: registry de npm, API JSON de PyPI, Maven Central.
+    npm, PyPI, Maven y Pub, sobre TODAS las dependencias (directas y transitivas).
+  - Ultima version: registry de npm, API JSON de PyPI, Maven Central, API de pub.dev.
   - Clasificacion: `security_patch` (hay version corregida en el mismo
     major), `security_watch` (ningun advisory tiene version corregida y la
     dependencia es solo de desarrollo, directa o transitiva),
@@ -38,6 +51,8 @@ Acciones:
     from, to, ecosystem, direct, dev, manifest, advisories) y seccion
     `Archivos:`; el modo Desarrollo de Batman lo aplica esa noche en la
     rama de trabajo del repo de forma determinista (sin Aider ni Claude).
+    Excepcion: Pub (Flutter/Dart) aun no tiene parche determinista, asi que
+    su `security_patch` lleva `needs-human` en vez de `night-agent`.
   - `security_watch` -> sin issue (si habia uno abierto se cierra con un
     comentario explicando la politica); se lista en el resumen semanal bajo
     "Sin parche disponible (vigilando)".
@@ -89,12 +104,16 @@ from packaging.version import InvalidVersion, Version
 
 from batcave.secrets import mask_secrets
 from modes.development import (
+    COMPOSE_FILE_GLOBS,
     build_clone_url,
     git_cmd,
     github_auth_env,
+    in_repo_scope,
     load_env,
     load_specialists,
     profile_repos,
+    repo_files_matching,
+    repo_scope_paths,
     resolve_project_path,
     resolve_work_branch,
     run_cli,
@@ -127,7 +146,10 @@ OSV_URL = "https://api.osv.dev/v1"
 NPM_REGISTRY = "https://registry.npmjs.org"
 PYPI_URL = "https://pypi.org/pypi"
 MAVEN_SEARCH_URL = "https://search.maven.org/solrsearch/select"
+PUB_API_URL = "https://pub.dev/api/packages"
 GITHUB_API = "https://api.github.com"
+DOCKER_HUB_API = "https://hub.docker.com/v2"
+DOCKER_HUB_MAX_PAGES = 3          # 100 tags por pagina, los mas recientes primero
 RELEASE_NOTES_MAX_CHARS = 15000
 RELEASE_NOTE_MAX_CHARS = 4000
 MAX_USAGE_LINES = 20
@@ -137,6 +159,26 @@ DIGEST_MAX_ITEMS = 10
 ECOSYSTEM_NPM = "npm"
 ECOSYSTEM_PYPI = "PyPI"
 ECOSYSTEM_MAVEN = "Maven"
+ECOSYSTEM_PUB = "Pub"
+ECOSYSTEM_ACTIONS = "GitHub Actions"   # nombre exacto del ecosistema en OSV
+ECOSYSTEM_DOCKER = "Docker"            # imagenes base; OSV no las cubre
+KNOWN_ECOSYSTEMS = (ECOSYSTEM_NPM, ECOSYSTEM_PYPI, ECOSYSTEM_MAVEN, ECOSYSTEM_PUB, ECOSYSTEM_ACTIONS, ECOSYSTEM_DOCKER)
+# `radar_ecosystems` de un perfil sin ese campo: los de aplicacion (sin
+# Actions ni Docker, que son de Spoiler; asi no se duplican issues).
+DEFAULT_RADAR_ECOSYSTEMS = (ECOSYSTEM_NPM, ECOSYSTEM_PYPI, ECOSYSTEM_MAVEN, ECOSYSTEM_PUB)
+# Ecosistemas sin parche determinista en modes/development.py: su security_patch
+# va a un humano (needs-human), no a Batman.
+MANUAL_PATCH_ECOSYSTEMS = {ECOSYSTEM_PUB, ECOSYSTEM_ACTIONS}
+MANUAL_PATCH_VERIFY = {
+    ECOSYSTEM_PUB: "`flutter pub get`, `flutter analyze` y `flutter test`",
+    ECOSYSTEM_ACTIONS: "`actionlint` y una corrida del workflow en la rama de trabajo",
+}
+# Solo reporte: sin OSV, sin issues, sin notas de Claude; nunca se parchan solos.
+REPORT_ONLY_ECOSYSTEMS = {ECOSYSTEM_DOCKER}
+# OSV no ordena versiones de GitHub Actions (rangos ECOSYSTEM sin lista de
+# `versions`): consultar por version nunca coincide. Se piden todos los
+# advisories del paquete y los rangos se evaluan aqui (`osv_affects`).
+LOCAL_RANGE_ECOSYSTEMS = {ECOSYSTEM_ACTIONS}
 
 SECURITY_PATCH = "security_patch"
 SECURITY_MAJOR = "security_major"
@@ -162,9 +204,18 @@ REQ_LINE_RE = re.compile(
     r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(===|==|~=|>=|>|<=|<|!=)?\s*([A-Za-z0-9.*+!_-]*)"
 )
 MAVEN_NS_RE = re.compile(r"^\{[^}]+\}")
+ACTION_USES_RE = re.compile(r"""^\s*(?:-\s*)?uses:\s*(['"]?)([^'"\s#]+)\1\s*(?:#\s*(.*))?$""")
+ACTION_REF_VERSION_RE = re.compile(r"^v?(\d+(?:\.\d+){0,2})$")
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+DOCKER_ARG_RE = re.compile(r"^\s*ARG\s+([A-Za-z_]\w*)(?:=(\S*))?", re.IGNORECASE)
+DOCKER_FROM_RE = re.compile(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?", re.IGNORECASE)
+DOCKER_TAG_RE = re.compile(r"^(?P<pre>[A-Za-z][A-Za-z_-]*?)?(?P<num>\d+(?:\.\d+)*)(?P<post>.*)$")
+COMPOSE_VAR_RE = re.compile(r"\$\{([A-Za-z_]\w*)(?::?-([^}]*))?\}")
+WORKFLOW_GLOBS = (".github/workflows/*.yml", ".github/workflows/*.yaml", ".github/actions/*/action.yml", ".github/actions/*/action.yaml")
+DOCKERFILE_GLOBS = ("Dockerfile", "Dockerfile.*", "*.Dockerfile", "dockerfile", "dockerfile.*", "*.dockerfile")
 PY_SKIP_NAMES = {"python", "pip", "setuptools", "wheel"}
-SOURCE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".java")
-SKIP_DIRS = {"node_modules", ".git", "dist", "build", "venv", ".venv", "__pycache__", "target", "coverage"}
+SOURCE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".java", ".dart")
+SKIP_DIRS = {"node_modules", ".git", "dist", "build", "venv", ".venv", "__pycache__", "target", "coverage", ".dart_tool"}
 
 log = logging.getLogger("radar")
 
@@ -201,10 +252,11 @@ class Dependency:
     ecosystem: str
     name: str
     version: Optional[str]
-    version_source: str  # lock | exacta | rango | minima | pom
-    manifest: str
+    version_source: str  # lock | exacta | rango | minima | pom | tag | sha | flotante | rama | oficial...
+    manifest: str  # Actions/Docker: rutas relativas separadas por ", " si el mismo ref aparece en varios archivos
     dev: bool = False
     direct: bool = True
+    ref: Optional[str] = None  # GitHub Actions: ref original de `uses:` (`v4`, SHA, rama)
 
     @property
     def scope(self) -> str:
@@ -247,9 +299,17 @@ class Finding:
 
 
 def version_key(ecosystem: str, raw: Optional[str]) -> Optional[tuple]:
-    """Clave comparable (release de 6 numeros, estable?, texto) para npm/PyPI/Maven."""
+    """Clave comparable (release de 6 numeros, estable?, texto) para npm/PyPI/Maven/Pub."""
     if not raw:
         return None
+    if ecosystem == ECOSYSTEM_DOCKER:
+        # Tag completo (`21-alpine3.19`, `alpine3.21`): cuenta solo su numero;
+        # el resto es la variante (`docker_tag_family`) y no lo hace inestable.
+        match = DOCKER_TAG_RE.match(raw.strip())
+        if not match:
+            return None
+        numbers = [int(part) for part in match.group("num").split(".")]
+        return (tuple(numbers) + (0,) * 6)[:6] + (1, raw.strip())
     text = raw.strip().lstrip("vV=").strip()
     if ecosystem == ECOSYSTEM_PYPI:
         try:
@@ -263,7 +323,7 @@ def version_key(ecosystem: str, raw: Optional[str]) -> Optional[tuple]:
         return None
     numbers = [int(part) for part in match.group(1).split(".")]
     suffix = match.group(2)
-    # `+build` (npm) y sufijos Maven tipo `.RELEASE`/`.Final` son estables.
+    # `+build` (npm, Pub) y sufijos Maven tipo `.RELEASE`/`.Final` son estables.
     stable = int(not suffix or suffix.startswith("+") or bool(re.fullmatch(r"(?i)[.-]?(release|final|ga)", suffix)))
     return (tuple(numbers) + (0,) * 6)[:6] + (stable, text)
 
@@ -334,6 +394,17 @@ def get_workspace_dir(config: dict) -> Path:
         if workspace == prod or prod.is_relative_to(workspace) or workspace.is_relative_to(prod):
             raise RuntimeError(f"radar.workspace_dir ({workspace}) se cruza con produccion ({prod}); se aborta")
     return workspace
+
+
+def repo_work_branch(config: dict, repo: str, profile: dict) -> str:
+    """Rama de trabajo de `repo` buscando en TODOS los perfiles (primero el
+    propio): Spoiler revisa workflows de repos ajenos sin fijar su rama, y
+    my_Portfolio_React_v2 sigue siendo `development` (batgirl.yaml)."""
+    try:
+        specialists = load_specialists(config)
+    except RuntimeError:
+        specialists = {}
+    return resolve_work_branch(config, repo, specialists, preferred=profile)
 
 
 def sync_workspace_repo(full_name: str, workspace_dir: Path, work_branch: str) -> Optional[tuple[Path, str]]:
@@ -608,8 +679,223 @@ def inventory_maven(repo: str, path: Path) -> list[Dependency]:
     return list(deps.values())
 
 
-def build_inventory(repo: str, path: Path) -> list[Dependency]:
-    return inventory_npm(repo, path) + inventory_python(repo, path) + inventory_maven(repo, path)
+def read_yaml_file(path: Path, repo: str) -> dict:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        log.error("%s: %s invalido: %s", repo, path.name, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def inventory_pub(repo: str, path: Path) -> list[Dependency]:
+    """Flutter/Dart. Directas: `dependencies` (produccion) y
+    `dev_dependencies` (dev) de `pubspec.yaml`, con la version resuelta de
+    `pubspec.lock` (si no hay lock, la base del rango). Se omiten las de
+    `sdk:` (flutter, flutter_test...), `path:` y `git:`. Transitivas: el resto
+    de los paquetes `hosted` del lock (marcadas como produccion: el lock no
+    dice que paquete las trae)."""
+    manifest = path / "pubspec.yaml"
+    if not manifest.exists():
+        return []
+    pubspec = read_yaml_file(manifest, repo)
+    lock_path = path / "pubspec.lock"
+    lock_packages = (read_yaml_file(lock_path, repo).get("packages") or {}) if lock_path.exists() else {}
+    hosted = {
+        name: str(meta["version"])
+        for name, meta in lock_packages.items()
+        if isinstance(meta, dict) and meta.get("source") == "hosted" and meta.get("version")
+    }
+    deps: dict[str, Dependency] = {}
+    for section, dev in (("dependencies", False), ("dev_dependencies", True)):
+        for name, spec in (pubspec.get(section) or {}).items():
+            if name in deps:
+                continue
+            if isinstance(spec, dict) and any(key in spec for key in ("sdk", "path", "git")):
+                continue
+            if spec is None:
+                spec = "any"
+            raw = spec.get("version") if isinstance(spec, dict) else spec
+            if name in hosted:
+                version, source = hosted[name], "lock"
+            elif isinstance(raw, str) and raw.strip() not in ("", "any"):
+                version, source = npm_version_from_spec(raw), "rango"
+            else:
+                version, source = None, "sin-version"
+            deps[name] = Dependency(repo, ECOSYSTEM_PUB, name, version, source, "pubspec.yaml", dev)
+    direct = {(d.name, d.version) for d in deps.values()}
+    transitive = [
+        Dependency(repo, ECOSYSTEM_PUB, name, version, "lock", "pubspec.lock", False, direct=False)
+        for name, version in sorted(hosted.items())
+        if (name, version) not in direct and name not in deps
+    ]
+    return list(deps.values()) + transitive
+
+
+def parse_action_ref(ref: str, comment: str) -> tuple[Optional[str], str]:
+    """(version, fuente) de `uses: owner/repo@<ref>  # <comentario>`:
+    `v4.2.2` -> exacta; `v4`/`v4.2` -> flotante (se resuelve luego a la
+    ultima release de ese major/minor, `resolve_floating_actions`); SHA de 40
+    -> la version del comentario (`# v4.2.2`) o sin version; otra cosa ->
+    rama (sin fijar)."""
+    if GIT_SHA_RE.match(ref):
+        match = VERSION_IN_TAG_RE.search(comment.strip().split()[0]) if comment.strip() else None
+        return (match.group(1).lstrip("vV"), f"sha ({comment.strip().split()[0]})") if match else (None, "sha sin comentario de version")
+    match = ACTION_REF_VERSION_RE.match(ref)
+    if not match:
+        return None, f"rama {ref} (sin fijar)"
+    if match.group(1).count(".") == 2:
+        return match.group(1), "tag"
+    return None, f"flotante {ref}"
+
+
+def inventory_actions(repo: str, path: Path, scope: Optional[list[str]]) -> list[Dependency]:
+    """`uses:` de los workflows (`.github/workflows/*.y*ml`) y de las acciones
+    compuestas locales (`.github/actions/*/action.y*ml`). Se omiten las
+    locales (`./...`) y `docker://`. Reusable workflows
+    (`owner/repo/.github/workflows/x.yml@ref`) cuentan como `owner/repo`.
+    Todas son de produccion: corren con los secretos del repo."""
+    deps: list[Dependency] = []
+    for rel in repo_files_matching(path, WORKFLOW_GLOBS, scope):
+        try:
+            lines = (path / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            log.warning("%s: no se pudo leer %s: %s", repo, rel, exc)
+            continue
+        for line in lines:
+            match = ACTION_USES_RE.match(line)
+            if not match:
+                continue
+            uses, comment = match.group(2), match.group(3) or ""
+            if uses.startswith(("./", "docker://")) or "@" not in uses:
+                continue
+            target, ref = uses.rsplit("@", 1)
+            parts = target.split("/")
+            if len(parts) < 2:
+                continue
+            version, source = parse_action_ref(ref, comment)
+            deps.append(Dependency(repo, ECOSYSTEM_ACTIONS, f"{parts[0]}/{parts[1]}", version, source, rel, ref=ref))
+    return deps
+
+
+def docker_official_name(image: str) -> Optional[str]:
+    """Nombre de una imagen oficial de Docker Hub (`node`, `library/node`,
+    `docker.io/library/node`), o None si es de otro namespace o registry."""
+    parts = image.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        if parts[0] not in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+            return None
+        parts = parts[1:]
+    if len(parts) == 2 and parts[0] == "library":
+        parts = parts[1:]
+    return parts[0] if len(parts) == 1 else None
+
+
+def docker_image_dep(repo: str, image_ref: str, manifest: str) -> Optional[Dependency]:
+    """Dependency de `imagen[:tag][@digest]`. Version = tag completo si tiene
+    numero; `latest`/`stable-alpine`/sin tag = sin version fija."""
+    ref, _, digest = image_ref.partition("@")
+    last = ref.rsplit("/", 1)[-1]
+    image, tag = (ref.rsplit(":", 1) if ":" in last else (ref, ""))
+    official = docker_official_name(image)
+    name = official or image
+    origin = "oficial" if official else "no oficial, sin chequeo de tags"
+    if digest:
+        origin += ", con digest"
+    if not tag or not DOCKER_TAG_RE.match(tag):
+        return Dependency(repo, ECOSYSTEM_DOCKER, name, None, f"tag mutable '{tag or 'latest'}' ({origin})", manifest)
+    return Dependency(repo, ECOSYSTEM_DOCKER, name, tag, origin, manifest)
+
+
+def inventory_docker(repo: str, path: Path, scope: Optional[list[str]]) -> list[Dependency]:
+    """Imagenes base: `FROM` de los Dockerfiles (ARG por defecto resueltos;
+    se omiten `scratch` y las etapas propias) e `image:` de los servicios de
+    compose sin `build:` (`${VAR:-default}` resuelto). Solo reporte."""
+    deps: list[Dependency] = []
+    for rel in repo_files_matching(path, DOCKERFILE_GLOBS, scope):
+        try:
+            lines = (path / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            log.warning("%s: no se pudo leer %s: %s", repo, rel, exc)
+            continue
+        args: dict[str, str] = {}
+        stages: set[str] = set()
+        for line in lines:
+            arg = DOCKER_ARG_RE.match(line)
+            if arg and arg.group(2):
+                args.setdefault(arg.group(1), arg.group(2).strip("'\""))
+            match = DOCKER_FROM_RE.match(line)
+            if not match:
+                continue
+            image = re.sub(r"\$\{?(\w+)\}?", lambda m: args.get(m.group(1), m.group(0)), match.group(1))
+            own_stage = image.lower() in stages
+            if match.group(2):
+                stages.add(match.group(2).lower())
+            if image.lower() == "scratch" or own_stage or "$" in image:
+                continue
+            dep = docker_image_dep(repo, image, rel)
+            if dep:
+                deps.append(dep)
+    for rel in repo_files_matching(path, COMPOSE_FILE_GLOBS, scope):
+        services = (read_yaml_file(path / rel, repo).get("services") or {})
+        for service in services.values():
+            if not isinstance(service, dict) or service.get("build") or not isinstance(service.get("image"), str):
+                continue
+            image = COMPOSE_VAR_RE.sub(lambda m: m.group(2) if m.group(2) is not None else m.group(0), service["image"])
+            if "$" in image:
+                continue
+            dep = docker_image_dep(repo, image, rel)
+            if dep:
+                deps.append(dep)
+    return deps
+
+
+def merge_manifests(deps: list[Dependency]) -> list[Dependency]:
+    """Un solo Dependency por (ecosistema, nombre, version, fuente) de
+    Actions/Docker, con todos sus archivos en `manifest` (", ")."""
+    merged: dict[tuple, Dependency] = {}
+    out: list[Dependency] = []
+    for dep in deps:
+        if dep.ecosystem not in (ECOSYSTEM_ACTIONS, ECOSYSTEM_DOCKER):
+            out.append(dep)
+            continue
+        key = (dep.ecosystem, dep.name, dep.version, dep.version_source)
+        if key in merged:
+            if dep.manifest not in merged[key].manifest.split(", "):
+                merged[key].manifest += f", {dep.manifest}"
+            continue
+        merged[key] = dep
+        out.append(dep)
+    return out
+
+
+def profile_ecosystems(profile: dict) -> list[str]:
+    """`radar_ecosystems` del perfil (default `DEFAULT_RADAR_ECOSYSTEMS`)."""
+    raw = profile.get("radar_ecosystems") or list(DEFAULT_RADAR_ECOSYSTEMS)
+    ecosystems = [str(e) for e in raw if str(e) in KNOWN_ECOSYSTEMS]
+    unknown = [str(e) for e in raw if str(e) not in KNOWN_ECOSYSTEMS]
+    if unknown:
+        log.warning("Perfil %s: radar_ecosystems desconocidos %s (validos: %s)", profile["name"], unknown, ", ".join(KNOWN_ECOSYSTEMS))
+    return ecosystems
+
+
+def build_inventory(repo: str, path: Path, ecosystems=DEFAULT_RADAR_ECOSYSTEMS, scope: Optional[list[str]] = None) -> list[Dependency]:
+    """Inventario de `ecosystems` en el repo. Con `scope` (globs `paths` del
+    perfil) solo cuentan los manifiestos dentro del alcance."""
+    deps: list[Dependency] = []
+    if ECOSYSTEM_NPM in ecosystems:
+        deps += inventory_npm(repo, path)
+    if ECOSYSTEM_PYPI in ecosystems:
+        deps += inventory_python(repo, path)
+    if ECOSYSTEM_MAVEN in ecosystems:
+        deps += inventory_maven(repo, path)
+    if ECOSYSTEM_PUB in ecosystems:
+        deps += inventory_pub(repo, path)
+    if ECOSYSTEM_ACTIONS in ecosystems:
+        deps += inventory_actions(repo, path, scope)
+    if ECOSYSTEM_DOCKER in ecosystems:
+        deps += inventory_docker(repo, path, scope)
+    return merge_manifests([d for d in deps if in_repo_scope(d.manifest, scope)])
 
 
 # --------------------------------------------------------------------------
@@ -664,18 +950,56 @@ def severity_from_vuln(vuln: dict) -> str:
     return "UNKNOWN"
 
 
-def fixed_version_for(vuln: dict, dep: Dependency) -> Optional[str]:
-    """Menor version `fixed` de OSV mayor que la actual, para este paquete."""
+def affected_entries(vuln: dict, dep: Dependency) -> list[dict]:
+    """Entradas `affected` de OSV que corresponden a este paquete."""
     wanted = osv_name(dep).lower()
-    candidates: list[str] = []
+    entries: list[dict] = []
     for affected in vuln.get("affected") or []:
         pkg = affected.get("package") or {}
         if pkg.get("ecosystem") != dep.ecosystem:
             continue
         name = pkg.get("name", "")
         name = re.sub(r"[-_.]+", "-", name).lower() if dep.ecosystem == ECOSYSTEM_PYPI else name.lower()
-        if name != wanted:
-            continue
+        if name == wanted:
+            entries.append(affected)
+    return entries
+
+
+def osv_affects(vuln: dict, dep: Dependency) -> bool:
+    """Evaluacion local de los rangos de OSV (`introduced` -> `fixed` /
+    `last_affected`), para ecosistemas en los que OSV no sabe ordenar
+    versiones al consultar por version (`LOCAL_RANGE_ECOSYSTEMS`)."""
+    eco, version = dep.ecosystem, dep.version
+
+    def reached(start: str) -> bool:
+        return start == "0" or not vgt(eco, start, version)
+
+    for affected in affected_entries(vuln, dep):
+        if version in (affected.get("versions") or []):
+            return True
+        for rng in affected.get("ranges") or []:
+            if rng.get("type") not in ("ECOSYSTEM", "SEMVER"):
+                continue
+            start: Optional[str] = None
+            for event in rng.get("events") or []:
+                if "introduced" in event:
+                    start = str(event["introduced"])
+                    continue
+                if start is None:
+                    continue
+                fixed, last = event.get("fixed"), event.get("last_affected")
+                if reached(start) and ((fixed and vgt(eco, fixed, version)) or (last and not vgt(eco, version, last))):
+                    return True
+                start = None
+            if start is not None and reached(start):
+                return True
+    return False
+
+
+def fixed_version_for(vuln: dict, dep: Dependency) -> Optional[str]:
+    """Menor version `fixed` de OSV mayor que la actual, para este paquete."""
+    candidates: list[str] = []
+    for affected in affected_entries(vuln, dep):
         for rng in affected.get("ranges") or []:
             for event in rng.get("events") or []:
                 fixed = event.get("fixed")
@@ -691,7 +1015,12 @@ def osv_query(session: requests.Session, deps: list[Dependency], timeout: int) -
     found: dict[int, list[str]] = {}
     for start in range(0, len(deps), OSV_BATCH_SIZE):
         chunk = deps[start:start + OSV_BATCH_SIZE]
-        queries = [{"package": {"name": osv_name(d), "ecosystem": d.ecosystem}, "version": d.version} for d in chunk]
+        # Sin version: todos los advisories del paquete (se filtran con `osv_affects`).
+        queries = [
+            {"package": {"name": osv_name(d), "ecosystem": d.ecosystem}}
+            | ({} if d.ecosystem in LOCAL_RANGE_ECOSYSTEMS else {"version": d.version})
+            for d in chunk
+        ]
         try:
             resp = session.post(f"{OSV_URL}/querybatch", json={"queries": queries}, timeout=timeout)
             resp.raise_for_status()
@@ -781,8 +1110,99 @@ def github_repo_from(urls: list[str]) -> Optional[str]:
     return None
 
 
+_ACTION_VERSIONS: dict[str, list[str]] = {}
+
+
+def action_versions(session: requests.Session, name: str, timeout: int) -> list[str]:
+    """Versiones publicadas (sin `v`) de una accion `owner/repo`: releases no
+    draft ni prerelease; si no publica releases, sus tags. Solo tags con al
+    menos `X.Y` (los flotantes `v4` no cuentan). Cache por corrida."""
+    if name in _ACTION_VERSIONS:
+        return _ACTION_VERSIONS[name]
+    versions: list[str] = []
+    try:
+        resp = session.get(f"{GITHUB_API}/repos/{name}/releases", params={"per_page": 100}, headers=github_headers(), timeout=timeout)
+        resp.raise_for_status()
+        tags = [r.get("tag_name") or "" for r in resp.json() if not r.get("draft") and not r.get("prerelease")]
+        if not tags:
+            resp = session.get(f"{GITHUB_API}/repos/{name}/tags", params={"per_page": 100}, headers=github_headers(), timeout=timeout)
+            resp.raise_for_status()
+            tags = [t.get("name") or "" for t in resp.json()]
+        versions = [m.group(1) for m in (VERSION_IN_TAG_RE.search(t) for t in tags) if m]
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("No se pudieron leer las versiones de la accion %s: %s", name, exc)
+    _ACTION_VERSIONS[name] = versions
+    return versions
+
+
+def resolve_floating_actions(session: requests.Session, deps: list[Dependency], timeout: int) -> None:
+    """`uses: x@v4` (o `@v4.2`) sigue a la ultima release de ese major/minor:
+    se resuelve a esa version para consultar OSV con lo que realmente corre."""
+    floating = [d for d in deps if d.ecosystem == ECOSYSTEM_ACTIONS and d.version is None and d.version_source.startswith("flotante")]
+    with ThreadPoolExecutor(max_workers=HTTP_WORKERS) as pool:
+        list(pool.map(lambda n: action_versions(session, n, timeout), sorted({d.name for d in floating})))
+    for dep in floating:
+        prefix = ACTION_REF_VERSION_RE.match(dep.ref or "").group(1)
+        matching = [
+            v for v in action_versions(session, dep.name, timeout)
+            if is_stable(ECOSYSTEM_ACTIONS, v) and (v == prefix or v.startswith(prefix + "."))
+        ]
+        best = vmax(ECOSYSTEM_ACTIONS, matching)
+        if best:
+            dep.version, dep.version_source = best, f"flotante {dep.ref} -> {best}"
+        else:
+            log.warning("%s: no se pudo resolver %s@%s a una release", dep.repo, dep.name, dep.ref)
+
+
+def docker_tag_family(tag: str) -> Optional[tuple[str, str, int]]:
+    """Familia de un tag: (prefijo, variante con los numeros como `#`,
+    cantidad de componentes del numero). `21-alpine3.19` ->
+    ('', '-alpine#', 1); `alpine3.21` -> ('alpine', '', 2). Solo se comparan
+    tags de la misma familia (misma variante y misma precision)."""
+    match = DOCKER_TAG_RE.match(tag)
+    if not match:
+        return None
+    return (match.group("pre") or "", re.sub(r"\d+(?:\.\d+)*", "#", match.group("post")), match.group("num").count(".") + 1)
+
+
+def docker_latest_tag(session: requests.Session, name: str, tag: str, timeout: int) -> Optional[str]:
+    """Tag mas nuevo de la imagen oficial `name` en la familia de `tag`
+    (Docker Hub, los `DOCKER_HUB_MAX_PAGES` x 100 tags mas recientes,
+    filtrados por la palabra de la variante, p. ej. `alpine`)."""
+    family = docker_tag_family(tag)
+    if not family:
+        return None
+    words = re.findall(r"[a-z]+", (family[0] + family[1]).lower())
+    url: Optional[str] = f"{DOCKER_HUB_API}/repositories/library/{quote(name)}/tags"
+    params: Optional[dict] = {"page_size": 100, "ordering": "last_updated", **({"name": words[0]} if words else {})}
+    names: list[str] = []
+    for _ in range(DOCKER_HUB_MAX_PAGES):
+        if not url:
+            break
+        resp = session.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        names += [r["name"] for r in data.get("results") or [] if r.get("name")]
+        url, params = data.get("next"), None
+    same = [n for n in names if docker_tag_family(n) == family] + [tag]
+    # Mismo numero principal: gana la variante mas nueva (alpine3.22 > alpine3.19).
+    return max(same, key=lambda n: (version_key(ECOSYSTEM_DOCKER, n)[:6], [int(x) for x in re.findall(r"\d+", n)]))
+
+
+def meta_key(dep: Dependency) -> tuple[str, str]:
+    """Llave de `fetch_meta`: Docker depende del tag (familia), no solo del nombre."""
+    if dep.ecosystem == ECOSYSTEM_DOCKER:
+        return dep.ecosystem, f"{dep.name}:{dep.version}"
+    return dep.ecosystem, dep.name
+
+
 def fetch_meta(session: requests.Session, ecosystem: str, name: str, timeout: int) -> PackageMeta:
     try:
+        if ecosystem == ECOSYSTEM_ACTIONS:
+            return PackageMeta(vmax(ecosystem, [v for v in action_versions(session, name, timeout) if is_stable(ecosystem, v)]), name)
+        if ecosystem == ECOSYSTEM_DOCKER:
+            image, _, tag = name.partition(":")
+            return PackageMeta(docker_latest_tag(session, image, tag, timeout), None)
         if ecosystem == ECOSYSTEM_NPM:
             resp = session.get(f"{NPM_REGISTRY}/{name.replace('/', '%2F')}/latest", timeout=timeout)
             resp.raise_for_status()
@@ -806,13 +1226,22 @@ def fetch_meta(session: requests.Session, ecosystem: str, name: str, timeout: in
             resp.raise_for_status()
             docs = (resp.json().get("response") or {}).get("docs") or []
             return PackageMeta(docs[0].get("latestVersion") if docs else None, None)
+        if ecosystem == ECOSYSTEM_PUB:
+            # `latest` de pub.dev es la ultima estable (si existe alguna).
+            resp = session.get(f"{PUB_API_URL}/{quote(name)}", timeout=timeout)
+            resp.raise_for_status()
+            latest = resp.json().get("latest") or {}
+            pubspec = latest.get("pubspec") or {}
+            urls = [str(pubspec.get(key) or "") for key in ("repository", "homepage", "issue_tracker")]
+            return PackageMeta(latest.get("version"), github_repo_from(urls))
     except (requests.RequestException, ValueError, KeyError) as exc:
         log.warning("No se pudo consultar la ultima version de %s (%s): %s", name, ecosystem, exc)
     return PackageMeta(None, None)
 
 
 def fetch_all_meta(session: requests.Session, deps: list[Dependency], timeout: int) -> dict[tuple[str, str], PackageMeta]:
-    keys = sorted({(d.ecosystem, d.name) for d in deps})
+    # Imagenes no oficiales (otro namespace/registry): sin chequeo de tags.
+    keys = sorted({meta_key(d) for d in deps if not (d.ecosystem == ECOSYSTEM_DOCKER and not d.version_source.startswith("oficial"))})
     with ThreadPoolExecutor(max_workers=HTTP_WORKERS) as pool:
         metas = pool.map(lambda key: fetch_meta(session, key[0], key[1], timeout), keys)
         return dict(zip(keys, metas))
@@ -856,33 +1285,47 @@ class RepoScan:
 def scan(config: dict, profile: dict, session: requests.Session) -> tuple[list[RepoScan], dict]:
     timeout = http_timeout(config)
     workspace_dir = get_workspace_dir(config)
+    ecosystems = profile_ecosystems(profile)
     scans: list[RepoScan] = []
     for repo in profile_repos(profile):
         full = repo_full_name(config, repo)
-        synced = sync_workspace_repo(full, workspace_dir, resolve_work_branch(config, repo, preferred=profile))
+        synced = sync_workspace_repo(full, workspace_dir, repo_work_branch(config, repo, profile))
         if not synced:
             scans.append(RepoScan(repo, full, None, None))
             continue
         path, branch = synced
-        deps = build_inventory(repo, path)
+        scope = repo_scope_paths(profile, repo)
+        deps = build_inventory(repo, path, ecosystems, scope)
         direct = sum(1 for d in deps if d.direct)
-        log.info("%s (%s): %d dependencias directas, %d transitivas", full, branch, direct, len(deps) - direct)
+        log.info(
+            "%s (%s%s): %d dependencias directas, %d transitivas",
+            full, branch, f", solo {', '.join(scope)}" if scope else "", direct, len(deps) - direct,
+        )
         scans.append(RepoScan(repo, full, path, branch, deps))
 
     all_deps = [d for s in scans for d in s.deps]
-    queryable = [d for d in all_deps if d.version]
+    resolve_floating_actions(session, all_deps, timeout)
+    versioned = [d for d in all_deps if d.version]
+    queryable = [d for d in versioned if d.ecosystem not in REPORT_ONLY_ECOSYSTEMS]
     vuln_ids = osv_query(session, queryable, timeout)
     details = osv_details(session, {vid for ids in vuln_ids.values() for vid in ids}, timeout)
-    by_dep = {id(queryable[i]): ids for i, ids in vuln_ids.items()}
+    by_dep: dict[int, list[str]] = {}
+    for i, ids in vuln_ids.items():
+        dep = queryable[i]
+        if dep.ecosystem in LOCAL_RANGE_ECOSYSTEMS:
+            # Sin detalle no se puede evaluar el rango: se conserva (mejor un falso positivo).
+            ids = [vid for vid in ids if vid not in details or osv_affects(details[vid], dep)]
+        if ids:
+            by_dep[id(dep)] = ids
     # Ultima version solo hace falta para directas y para transitivas vulnerables.
-    metas = fetch_all_meta(session, [d for d in queryable if d.direct or id(d) in by_dep], timeout)
+    metas = fetch_all_meta(session, [d for d in versioned if d.direct or id(d) in by_dep], timeout)
     for repo_scan in scans:
         findings: list[Finding] = []
         for dep in repo_scan.deps:
             if not dep.version:
                 continue
             advisories = advisories_for(dep, by_dep.get(id(dep), []), details)
-            finding = classify(dep, advisories, metas.get((dep.ecosystem, dep.name), PackageMeta(None, None)).latest)
+            finding = classify(dep, advisories, metas.get(meta_key(dep), PackageMeta(None, None)).latest)
             if finding:
                 findings.append(finding)
         findings.sort(
@@ -923,13 +1366,24 @@ def apply_command(finding: Finding) -> str:
         return f"npm install {'--save-dev ' if dep.dev else ''}{dep.name}@{target}"
     if dep.ecosystem == ECOSYSTEM_PYPI:
         return f"pip install '{dep.name}=={target}'  # y fijar `{dep.name}=={target}` en {dep.manifest}"
+    if dep.ecosystem == ECOSYSTEM_PUB:
+        if not dep.direct:
+            return (f"flutter pub upgrade {dep.name}  # transitiva: debe quedar >= {target} en pubspec.lock; "
+                    f"si el rango del paquete padre no lo permite, agregar `dependency_overrides: {{{dep.name}: ^{target}}}` en pubspec.yaml")
+        return f"flutter pub add {'dev:' if dep.dev else ''}{dep.name}:^{target}"
+    if dep.ecosystem == ECOSYSTEM_ACTIONS:
+        return (f"# en {dep.manifest}: cambiar `uses: {dep.name}@{dep.ref}` por\n"
+                f"#   uses: {dep.name}@<sha-del-tag-v{target}>  # v{target}\n"
+                f"gh api repos/{dep.name}/git/ref/tags/v{target} --jq .object.sha  # SHA del tag (si es anotado, seguir a /git/tags/<sha>)")
     return f"# pom.xml: <version>{target}</version> para {dep.name}"
 
 
 def files_to_edit(dep: Dependency) -> list[str]:
     if dep.ecosystem == ECOSYSTEM_NPM:
         return ["package.json", "package-lock.json"]
-    return [dep.manifest]
+    if dep.ecosystem == ECOSYSTEM_PUB:
+        return ["pubspec.yaml", "pubspec.lock"]
+    return dep.manifest.split(", ")
 
 
 def patch_block(finding: Finding) -> str:
@@ -981,10 +1435,25 @@ def issue_body(config: dict, profile: dict, finding: Finding) -> str:
     for adv in finding.advisories:
         aliases = f" ({', '.join(adv.aliases[:3])})" if adv.aliases else ""
         lines.append(f"- [{adv.id}]({adv.url}){aliases} — {adv.severity} — {adv.summary} — corregido en `{adv.fixed or 'sin fix'}`")
-    if finding.category == SECURITY_PATCH:
+    if finding.category == SECURITY_PATCH and dep.ecosystem in MANUAL_PATCH_ECOSYSTEMS:
         lines += [
             "",
-            f"### Como aplicarlo (rama `{resolve_work_branch(config, dep.repo, preferred=profile)}`)",
+            f"### Como aplicarlo (rama `{repo_work_branch(config, dep.repo, profile)}`)",
+            "```bash",
+            apply_command(finding),
+            "```",
+            f"El fix existe dentro del mismo major, pero el modo Desarrollo aun no tiene parche determinista "
+            f"para {dep.ecosystem}: lleva `needs-human` (no `night-agent`). Verificar con "
+            f"{MANUAL_PATCH_VERIFY.get(dep.ecosystem, 'la verificacion del perfil')} antes de comitear.",
+            "",
+            "Archivos:",
+            *files_to_edit(dep),
+            "",
+        ]
+    elif finding.category == SECURITY_PATCH:
+        lines += [
+            "",
+            f"### Como aplicarlo (rama `{repo_work_branch(config, dep.repo, profile)}`)",
             "```bash",
             apply_command(finding),
             "```",
@@ -1019,7 +1488,8 @@ def issue_body(config: dict, profile: dict, finding: Finding) -> str:
 def issue_labels(config: dict, profile: dict, finding: Finding) -> tuple[list[str], str]:
     """(labels a poner, label opuesto a quitar)."""
     night_label = config.get("github", {}).get("issue_label", "night-agent")
-    first, opposite = (night_label, NEEDS_HUMAN_LABEL) if finding.category == SECURITY_PATCH else (NEEDS_HUMAN_LABEL, night_label)
+    automatic = finding.category == SECURITY_PATCH and finding.dep.ecosystem not in MANUAL_PATCH_ECOSYSTEMS
+    first, opposite = (night_label, NEEDS_HUMAN_LABEL) if automatic else (NEEDS_HUMAN_LABEL, night_label)
     return [first, str(profile["label"]), DEPENDENCIES_LABEL], opposite
 
 
@@ -1196,7 +1666,12 @@ def format_alert(profile: dict, items: list[tuple[Finding, Advisory]], issue_url
     lines = [f"📡 <b>Radar de {html.escape(profile.get('display_name') or profile['name'])}</b>", "Vulnerabilidades en dependencias de produccion:"]
     for finding, adv in items:
         dep = finding.dep
-        accion = "parche automatico esta noche" if finding.category == SECURITY_PATCH else "requiere humano (major)"
+        if finding.category != SECURITY_PATCH:
+            accion = "requiere humano (major)"
+        elif dep.ecosystem in MANUAL_PATCH_ECOSYSTEMS:
+            accion = f"parche manual ({dep.ecosystem} sin parche automatico)"
+        else:
+            accion = "parche automatico esta noche"
         url = issue_urls.get(f"{dep.repo}:{dep.name}")
         lines.append(
             f"• <b>{html.escape(adv.severity)}</b> <code>{html.escape(dep.name)}</code> {html.escape(str(dep.version))}"
@@ -1313,13 +1788,18 @@ def find_usages(repo_path: Path, dep: Dependency) -> list[str]:
     elif dep.ecosystem == ECOSYSTEM_PYPI:
         module = re.escape(re.sub(r"[-.]", "_", dep.name).lower())
         pattern = re.compile(rf"^\s*(?:from|import)\s+{module}\b", re.IGNORECASE)
+    elif dep.ecosystem == ECOSYSTEM_PUB:
+        pattern = re.compile(r"""^\s*(?:import|export)\s+['"]package:""" + re.escape(dep.name) + "/")
+    elif dep.ecosystem == ECOSYSTEM_ACTIONS:
+        pattern = re.compile(r"uses:\s*['\"]?" + re.escape(dep.name) + r"[/@]")
     else:
         pattern = re.compile(re.escape(dep.name.split(":")[0]))
+    suffixes = (".yml", ".yaml") if dep.ecosystem == ECOSYSTEM_ACTIONS else SOURCE_SUFFIXES
     hits: list[str] = []
     for root, dirs, files in os.walk(repo_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for name in files:
-            if not name.endswith(SOURCE_SUFFIXES):
+            if not name.endswith(suffixes):
                 continue
             file_path = Path(root) / name
             try:
@@ -1341,7 +1821,7 @@ def build_summary_prompt(profile: dict, finding: Finding, target: str, notes: st
         part
         for part in [
             f"Eres el radar tecnologico de {profile.get('display_name') or profile['name']} "
-            f"(rol {profile.get('role')}, stack: {', '.join(profile.get('frameworks') or [])}).",
+            f"(rol {profile.get('role')}, stack: {', '.join(profile.get('frameworks') or profile.get('tools') or [])}).",
             f"Paquete {dep.ecosystem} `{dep.name}`: usamos `{dep.version}`, objetivo `{target}`.",
             f"Advisories de seguridad:\n{advisories}" if advisories else "",
             f"Donde lo usamos (repos en el directorio actual o sus vecinos):\n{usage_text}",
@@ -1387,7 +1867,7 @@ def weekly_candidates(scans: list[RepoScan]) -> list[tuple[Finding, str, list[Re
     grouped: dict[tuple, tuple[Finding, str, list[RepoScan]]] = {}
     for repo_scan in scans:
         for finding in repo_scan.findings:
-            if finding.category not in (SECURITY_MAJOR, OUTDATED_MAJOR):
+            if finding.category not in (SECURITY_MAJOR, OUTDATED_MAJOR) or finding.dep.ecosystem in REPORT_ONLY_ECOSYSTEMS:
                 continue
             target = finding.target or finding.latest
             if not target:
@@ -1417,7 +1897,7 @@ def run_weekly_summaries(
             log.info("Tope de %d resumenes semanales alcanzado; %s queda para la proxima semana", cap, dep.name)
             continue
         used += 1
-        gh_repo = metas.get((dep.ecosystem, dep.name), PackageMeta(None, None)).github_repo
+        gh_repo = metas.get(meta_key(dep), PackageMeta(None, None)).github_repo
         notes = fetch_release_notes(session, gh_repo, dep.ecosystem, dep.version, target, timeout) if gh_repo else ""
         if dry_run:
             print(f"  [semanal] {dep.name} {dep.version} -> {target}: release notes de {gh_repo or '?'} "
@@ -1460,10 +1940,15 @@ def render_text(profile: dict, scans: list[RepoScan], markdown: bool = False) ->
             continue
         direct = [d for d in repo_scan.deps if d.direct]
         out.append(f"  Inventario ({len(direct)} dependencias directas):")
+        width = max([5] + [len(d.ecosystem) for d in direct])
         for dep in sorted(direct, key=lambda d: (d.ecosystem, d.dev, d.name.lower())):
             scope = "dev " if dep.dev else "prod"
-            out.append(f"    {dep.ecosystem:<5} {scope} {dep.name:<45} {dep.version or '-':<16} ({dep.version_source}, {dep.manifest})")
+            out.append(f"    {dep.ecosystem:<{width}} {scope} {dep.name:<45} {dep.version or '-':<16} ({dep.version_source}, {dep.manifest})")
         out.append(f"  Transitivas: {len(repo_scan.deps) - len(direct)} (solo se revisan vulnerabilidades)")
+        unpinned = [d for d in direct if d.ecosystem in (ECOSYSTEM_ACTIONS, ECOSYSTEM_DOCKER) and not d.version]
+        if unpinned:
+            out.append(f"  Sin version fija ({len(unpinned)}; sin OSV ni ultima version):")
+            out += [f"    {d.ecosystem}: {d.name}{'@' + d.ref if d.ref else ''} ({d.version_source}, {d.manifest})" for d in unpinned]
         out.append(f"  Hallazgos ({len(repo_scan.findings)}):")
         if not repo_scan.findings:
             out.append("    (ninguno)")
@@ -1496,6 +1981,13 @@ async def run(specialist: str, dry_run: bool, weekly: bool) -> int:
         return 2
     profile = specialists[specialist]
     log.info("📡 Radar de %s (%s%s)", specialist_display(profile), "dry-run" if dry_run else "real", ", semanal" if weekly else "")
+    if not profile_repos(profile):
+        # Perfil sin repos: no hay nada que inventariar; sin workspace, OSV,
+        # issues, Telegram, Claude, estado ni reporte.
+        log.info("%s no tiene repos asignados en su perfil; el radar no tiene nada que revisar", specialist_display(profile))
+        if dry_run:
+            print(f"Radar de {profile.get('display_name') or profile['name']}: sin repos asignados en el perfil, nada que revisar.")
+        return 0
 
     session = requests.Session()
     session.headers["User-Agent"] = "batcave-radar/1.0"
@@ -1533,7 +2025,7 @@ async def run(specialist: str, dry_run: bool, weekly: bool) -> int:
                     except Exception as exc:
                         log.error("No se pudo cerrar el issue de %s en %s: %s", finding.dep.name, repo_scan.full_name, exc)
                     continue
-                if finding.category not in (SECURITY_PATCH, SECURITY_MAJOR):
+                if finding.category not in (SECURITY_PATCH, SECURITY_MAJOR) or finding.dep.ecosystem in REPORT_ONLY_ECOSYSTEMS:
                     continue
                 labels, opposite = issue_labels(config, profile, finding)
                 try:
