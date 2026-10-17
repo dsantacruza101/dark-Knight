@@ -118,7 +118,11 @@ from modes.development import (
     git_cmd,
     github_auth_env,
     is_forbidden_path,
+    UV_LOCK,
+    is_test_db_var,
     load_specialists,
+    profile_repos,
+    python_test_env,
     read_repo_claude_md,
     remove_aider_artifacts,
     repo_is_clean,
@@ -386,18 +390,27 @@ def get_origin_url(prod_repo_path: Path) -> Optional[str]:
     return url or None
 
 
-def repo_work_branch(config: dict, prod_repo_path: Path, specialists: dict[str, dict]) -> str:
-    """Rama de trabajo del repo de produccion `prod_repo_path`: se busca su
-    nombre de GitHub en `repo_paths` (si no esta, el nombre del directorio)
-    y se resuelve con `resolve_work_branch` (work_branch del perfil, default
-    `github.work_branch`)."""
+def repo_github_name(config: dict, prod_repo_path: Path) -> str:
+    """Nombre de GitHub del repo de produccion `prod_repo_path` segun
+    `repo_paths` (si no esta, el nombre del directorio)."""
     resolved = prod_repo_path.expanduser().resolve()
-    repo_name = prod_repo_path.name
     for name, raw in (config.get("repo_paths") or {}).items():
         if Path(raw).expanduser().resolve() == resolved:
-            repo_name = name
-            break
-    return resolve_work_branch(config, repo_name, specialists)
+            return name
+    return prod_repo_path.name
+
+
+def repo_work_branch(config: dict, prod_repo_path: Path, specialists: dict[str, dict]) -> str:
+    """Rama de trabajo del repo de produccion `prod_repo_path`: su nombre de
+    GitHub (`repo_github_name`) resuelto con `resolve_work_branch`
+    (work_branch del perfil, default `github.work_branch`)."""
+    return resolve_work_branch(config, repo_github_name(config, prod_repo_path), specialists)
+
+
+def repo_profile(config: dict, prod_repo_path: Path, specialists: dict[str, dict]) -> Optional[dict]:
+    """Perfil de especialista dueño del repo (el primero que lo lista en `repos`), o None."""
+    name = repo_github_name(config, prod_repo_path)
+    return next((p for p in specialists.values() if name in profile_repos(p)), None)
 
 
 def setup_workspace_repo(
@@ -456,7 +469,7 @@ def setup_workspace_repo(
 def detect_stack(repo_path: Path) -> str:
     if (repo_path / "package.json").exists():
         return "node"
-    if (repo_path / "requirements.txt").exists() or any(repo_path.glob("*.py")):
+    if (repo_path / "requirements.txt").exists() or (repo_path / UV_LOCK).exists() or any(repo_path.glob("*.py")):
         return "python"
     return "unknown"
 
@@ -588,15 +601,21 @@ def parse_pytest_counts(output: str) -> tuple[int, int]:
     return passed, failed
 
 
-def run_python_tests(repo_path: Path) -> dict:
+def run_python_tests(repo_path: Path, test_env: Optional[dict] = None) -> dict:
+    """Suite completa de pytest. Repo uv (`uv.lock`): `uv run --locked
+    pytest` con el entorno seguro del perfil (`test_env`) y sin variables
+    `*DATABASE_URL*`; si no, pytest del venv del repo (o python3)."""
     if not (repo_path / "tests").exists():
         return {"status": "sin_tests", "passed": 0, "failed": 0, "coverage_pct": None, "output": ""}
 
-    python_bin = venv_python(repo_path) or "python3"
-    env = {**os.environ, "CI": "true"}
-    proc, timed_out = _run_with_timeout(
-        [python_bin, "-m", "pytest", "--tb=short", "-q"], cwd=repo_path, timeout=TEST_TIMEOUT_SECONDS, env=env
-    )
+    if (repo_path / UV_LOCK).exists():
+        env = {k: v for k, v in os.environ.items() if not is_test_db_var(k)}
+        env.update({**(test_env or {}), "CI": "true"})
+        cmd = ["uv", "run", "--locked", "pytest", "--tb=short", "-q"]
+    else:
+        env = {**os.environ, "CI": "true"}
+        cmd = [venv_python(repo_path) or "python3", "-m", "pytest", "--tb=short", "-q"]
+    proc, timed_out = _run_with_timeout(cmd, cwd=repo_path, timeout=TEST_TIMEOUT_SECONDS, env=env)
     output = (proc.stdout + "\n" + proc.stderr)[-20000:]
     if timed_out:
         return {"status": "timeout", "passed": 0, "failed": 0, "coverage_pct": None, "output": output}
@@ -942,14 +961,28 @@ def run_single_node_test(repo_path: Path, test_rel: str) -> bool:
     return executed > 0 and failed == 0
 
 
-def run_single_python_test(repo_path: Path, test_rel: str) -> bool:
+def run_single_python_test(repo_path: Path, test_rel: str, test_env: Optional[dict] = None) -> bool:
+    """Repo uv (`uv.lock`): runner por archivo del modo Desarrollo
+    (`run_test_file` -> `uv run --locked pytest <archivo> --no-cov -q`, con
+    el entorno seguro del perfil y sin `*DATABASE_URL*`; exige > 0 tests y 0
+    fallidos). Si no, `pytest` del venv del repo (o python3)."""
+    if (repo_path / UV_LOCK).exists():
+        executed, failed, _ = run_test_file(repo_path, test_rel, "pytest", test_env)
+        log.info("%s: %s -> %d test(s) ejecutados, %d fallido(s)", repo_path.name, test_rel, executed, failed)
+        return executed > 0 and failed == 0
     python_bin = venv_python(repo_path) or "python3"
     proc = run_cli([python_bin, "-m", "pytest", test_rel, "--tb=short", "-q"], cwd=repo_path, timeout=SINGLE_TEST_TIMEOUT)
     return proc.returncode == 0
 
 
 def generate_tests_for_repo(
-    repo_path: Path, stack: str, branch: str, candidates: list[str], model: str, max_files: int
+    repo_path: Path,
+    stack: str,
+    branch: str,
+    candidates: list[str],
+    model: str,
+    max_files: int,
+    test_env: Optional[dict] = None,
 ) -> list[dict]:
     claude_md = read_repo_claude_md(repo_path)
     if stack == "node":
@@ -976,7 +1009,7 @@ def generate_tests_for_repo(
             continue
 
         passed = (
-            run_single_node_test(repo_path, test_rel) if stack == "node" else run_single_python_test(repo_path, test_rel)
+            run_single_node_test(repo_path, test_rel) if stack == "node" else run_single_python_test(repo_path, test_rel, test_env)
         )
         if passed:
             # Solo se stagea el test generado; cualquier otro cambio (p. ej.
@@ -1304,6 +1337,7 @@ async def audit_repo(
     repo_name = display_repo_name(repo_path)
     state_entry = state.setdefault(str(repo_path), {})
     work_branch = repo_work_branch(config, repo_path, specialists or {})
+    profile = repo_profile(config, repo_path, specialists or {})
 
     if dry_run:
         log.info("[dry-run] %s: rama de trabajo -> %s", repo_name, work_branch)
@@ -1338,7 +1372,7 @@ async def audit_repo(
         lint_output = run_node_lint(repo_path)
         audit_vulns = run_node_audit(repo_path)
     elif stack == "python":
-        test_result = run_python_tests(repo_path)
+        test_result = run_python_tests(repo_path, python_test_env(repo_path, profile))
         py_compile_errors = run_py_compile(repo_path)
         audit_vulns = run_pip_audit(repo_path)
     else:
@@ -1407,7 +1441,8 @@ async def audit_repo(
 
             if candidates:
                 model = config["models"]["aider"]
-                generated = generate_tests_for_repo(repo_path, stack, branch, candidates, model, max_files)
+                test_env = python_test_env(repo_path, profile) if stack == "python" else {}
+                generated = generate_tests_for_repo(repo_path, stack, branch, candidates, model, max_files, test_env)
                 for item in generated:
                     if item["status"] == "committed":
                         update_memory("test_generated_success", file=item["file"], framework=stack, branch=branch)

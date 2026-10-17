@@ -19,7 +19,11 @@ Dependencias directas: `package.json` (+ version instalada de
 `requirements-dev.txt` (dev), `pyproject.toml`, `pom.xml` y `pubspec.yaml`
 (+ version resuelta de `pubspec.lock`). Transitivas: todo lo demas de
 `package-lock.json`, `requirements.txt` (pip freeze), `requirements*.lock`
-(pip-compile) y `pubspec.lock`.
+(pip-compile) y `pubspec.lock`. Proyectos uv (`uv.lock`): directas de
+`[project.dependencies]` (produccion) y `[project.optional-dependencies]` +
+`[dependency-groups]` (desarrollo), todas con la version exacta del lock;
+transitivas = resto del lock (produccion si se alcanzan desde las directas de
+produccion). Manifiesto `uv.lock`: parche `uv lock --upgrade-package`.
 
 Ecosistemas por perfil (`radar_ecosystems`, default npm/PyPI/Maven/Pub).
 Spoiler agrega:
@@ -105,6 +109,7 @@ from packaging.version import InvalidVersion, Version
 from batcave.secrets import mask_secrets
 from modes.development import (
     COMPOSE_FILE_GLOBS,
+    UV_LOCK,
     build_clone_url,
     git_cmd,
     github_auth_env,
@@ -566,10 +571,100 @@ def read_requirements(path: Path, repo: str, dev: bool) -> list[Dependency]:
     return [d for d in (parse_requirement(line, repo, path.name, dev) for line in lines) if d]
 
 
+def read_toml(path: Path, repo: str) -> dict:
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        log.error("%s: %s invalido: %s", repo, path.name, exc)
+        return {}
+
+
+def inventory_uv(repo: str, path: Path) -> list[Dependency]:
+    """Proyecto uv: version EXACTA de cada paquete desde `uv.lock`.
+
+    Directas: `[project.dependencies]` (produccion) y
+    `[project.optional-dependencies]` + `[dependency-groups]` (desarrollo) de
+    `pyproject.toml`. Transitivas: el resto de paquetes del lock con fuente de
+    registry (se omiten el propio proyecto, `editable`/`virtual`/`path`/`git`).
+    Una transitiva es de produccion si se alcanza desde las dependencias de
+    produccion del proyecto en el grafo del lock (extras incluidos); si solo
+    la traen grupos/extras, es de desarrollo. Todo lleva manifiesto
+    `uv.lock`: el parche determinista es `uv lock --upgrade-package`."""
+    lock = read_toml(path / UV_LOCK, repo)
+    pyproject = read_toml(path / "pyproject.toml", repo)
+    project = pyproject.get("project") or {}
+    by_name: dict[str, list[dict]] = {}
+    for pkg in lock.get("package") or []:
+        if isinstance(pkg, dict) and pkg.get("name"):
+            by_name.setdefault(py_key(str(pkg["name"])), []).append(pkg)
+    root_key = py_key(str(project.get("name") or ""))
+
+    def requirements(lines) -> list[tuple[str, list[str]]]:
+        """(paquete, extras) de una lista PEP 508 ([dependency-groups] admite {include-group = ...}: se omite)."""
+        out = []
+        for line in lines or []:
+            match = REQ_LINE_RE.match(line.split("#", 1)[0].split(";", 1)[0].strip()) if isinstance(line, str) else None
+            if match and match.group(1).lower() not in PY_SKIP_NAMES:
+                extras = [e.strip() for e in (match.group(2) or "").strip("[]").split(",") if e.strip()]
+                out.append((py_key(match.group(1)), extras))
+        return out
+
+    prod_direct = requirements(project.get("dependencies"))
+    dev_groups = [*(project.get("optional-dependencies") or {}).values(), *(pyproject.get("dependency-groups") or {}).values()]
+    dev_direct = [req for lines in dev_groups for req in requirements(lines)]
+
+    def reachable(start: list[tuple[str, list[str]]]) -> set[str]:
+        """Paquetes alcanzables en el grafo del lock (solo los extras pedidos)."""
+        seen: set[tuple[str, str]] = set()
+        stack = [(key, extra) for key, extras in start for extra in ["", *extras]]
+        while stack:
+            key, extra = stack.pop()
+            if (key, extra) in seen or key == root_key:
+                continue
+            seen.add((key, extra))
+            for pkg in by_name.get(key, []):
+                edges = pkg.get("dependencies") if not extra else (pkg.get("optional-dependencies") or {}).get(extra)
+                for edge in edges or []:
+                    if isinstance(edge, dict) and edge.get("name"):
+                        stack += [(py_key(str(edge["name"])), e) for e in ["", *(edge.get("extra") or [])]]
+        return {key for key, _ in seen}
+
+    prod_keys = reachable(prod_direct)
+    prod_direct_keys = [key for key, _ in prod_direct]
+    dev_direct_keys = [key for key, _ in dev_direct]
+    deps: list[Dependency] = []
+    seen_direct: set[str] = set()
+    for names, dev in ((prod_direct_keys, False), (dev_direct_keys, True)):
+        for key in names:
+            if key in seen_direct:
+                continue
+            seen_direct.add(key)
+            dev = dev and key not in prod_keys  # un grupo dev que produccion tambien trae: cuenta como produccion
+            locked = [p for p in by_name.get(key, []) if "registry" in (p.get("source") or {})]
+            if not locked:
+                deps.append(Dependency(repo, ECOSYSTEM_PYPI, key, None, "sin-version", UV_LOCK, dev))
+                continue
+            for pkg in locked:
+                deps.append(Dependency(repo, ECOSYSTEM_PYPI, str(pkg["name"]), str(pkg.get("version") or "") or None, "lock", UV_LOCK, dev))
+    for key, pkgs in by_name.items():
+        if key in seen_direct or key == root_key:
+            continue
+        for pkg in pkgs:
+            if "registry" not in (pkg.get("source") or {}) or not pkg.get("version"):
+                continue
+            deps.append(
+                Dependency(repo, ECOSYSTEM_PYPI, str(pkg["name"]), str(pkg["version"]), "lock", UV_LOCK, key not in prod_keys, direct=False)
+            )
+    return deps
+
+
 def inventory_python(repo: str, path: Path) -> list[Dependency]:
     """Directas: `requirements.in` (si existe; si no, `requirements.txt`) +
     `requirements-dev.txt` + `pyproject.toml`. Transitivas: el resto de los
-    pines exactos de `requirements.txt` (pip freeze) y `requirements*.lock`."""
+    pines exactos de `requirements.txt` (pip freeze) y `requirements*.lock`.
+    Con `uv.lock` el inventario es `inventory_uv` (el lock manda)."""
+    if (path / UV_LOCK).exists():
+        return inventory_uv(repo, path)
     deps: dict[str, Dependency] = {}
 
     def add(dep: Optional[Dependency]) -> None:
@@ -1364,6 +1459,9 @@ def apply_command(finding: Finding) -> str:
             return (f"npm update {dep.name}  # transitiva: debe quedar >= {target} en package-lock.json; "
                     f"si el rango del paquete padre no lo permite, agregar \"overrides\": {{\"{dep.name}\": \"^{target}\"}} en package.json")
         return f"npm install {'--save-dev ' if dep.dev else ''}{dep.name}@{target}"
+    if dep.ecosystem == ECOSYSTEM_PYPI and dep.manifest == UV_LOCK:
+        return (f"uv lock --upgrade-package '{dep.name}=={target}' && uv sync --locked"
+                f"  # si pyproject.toml lo impide, subir la cota minima a >={target}")
     if dep.ecosystem == ECOSYSTEM_PYPI:
         return f"pip install '{dep.name}=={target}'  # y fijar `{dep.name}=={target}` en {dep.manifest}"
     if dep.ecosystem == ECOSYSTEM_PUB:
@@ -1383,6 +1481,8 @@ def files_to_edit(dep: Dependency) -> list[str]:
         return ["package.json", "package-lock.json"]
     if dep.ecosystem == ECOSYSTEM_PUB:
         return ["pubspec.yaml", "pubspec.lock"]
+    if dep.manifest == UV_LOCK:
+        return [UV_LOCK, "pyproject.toml"]
     return dep.manifest.split(", ")
 
 

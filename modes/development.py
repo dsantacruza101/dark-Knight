@@ -186,6 +186,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections import Counter
 from datetime import datetime, timedelta
 from fnmatch import fnmatchcase
@@ -216,6 +217,7 @@ DEFAULT_WORK_BRANCH = "dev"
 PROTECTED_BRANCHES = ("main", "master")
 TEST_RUNNERS = ("auto", "vitest", "jest", "pytest", "flutter")
 VITEST_CONFIG_GLOBS = ("vitest.config.*", "vitest.workspace.*")
+UV_LOCK = "uv.lock"  # repo Python gestionado con uv: pytest por archivo y parches via `uv`
 
 DEFAULT_MAX_CLAUDE_ESCALATIONS = 2
 DEFAULT_CLAUDE_TIMEOUT = 1800
@@ -246,6 +248,9 @@ REQ_PIN_LINE_RE = re.compile(
     r"((?:(?:===|==|~=|>=|>|<=|<|!=)\s*[^;#\s,]+\s*,?\s*)*)(.*)$"
 )
 PATCH_FILES = {"npm": ["package.json", "package-lock.json"], "PyPI": ["requirements.txt"]}
+# Repos uv: uv.lock siempre; pyproject.toml solo cambia si hubo que subir una cota minima.
+UV_PATCH_FILES = ["uv.lock", "pyproject.toml"]
+UV_SYNC_TIMEOUT = 900
 NPM_QUIET_FLAGS = ["--no-audit", "--no-fund"]
 OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
 OSV_TIMEOUT = 30
@@ -1032,14 +1037,21 @@ def validate_allowed_file_content(repo_path: Path, allowed_files: list[str]) -> 
 
 
 def run_cli(
-    cmd: list[str], cwd: Optional[Path] = None, timeout: int = 600, extra_env: Optional[dict] = None
+    cmd: list[str],
+    cwd: Optional[Path] = None,
+    timeout: int = 600,
+    extra_env: Optional[dict] = None,
+    drop_env=None,
 ) -> subprocess.CompletedProcess:
     """Ejecuta `cmd`. Si `extra_env` viene dado (p. ej. `github_auth_env()`),
     se funde con `os.environ` y se pasa solo al proceso hijo: el header de
     autenticacion nunca forma parte de `cmd`, asi que no aparece en el log
-    de abajo ni en `ps`/`/proc/<pid>/cmdline`."""
+    de abajo ni en `ps`/`/proc/<pid>/cmdline`. `drop_env` (callable sobre el
+    nombre) quita variables heredadas del entorno del hijo."""
     log.info("Ejecutando: %s (cwd=%s)", mask_secrets(" ".join(cmd)), cwd)
     env = {**os.environ, **extra_env} if extra_env else None
+    if drop_env is not None:
+        env = {k: v for k, v in (env or os.environ).items() if not drop_env(k)}
     try:
         return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1630,34 +1642,89 @@ def run_flutter_file(repo_path: Path, rel: str) -> tuple[int, int, str]:
     return executed, failed, output
 
 
-def run_test_file(repo_path: Path, rel: str, runner: str = "auto") -> tuple[int, int, str]:
+def uv_lock_packages(repo_path: Path) -> list[dict]:
+    """Entradas `[[package]]` del `uv.lock` del repo ([] si no hay o es ilegible)."""
+    lock_path = repo_path / UV_LOCK
+    if not lock_path.exists():
+        return []
+    try:
+        data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        log.warning("%s: uv.lock ilegible: %s", repo_path.name, exc)
+        return []
+    return [p for p in data.get("package") or [] if isinstance(p, dict)]
+
+
+def uv_locked_versions(repo_path: Path, package: str) -> list[str]:
+    """Versiones de `package` en el uv.lock (puede haber varias por marcadores)."""
+    return sorted(
+        {str(p["version"]) for p in uv_lock_packages(repo_path) if py_key(str(p.get("name", ""))) == py_key(package) and p.get("version")}
+    )
+
+
+def is_test_db_var(name: str) -> bool:
+    """Variables de conexion a una base real (`*DATABASE_URL*`): nunca llegan a los tests por archivo."""
+    return "DATABASE_URL" in name.upper()
+
+
+def python_test_env(repo_path: Path, profile: Optional[dict]) -> dict:
+    """Entorno seguro para pytest por archivo: las asignaciones `VAR=valor`
+    del paso pytest del perfil en los stacks detectados del repo (p. ej.
+    `PENGUIN_ENV_FILE=/nonexistent/penguin.env` en Red Robin), asi el test
+    corre con el mismo entorno que la suite completa de la verificacion."""
+    env: dict[str, str] = {}
+    for _name, stack in detected_stacks(repo_path, profile or {}):
+        for step in stack.get("steps", []):
+            command = str(step.get("cmd") or "")
+            if "pytest" in command:
+                env.update(split_env_prefix(command)[0])
+    return env
+
+
+def run_pytest_file(repo_path: Path, rel: str, env: Optional[dict] = None) -> tuple[int, int, str]:
+    """pytest apuntado a `rel`. Repo uv (`uv.lock`): `uv run --locked pytest
+    <rel> --no-cov -q` (el venv bloqueado del repo; `--no-cov` evita que el
+    `fail_under` de cobertura de la suite completa tumbe un solo archivo, y
+    solo se pasa si pytest-cov esta en el lock); si no, `python3 -m pytest`.
+    Siempre con `env` (entorno seguro del perfil) y sin variables
+    `*DATABASE_URL*` heredadas: nunca una base real. Ejecutados = passed +
+    failed + errors."""
+    if (repo_path / UV_LOCK).exists():
+        no_cov = ["--no-cov"] if uv_locked_versions(repo_path, "pytest-cov") else []
+        cmd = ["uv", "run", "--locked", "pytest", rel, *no_cov, "-q", "-p", "no:cacheprovider"]
+    else:
+        cmd = ["python3", "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"]
+    proc = run_cli(cmd, cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT, extra_env=env or None, drop_env=is_test_db_var)
+    output = mask_secrets(proc.stdout + proc.stderr)
+    summaries = PYTEST_SUMMARY_LINE_RE.findall(output)
+    summary = summaries[-1] if summaries else ""
+    counts = {
+        name: sum(int(n) for n in regex.findall(summary))
+        for name, regex in (("passed", PYTEST_PASSED_RE), ("failed", PYTEST_FAILED_RE), ("errors", PYTEST_ERRORS_RE))
+    }
+    failed = counts["failed"] + counts["errors"]
+    if proc.returncode not in (0, 5) and failed == 0:
+        failed = 1
+    return counts["passed"] + failed, failed, output
+
+
+def run_test_file(
+    repo_path: Path, rel: str, runner: str = "auto", env: Optional[dict] = None
+) -> tuple[int, int, str]:
     """Corre el runner apuntando SOLO a `rel`. Devuelve (tests ejecutados,
     fallidos, salida). El runner sale de `detect_test_runner` (`test_runner`
     del perfil: auto|vitest|jest|pytest). Vitest: `run_vitest_file`. Jest:
     `npm test -- --runTestsByPath <rel>` con `--json` a un archivo temporal
     fuera del repo (fallback: linea `Tests:` del texto, exigiendo que el
-    archivo aparezca en la salida). Python: `pytest <rel>`; ejecutados =
-    passed + failed + errors."""
+    archivo aparezca en la salida). Python: `run_pytest_file` (uv si hay
+    `uv.lock`), con `env` = `python_test_env` del perfil."""
     runner = detect_test_runner(repo_path, rel, runner)
     if runner == "vitest":
         return run_vitest_file(repo_path, rel)
     if runner == "flutter":
         return run_flutter_file(repo_path, rel)
     if runner == "pytest":
-        proc = run_cli(
-            ["python3", "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"], cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT
-        )
-        output = mask_secrets(proc.stdout + proc.stderr)
-        summaries = PYTEST_SUMMARY_LINE_RE.findall(output)
-        summary = summaries[-1] if summaries else ""
-        counts = {
-            name: sum(int(n) for n in regex.findall(summary))
-            for name, regex in (("passed", PYTEST_PASSED_RE), ("failed", PYTEST_FAILED_RE), ("errors", PYTEST_ERRORS_RE))
-        }
-        failed = counts["failed"] + counts["errors"]
-        if proc.returncode not in (0, 5) and failed == 0:
-            failed = 1
-        return counts["passed"] + failed, failed, output
+        return run_pytest_file(repo_path, rel, env)
 
     with tempfile.TemporaryDirectory(prefix="nightwing-jest-") as tmp:
         report_path = Path(tmp) / "jest.json"
@@ -1686,7 +1753,7 @@ def run_test_file(repo_path: Path, rel: str, runner: str = "auto") -> tuple[int,
 
 
 def verify_test_files(
-    repo_path: Path, test_files: list[str], runner: str = "auto"
+    repo_path: Path, test_files: list[str], runner: str = "auto", env: Optional[dict] = None
 ) -> tuple[list[str], list[str], dict[str, dict]]:
     """Cada archivo de test permitido debe ejecutar > 0 tests y 0 fallidos
     corriendo su runner apuntado a ese archivo. Devuelve (errores, salidas
@@ -1697,7 +1764,7 @@ def verify_test_files(
     for rel in test_files:
         if not (repo_path / rel).is_file():
             continue
-        executed, failed, output = run_test_file(repo_path, rel, runner)
+        executed, failed, output = run_test_file(repo_path, rel, runner, env)
         counts[rel] = {"executed": executed, "failed": failed, "runner": detect_test_runner(repo_path, rel, runner)}
         if executed == 0 or failed > 0:
             errors.append(f"{rel}: {executed} test(s) ejecutados, {failed} fallido(s) (se exige > 0 y 0)")
@@ -1745,7 +1812,9 @@ def verify_changes(
     errors.extend(step_errors)
     full_outputs.extend(step_full)
 
-    test_errors, test_full, test_counts = verify_test_files(repo_path, test_files, profile.get("test_runner", "auto"))
+    test_errors, test_full, test_counts = verify_test_files(
+        repo_path, test_files, profile.get("test_runner", "auto"), python_test_env(repo_path, profile)
+    )
     errors.extend(test_errors)
     full_outputs.extend(test_full)
 
@@ -2029,6 +2098,9 @@ def describe_dependency_patch(patch: dict) -> str:
         if patch["direct"]:
             return f"npm install {'-D ' if patch['dev'] else ''}{pkg}@{to}"
         return f"npm update {pkg} (+ overrides {{\"{pkg}\": \"{to}\"}} y npm install si el lock sigue vulnerable)"
+    if patch["manifest"] == UV_LOCK:
+        return (f"uv lock --upgrade-package {pkg}=={to} + uv sync --locked "
+                f"(cota minima >={to} en pyproject.toml solo si hace falta)")
     return f"fijar {pkg}=={to} en requirements.txt"
 
 
@@ -2037,9 +2109,11 @@ def py_key(name: str) -> str:
 
 
 def installed_versions(repo_path: Path, patch: dict) -> list[str]:
-    """Versiones del paquete que quedan en el lock (npm, anidadas incluidas)
-    o el pin de requirements.txt (PyPI)."""
+    """Versiones del paquete que quedan en el lock (npm, anidadas incluidas;
+    uv.lock en repos uv) o el pin de requirements.txt (PyPI)."""
     package = patch["package"]
+    if is_uv_patch(repo_path, patch):
+        return uv_locked_versions(repo_path, package)
     if patch["ecosystem"] == "npm":
         # Import tardio: batcave.radar importa este modulo.
         from batcave.radar import lock_all_packages
@@ -2109,9 +2183,9 @@ class PatchLog:
     def step(self, label: str, ok: bool, detail: str = "", seconds: float = 0.0) -> None:
         self.steps.append((label, ok, detail, seconds))
 
-    def run(self, cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    def run(self, cmd: list[str], cwd: Path, timeout: int = DEFAULT_STEP_TIMEOUT) -> subprocess.CompletedProcess:
         started = datetime.now()
-        proc = run_cli(cmd, cwd=cwd, timeout=DEFAULT_STEP_TIMEOUT)
+        proc = run_cli(cmd, cwd=cwd, timeout=timeout)
         command = " ".join(cmd)
         self.note(f"{command} (codigo {proc.returncode})", (proc.stdout + proc.stderr).strip()[-6000:])
         self.step(command, proc.returncode == 0, f"codigo {proc.returncode}", (datetime.now() - started).total_seconds())
@@ -2380,6 +2454,119 @@ def pin_requirement(repo_path: Path, patch: dict, plog: PatchLog) -> str:
     return ""
 
 
+def is_uv_patch(repo_path: Path, patch: dict) -> bool:
+    """Parche PyPI en un repo uv: se aplica con `uv lock`, no en requirements.txt."""
+    return patch["ecosystem"] == "PyPI" and (repo_path / UV_LOCK).exists()
+
+
+def patch_files(repo_path: Path, patch: dict) -> list[str]:
+    """Archivos que el parche puede tocar (lista permitida del candado y del commit)."""
+    return UV_PATCH_FILES if is_uv_patch(repo_path, patch) else PATCH_FILES[patch["ecosystem"]]
+
+
+def raised_requirement(requirement: str, target: str) -> tuple[Optional[str], str]:
+    """Requisito PEP 508 de pyproject.toml ajustado para admitir `target`.
+
+    Si ya lo admite -> (None, ''): no se toca. Si lo excluye una cota minima
+    (`>=`/`>`) se sube a `>=target`; un pin `==` pasa a `==target`. Si lo
+    excluye una cota superior, `!=` o `~=`, no se toca y se devuelve el error
+    (subir eso es decision de un humano)."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        req = Requirement(requirement)
+        version = Version(target)
+    except (InvalidRequirement, InvalidVersion) as exc:
+        return None, f"no se pudo interpretar `{requirement}` / {target}: {exc}"
+    if req.specifier.contains(version, prereleases=True):
+        return None, ""
+    specs: list[str] = []
+    for spec in req.specifier:
+        if spec.contains(version, prereleases=True):
+            specs.append(str(spec))
+        elif spec.operator in (">=", ">"):
+            specs.append(f">={target}")
+        elif spec.operator in ("==", "==="):
+            specs.append(f"=={target}")
+        else:
+            return None, f"`{requirement}` en pyproject.toml excluye {target} por `{spec}` (no es una cota minima)"
+    extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+    marker = f"; {req.marker}" if req.marker else ""
+    return f"{req.name}{extras}{','.join(dict.fromkeys(specs))}{marker}", ""
+
+
+def raise_pyproject_lower_bound(repo_path: Path, package: str, target: str, plog: PatchLog) -> str:
+    """Sube en pyproject.toml la cota minima de `package` SOLO si su requisito
+    actual excluye `target` (dependencies, optional-dependencies y
+    dependency-groups). Reemplaza el texto exacto del requisito (conserva el
+    resto del archivo). Devuelve error ('' si no hizo falta o se aplico)."""
+    pyproject = repo_path / "pyproject.toml"
+    if not pyproject.exists():
+        return ""
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return f"pyproject.toml ilegible: {exc}"
+    project = data.get("project") or {}
+    lists = [project.get("dependencies") or [], *(project.get("optional-dependencies") or {}).values(),
+             *(data.get("dependency-groups") or {}).values()]
+    changes: dict[str, str] = {}
+    for line in (item for lst in lists for item in lst if isinstance(item, str)):
+        match = REQ_PIN_LINE_RE.match(line)
+        if not match or py_key(match.group(1)) != py_key(package):
+            continue
+        new, error = raised_requirement(line, target)
+        if error:
+            return error
+        if new:
+            changes[line] = new
+    for old, new in changes.items():
+        replaced = text.replace(f'"{old}"', f'"{new}"').replace(f"'{old}'", f"'{new}'")
+        if replaced == text:
+            return f"no se encontro `{old}` literal en pyproject.toml para subir su cota"
+        text = replaced
+    if not changes:
+        return ""
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        return f"pyproject.toml quedaria invalido al subir la cota: {exc}"
+    pyproject.write_text(text, encoding="utf-8")
+    summary = "\n".join(f"{old} -> {new}" for old, new in changes.items())
+    plog.note("pyproject.toml: cota minima subida", summary)
+    plog.step(f"pyproject.toml: {'; '.join(changes.values())}", True)
+    return ""
+
+
+def apply_uv_patch(config: dict, repo_path: Path, patch: dict, plog: PatchLog) -> tuple[str, str, list[str]]:
+    """Repo uv: (1) sube la cota minima en pyproject.toml solo si excluye la
+    version objetivo, (2) `uv lock --upgrade-package <pkg>==<to>`, (3) exige
+    que el lock ya no tenga versiones < to, (4) `uv sync --locked`. Solo
+    cambian uv.lock (y pyproject.toml si hizo falta). Misma firma y retorno
+    que `apply_npm_patch`."""
+    from batcave.radar import vgt
+
+    package, target = patch["package"], patch["to"]
+    if not tool_available("uv"):
+        return "uv no esta en el PATH del servicio; no se puede parchear un repo uv", "", []
+    error = raise_pyproject_lower_bound(repo_path, package, target, plog)
+    if error:
+        return error, "", []
+    proc = plog.run(["uv", "lock", "--upgrade-package", f"{package}=={target}"], repo_path)
+    if proc.returncode != 0:
+        return f"`uv lock --upgrade-package {package}=={target}` fallo", proc.stdout + proc.stderr, []
+    locked = uv_locked_versions(repo_path, package)
+    behind = [v for v in locked if vgt("PyPI", target, v)]
+    if behind:
+        return f"uv.lock sigue con {package} {', '.join(behind)} (< {target})", proc.stdout + proc.stderr, []
+    proc = plog.run(["uv", "sync", "--locked"], repo_path, timeout=UV_SYNC_TIMEOUT)
+    if proc.returncode != 0:
+        return "`uv sync --locked` fallo", proc.stdout + proc.stderr, []
+    return "", "", [f"{package} {patch['from']} -> {', '.join(locked) or target}"]
+
+
 def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path: Path, branch: str) -> dict:
     """Issue `dependencies` del radar: parche mecanico, sin Aider ni Claude
     (no consume escalaciones). Aplica el comando, corre la verificacion del
@@ -2415,7 +2602,7 @@ def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path
     if patch is None:
         return fail(error)
     package, target = patch["package"], patch["to"]
-    files = PATCH_FILES[patch["ecosystem"]]
+    files = patch_files(repo_path, patch)
     scope = repo_scope_paths(profile, repo_short_name)
     if not all(in_repo_scope(f, scope) for f in files):
         return fail(f"{', '.join(files)} fuera del alcance de {profile['name']} en {repo_short_name} ({', '.join(scope or [])})")
@@ -2442,7 +2629,10 @@ def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path
         log.info(msg)
         return issue_result(msg, SOLVER_NONE)
 
-    apply = apply_npm_patch if patch["ecosystem"] == "npm" else apply_pypi_patch
+    if patch["ecosystem"] == "npm":
+        apply = apply_npm_patch
+    else:
+        apply = apply_uv_patch if is_uv_patch(repo_path, patch) else apply_pypi_patch
     error, output, changes = apply(config, repo_path, patch, plog)
     if error:
         return fail(error, output)

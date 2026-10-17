@@ -12,9 +12,17 @@ databases: [PostgreSQL (+pgvector), MongoDB, Firebase]
 orms: [Prisma, TypeORM, Alembic]
 ai: [RAG, embeddings, Ollama]
 
-# Sin repos asignados todavia: el enrutamiento por label `data` funciona y el
-# radar termina sin hacer nada. Candidatos en reports/red_robin-setup.md.
-repos: []
+# Nombres de repo en GitHub (sin el owner); ruta local en config.yaml repo_paths.
+repos:
+  # ~/projects/penguin: Python 3.12 + uv (uv.lock), SQLAlchemy + Alembic
+  # (alembic/versions), PostgreSQL + pgvector; ruff, mypy --strict, pytest.
+  - name: investing-bot-penguin
+    work_branch: dev
+  # ~/projects/tarjetas: Node + TypeScript (Express 5, tsup, vitest), `pg`
+  # con SQL crudo (CREATE TABLE IF NOT EXISTS en ensureSchema); sin
+  # herramienta de migraciones.
+  - name: tarjetas
+    work_branch: dev
 
 # Runner por archivo de test: auto|vitest|jest|pytest (los .py siempre pytest).
 test_runner: auto
@@ -31,8 +39,35 @@ conventions:
 # Verificacion por stack. Se corren todos los stacks cuyo `detect` coincida
 # con algun archivo en la raiz del repo, en el orden listado.
 verification:
+  # Proyectos uv (investing-bot-penguin): mismos pasos que su CI, en el venv
+  # bloqueado del workspace (`uv sync --locked`). PENGUIN_ENV_FILE apunta a un
+  # archivo inexistente para que nunca se lea un .env real; sin
+  # PENGUIN_TEST_DATABASE_URL los tests usan SQLite en memoria. `alembic
+  # check` no se corre: necesita un Postgres (lo hace el CI del repo).
+  uv:
+    detect: [uv.lock]
+    steps:
+      - builtin: py_compile_changed
+      - cmd: uv sync --locked
+        requires: uv
+        timeout: 900
+      - cmd: uv run --locked ruff check .
+        requires: uv
+      - cmd: uv run --locked ruff format --check .
+        requires: uv
+      - cmd: uv run --locked mypy
+        requires: uv
+        timeout: 900
+      - cmd: PENGUIN_ENV_FILE=/nonexistent/penguin.env uv run --locked pytest -q
+        requires: uv
+        when: exists:tests
+        timeout: 1200
+        counts_tests: pytest
+  # Python sin uv (requirements.txt / setup.py). pyproject.toml no esta en
+  # `detect` a proposito: en un repo uv, `python3 -m pytest` del sistema no
+  # tiene las dependencias.
   python:
-    detect: [requirements.txt, pyproject.toml, setup.py]
+    detect: [requirements.txt, setup.py]
     steps:
       - builtin: py_compile_changed
       - cmd: python3 -m pytest -q
@@ -43,6 +78,13 @@ verification:
       - builtin: npm_ci_if_needed
       - cmd: npm run build
         when: script:build
-      - cmd: CI=true npm test -- --passWithNoTests --watchAll=false
+      - cmd: npm run typecheck
+        when: script:typecheck
+      - cmd: npm run lint --if-present
+      # Los repos Node de Red Robin usan vitest (no acepta --watchAll de jest).
+      # tests/cardRepository.test.ts (tarjetas) exige
+      # TARJETAS_TEST_DATABASE_URL (Postgres real), que el workspace no tiene:
+      # se excluye de la suite completa.
+      - cmd: CI=true npx vitest run --passWithNoTests --exclude tests/cardRepository.test.ts
         when: script:test
         counts_tests: node

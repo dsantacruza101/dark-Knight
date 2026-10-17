@@ -45,10 +45,18 @@ Hoy existen:
   Alembic; RAG, embeddings, Ollama; `test_runner: auto`. Convenciones:
   migraciones reversibles, ningun cambio de datos sin migracion, solo
   queries parametrizadas, sin secretos en codigo, revisar indices de cada
-  query nueva. Verificacion: Python -> `py_compile` de los cambiados +
-  `pytest -q` si hay `tests/`; Node -> `npm ci` si hace falta, `npm run
-  build`, `npm test`. **Sin repos asignados** (`repos: []`): el label `data`
-  enruta igual y el radar termina sin hacer nada. Notas semilla en
+  query nueva. Repos (rama `dev`): `investing-bot-penguin`
+  (`~/projects/penguin`; Python 3.12 + uv, SQLAlchemy + Alembic, Postgres +
+  pgvector) y `tarjetas` (`~/projects/tarjetas`; Node/TS, Express 5, `pg`
+  con SQL crudo, sin herramienta de migraciones). Verificacion: uv (detect
+  `uv.lock`) -> `py_compile` de los cambiados, `uv sync --locked`, `uv run
+  --locked` ruff check + ruff format --check + mypy + pytest (con
+  `PENGUIN_ENV_FILE=/nonexistent/...`, SQLite en memoria; `requires: uv`);
+  Python sin uv (`requirements.txt`/`setup.py`) -> `py_compile` + `pytest
+  -q` si hay `tests/`; Node -> `npm ci` si hace falta, `npm run build`,
+  `npm run typecheck`, lint si existe, `npx vitest run --passWithNoTests
+  --exclude tests/cardRepository.test.ts` (ese test exige un Postgres
+  real). Notas semilla en
   `batcave/knowledge/red_robin/` (indices + EXPLAIN, migraciones seguras,
   RAG con pgvector + Ollama).
 - **Robin** (Damian Wayne, `robin.yaml`): mobile (`label: mobile`), Dart
@@ -107,7 +115,11 @@ archivos permitidos tocados), `when: glob:<patron>` y `when` en lista.
 **Runner por archivo de test** (`test_runner` del perfil: `auto|vitest|jest|pytest|flutter`):
 cada test permitido se corre solo y debe ejecutar > 0 tests y 0 fallidos:
 vitest -> `npx vitest run <archivo> --reporter=json --outputFile=<tmp>`;
-jest -> `npm test -- --runTestsByPath <archivo> --json`; `.py` -> pytest;
+jest -> `npm test -- --runTestsByPath <archivo> --json`; `.py` -> pytest
+(repo con `uv.lock`: `uv run --locked pytest <archivo> --no-cov -q`, sin
+uv: `python3 -m pytest`; siempre con las variables `VAR=valor` del paso
+pytest del perfil, p. ej. `PENGUIN_ENV_FILE=/nonexistent/...`, y sin
+ninguna `*DATABASE_URL*` heredada);
 `*_test.dart` -> `flutter test --machine <archivo>` (cuenta eventos
 `testDone` no ocultos ni omitidos; fallback: linea `+N ~S -F:` del
 resumen). `auto` elige vitest si esta en package.json o hay `vitest.config.*`.
@@ -156,7 +168,13 @@ Flujo por issue en `modes/development.py`:
 cuerpo) y aplica: npm directa -> `npm install [-D] <pkg>@<to>` (`-D` segun
 package.json); npm transitiva -> `npm update <pkg>` y, si OSV aun ve una
 version vulnerable en el lock, `"overrides": {<pkg>: <to>}` + `npm install`;
-PyPI -> fija `<pkg>==<to>` en requirements.txt.
+PyPI -> fija `<pkg>==<to>` en requirements.txt; PyPI en repo uv (`uv.lock`)
+-> sube la cota minima en pyproject.toml SOLO si el requisito excluye la
+version objetivo (`>=`/`>` -> `>=to`, `==` -> `==to`; una cota superior,
+`!=` o `~=` que la excluya falla), `uv lock --upgrade-package <pkg>==<to>`
+(el lock no debe quedar con versiones < to) y `uv sync --locked`; se
+stagea solo uv.lock (+ pyproject.toml si cambio). Requiere `uv` en el PATH
+del servicio (`~/.local/bin`).
 
 - **Familias** (`development.package_families` en `config.yaml`, patrones
   fnmatch `include`/`exclude`: nestjs, angular, react, vitest, tailwind,
@@ -204,7 +222,7 @@ Config en `config.yaml` (`radar:`). Ecosistemas por perfil:
 Actions` y `Docker`, que ningun otro radar inventaria, asi no hay issues
 duplicados). Con `paths` en la entrada del repo solo cuentan los
 manifiestos dentro del alcance.
-Un perfil sin repos (Red Robin y Robin hoy) termina de inmediato con codigo 0: sin
+Un perfil sin repos (Robin hoy) termina de inmediato con codigo 0: sin
 workspace, OSV, issues, Telegram, Claude, estado ni reporte.
 
 - **Inventario**: por cada repo de `repos` del perfil, copia de SOLO
@@ -223,7 +241,13 @@ workspace, OSV, issues, Telegram, Claude, estado ni reporte.
   version de `pubspec.lock`; se omiten `sdk:`, `path:` y `git:`).
   Transitivas: el resto de `package-lock.json` (anidadas incluidas), de
   `requirements.txt` (pip freeze), de `requirements*.lock` y los paquetes
-  `hosted` de `pubspec.lock` (como produccion). `devDependencies`,
+  `hosted` de `pubspec.lock` (como produccion). Repo uv (`uv.lock`, se lee
+  como TOML y reemplaza al inventario Python de requirements): directas de
+  `[project.dependencies]` (produccion), `[project.optional-dependencies]` y
+  `[dependency-groups]` (dev), con la version exacta del lock; transitivas =
+  resto de paquetes de registry del lock, de produccion si se alcanzan desde
+  las directas de produccion (grafo del lock, extras pedidos); manifiesto
+  `uv.lock` (issue con `Archivos:` uv.lock + pyproject.toml). `devDependencies`,
   `dev_dependencies`, extras opcionales y scope `test` cuentan como dev. Sin
   version fija no se consulta. Vulnerabilidades se revisan en TODAS;
   `outdated_*` solo en directas. Cada hallazgo indica `directa`/`transitiva`.
@@ -431,7 +455,10 @@ genera tests para hasta `red_hood.max_tests_per_repo` archivos con Aider
 toca algo mas o el test generado falla, se descarta con `git checkout` y se
 registra en memoria. El test generado se valida con el runner por archivo
 del modo Desarrollo (`run_test_file`: vitest/jest con reporte JSON; exige
-> 0 tests ejecutados y 0 fallidos). Si pasa, se comitea (y pushea) a la rama
+> 0 tests ejecutados y 0 fallidos). En repos uv (`uv.lock`, tambien
+detectados como Python) la suite y el test por archivo corren con `uv run
+--locked pytest` y el entorno seguro del perfil dueño del repo
+(`python_test_env`), sin `*DATABASE_URL*`; sin uv, pytest del venv o python3. Si pasa, se comitea (y pushea) a la rama
 de trabajo del repo.
 
 Reporta hallazgos high/critical y tests fallidos como issues en GitHub

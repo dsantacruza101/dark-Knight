@@ -25,7 +25,7 @@ Equipo actual:
 |---|---|---|---|
 | `nightwing.yaml` (default) | `backend` | dsantacruz-client-gateway, NodeMailer_MicroService, telegram-bot, dark-Knight (`dev`) | `auto` |
 | `batgirl.yaml` | `frontend` | my_Portfolio_React_v2 (`development`) | `vitest` |
-| `red_robin.yaml` | `data` | (ninguno todavia) | `auto` |
+| `red_robin.yaml` | `data` | investing-bot-penguin, tarjetas (`dev`) | `auto` |
 | `robin.yaml` | `mobile` | (ninguno todavia) | `flutter` |
 | `spoiler.yaml` | `devops` | portfolioServiceLauncher (`dev`); solo `.github/workflows/**` en dsantacruz-client-gateway, NodeMailer_MicroService, telegram-bot, dark-Knight y my_Portfolio_React_v2 (rama del perfil dueño) | `auto` |
 
@@ -33,7 +33,7 @@ Un perfil puede tener `repos: []` (o no tener `repos`): el enrutamiento por
 label funciona igual (el motivo dice "perfil sin repos asignados") y el
 radar termina de inmediato con codigo 0, sin workspace, OSV, issues,
 Telegram, Claude, estado ni reporte. Asi se puede dar de alta un
-especialista (Red Robin, Robin) antes de decidir que repos le tocan.
+especialista (Robin) antes de decidir que repos le tocan.
 
 ## Esquema
 

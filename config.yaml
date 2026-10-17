@@ -20,6 +20,9 @@ github:
     - dsantacruza101/dsantacruz-client-gateway
     - dsantacruza101/NodeMailer_MicroService
     - dsantacruza101/dark-Knight
+    - dsantacruza101/telegram-bot
+    - dsantacruza101/investing-bot-penguin
+    - dsantacruza101/tarjetas
   issue_label: night-agent
   # Rama de integracion por defecto. Un repo puede fijar la suya con
   # `work_branch` en su entrada de `repos` del perfil de especialista
@@ -35,6 +38,8 @@ repo_paths:
   dsantacruz-client-gateway: ~/projects/portfolioServiceLauncher/client-gateway
   my_Portfolio_React_v2: ~/projects/my_Portfolio_React_v2
   portfolioServiceLauncher: ~/projects/portfolioServiceLauncher
+  investing-bot-penguin: ~/projects/penguin
+  tarjetas: ~/projects/tarjetas
 
 development:
   workspace_dir: ~/projects/.nightwing-workspace
