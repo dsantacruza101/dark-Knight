@@ -1295,12 +1295,16 @@ def verify_python_files(repo_path: Path, py_files: list[str]) -> tuple[list[str]
     return errors, full_outputs
 
 
-def npm_ci_if_needed(repo_path: Path) -> Optional[subprocess.CompletedProcess]:
+def npm_ci_if_needed(repo_path: Path, allowed_files: Optional[list[str]] = None) -> Optional[subprocess.CompletedProcess]:
     """Antes de verificar en repos Node, instala dependencias con `npm ci` si
     `node_modules` no existe o si `package-lock.json` cambio desde la ultima
     instalacion (hash guardado dentro de `node_modules`, que sobrevive al
     `git clean -fd` de `setup_workspace_repo` por estar gitignoreado).
-    Devuelve el resultado de `npm ci`, o None si no hizo falta."""
+
+    Repo greenfield (hay package.json pero no package-lock.json) con
+    `package-lock.json` entre los archivos permitidos del issue: `npm install`
+    en vez de `npm ci`, asi el lockfile generado se comitea con el resto.
+    Devuelve el resultado del comando, o None si no hizo falta."""
     lockfile = repo_path / "package-lock.json"
     node_modules = repo_path / "node_modules"
     hash_marker = node_modules / ".night-agent-lockfile-hash"
@@ -1308,11 +1312,17 @@ def npm_ci_if_needed(repo_path: Path) -> Optional[subprocess.CompletedProcess]:
     current_hash = hashlib.sha256(lockfile.read_bytes()).hexdigest() if lockfile.exists() else None
     previous_hash = hash_marker.read_text(encoding="utf-8").strip() if hash_marker.exists() else None
 
-    if node_modules.exists() and current_hash == previous_hash:
+    allowed = {normalize_rel_path(f) for f in allowed_files or []}
+    greenfield = (repo_path / "package.json").exists() and not lockfile.exists() and "package-lock.json" in allowed
+
+    if node_modules.exists() and current_hash == previous_hash and not greenfield:
         return None
 
-    log.info("%s: instalando dependencias (npm ci)", repo_path.name)
-    proc = run_cli(["npm", "ci"], cwd=repo_path, timeout=NPM_CI_TIMEOUT)
+    cmd = ["npm", "install"] if greenfield else ["npm", "ci"]
+    log.info("%s: instalando dependencias (%s)", repo_path.name, " ".join(cmd))
+    proc = run_cli(cmd, cwd=repo_path, timeout=NPM_CI_TIMEOUT)
+    if greenfield and lockfile.exists():
+        current_hash = hashlib.sha256(lockfile.read_bytes()).hexdigest()
     if current_hash is not None and node_modules.exists():
         hash_marker.write_text(current_hash, encoding="utf-8")
     return proc
@@ -1476,9 +1486,9 @@ def run_verification_steps(
                         full_outputs.append(f"=== {compose_label} ===\n{mask_secrets(proc.stdout + proc.stderr)}")
                 continue
             if builtin == "npm_ci_if_needed":
-                ci = npm_ci_if_needed(repo_path)
+                ci = npm_ci_if_needed(repo_path, allowed_files)
                 if ci is not None:
-                    record("npm ci", ci.returncode == 0, f"codigo {ci.returncode}", started)
+                    record(" ".join(ci.args), ci.returncode == 0, f"codigo {ci.returncode}", started)
                 continue
             if builtin == "py_compile_changed":
                 py_files = sorted(

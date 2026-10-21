@@ -20,6 +20,8 @@ repos:
   - NodeMailer_MicroService
   - telegram-bot
   - dark-Knight
+  - name: bills
+    work_branch: dev
 
 conventions:
   - "Conventional commits (feat/fix/chore/ci/test/refactor)."

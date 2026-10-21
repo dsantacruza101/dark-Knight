@@ -23,6 +23,7 @@ github:
     - dsantacruza101/telegram-bot
     - dsantacruza101/investing-bot-penguin
     - dsantacruza101/tarjetas
+    - dsantacruza101/bills
   issue_label: night-agent
   # Rama de integracion por defecto. Un repo puede fijar la suya con
   # `work_branch` en su entrada de `repos` del perfil de especialista
@@ -40,6 +41,7 @@ repo_paths:
   portfolioServiceLauncher: ~/projects/portfolioServiceLauncher
   investing-bot-penguin: ~/projects/penguin
   tarjetas: ~/projects/tarjetas
+  bills: ~/projects/bills
 
 development:
   workspace_dir: ~/projects/.nightwing-workspace
