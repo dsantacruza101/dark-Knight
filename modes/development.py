@@ -38,10 +38,11 @@ npm transitiva -> `npm update <pkg>` y, si OSV aun ve una version
 vulnerable en el lock, `overrides: {<pkg>: <to>}` en package.json +
 `npm install`. En npm, `npm ls --depth=0` despues de instalar: peers
 invalidos o faltantes fallan antes de los tests. PyPI -> fija
-`<pkg>==<to>` en requirements.txt. Luego corre la verificacion del perfil,
+`<pkg>==<to>` en cada `requirements*.txt`/`requirements*.lock` que lo fije
+(o lo agrega a requirements.txt). Luego corre la verificacion del perfil,
 re-chequea OSV (los advisories del issue ya no deben afectar a ninguna
-version del lock), stagea solo package.json/package-lock.json (o
-requirements.txt) y comitea `fix(deps): <pkg> <from> -> <to> (radar)`.
+version del lock), stagea solo package.json/package-lock.json (o esos
+requirements) y comitea `fix(deps): <pkg> <from> -> <to> (radar)`.
 Exito -> comentario `Aplicado en <rama>: <sha>, verificado` + label `in-dev`
 (los issues `in-dev` se omiten); ya corregido segun OSV -> se cierra como
 completado; fallo -> `needs-review` con las ultimas 30 lineas del paso que
@@ -248,6 +249,14 @@ REQ_PIN_LINE_RE = re.compile(
     r"((?:(?:===|==|~=|>=|>|<=|<|!=)\s*[^;#\s,]+\s*,?\s*)*)(.*)$"
 )
 PATCH_FILES = {"npm": ["package.json", "package-lock.json"], "PyPI": ["requirements.txt"]}
+# Comandos que la escalacion a Claude puede correr en un repo Node greenfield
+# (generar el lockfile y verificar build/tests antes de terminar).
+GREENFIELD_NODE_CLAUDE_TOOLS = [
+    "Bash(npm install:*)", "Bash(npm run build:*)", "Bash(npm run lint:*)",
+    "Bash(npm test:*)", "Bash(npx vitest:*)", "Bash(npx tsc:*)",
+]
+# PyPI sin uv: se edita el requirements que realmente fija el paquete.
+REQUIREMENTS_PIN_GLOBS = ("requirements*.txt", "requirements*.lock")
 # Repos uv: uv.lock siempre; pyproject.toml solo cambia si hubo que subir una cota minima.
 UV_PATCH_FILES = ["uv.lock", "pyproject.toml"]
 UV_SYNC_TIMEOUT = 900
@@ -890,42 +899,93 @@ def is_forbidden_path(rel_path: str) -> bool:
     return any(seg in parts or seg in name for seg in FORBIDDEN_PATH_SEGMENTS)
 
 
+def changed_entries(repo_path: Path) -> list[tuple[str, str]]:
+    """(estado XY, ruta) de cada archivo modificado, borrado o nuevo.
+    `--untracked-files=all` lista cada archivo nuevo por separado (sin el,
+    un directorio nuevo sale como `src/` y el candado no lo encuentra en la
+    lista permitida); `-z` evita las comillas de rutas con caracteres raros.
+    En un renombre se devuelve la ruta nueva."""
+    status = run_cli(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd=repo_path)
+    entries: list[tuple[str, str]] = []
+    fields = status.stdout.split("\0")
+    i = 0
+    while i < len(fields):
+        field = fields[i]
+        i += 1
+        if len(field) < 4:
+            continue
+        code, rel_path = field[:2], field[3:]
+        if "R" in code or "C" in code:
+            i += 1  # el siguiente campo es la ruta de origen
+        entries.append((code, rel_path))
+    return entries
+
+
 def changed_files(repo_path: Path) -> list[str]:
-    status = run_cli(["git", "status", "--porcelain"], cwd=repo_path)
-    files: list[str] = []
-    for line in status.stdout.splitlines():
-        rel_path = line[3:].strip()
-        if " -> " in rel_path:
-            rel_path = rel_path.split(" -> ")[-1]
-        files.append(rel_path)
-    return files
+    return [rel_path for _, rel_path in changed_entries(repo_path)]
+
+
+def prune_empty_dirs(repo_path: Path, rel_paths) -> list[str]:
+    """Borra los directorios que quedaron vacios tras eliminar `rel_paths`,
+    subiendo desde cada archivo hasta la raiz del repo (nunca la raiz, nunca
+    un directorio con contenido)."""
+    root = repo_path.resolve()
+    pruned: list[str] = []
+    for rel in rel_paths:
+        parent = (repo_path / rel).parent
+        while True:
+            try:
+                resolved = parent.resolve()
+            except OSError:
+                break
+            if resolved == root or root not in resolved.parents:
+                break
+            try:
+                parent.rmdir()
+            except OSError:
+                break  # no existe o no esta vacio
+            pruned.append(str(resolved.relative_to(root)) + "/")
+            parent = parent.parent
+    return pruned
+
+
+def revert_entries(repo_path: Path, entries: list[tuple[str, str]]) -> list[str]:
+    """Revierte archivo por archivo, nunca un directorio completo: los nuevos
+    (sin trackear o solo en el index) se borran, los trackeados vuelven a su
+    version de HEAD. Despues poda los directorios que quedaron vacios."""
+    reverted: list[str] = []
+    removed: list[str] = []
+    for code, rel_path in entries:
+        full = repo_path / rel_path
+        if code == "??" or code[0] == "A":
+            if code[0] == "A":
+                run_cli(["git", "rm", "-q", "--cached", "--", rel_path], cwd=repo_path)
+            if full.is_symlink() or full.is_file():
+                full.unlink(missing_ok=True)
+            removed.append(rel_path)
+        else:
+            run_cli(["git", "checkout", "HEAD", "--", rel_path], cwd=repo_path)
+        reverted.append(rel_path)
+    prune_empty_dirs(repo_path, removed)
+    return reverted
 
 
 def revert_forbidden_changes(repo_path: Path) -> list[str]:
     """Revierte cambios de Aider en rutas prohibidas antes de comitear."""
-    reverted: list[str] = []
-    for rel_path in changed_files(repo_path):
-        if not is_forbidden_path(rel_path):
-            continue
+    forbidden = [(code, rel) for code, rel in changed_entries(repo_path) if is_forbidden_path(rel)]
+    for _, rel_path in forbidden:
         log.warning("Cambio revertido por politica de seguridad: %s", rel_path)
-        run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
-        run_cli(["git", "clean", "-f", "--", rel_path], cwd=repo_path)
-        reverted.append(rel_path)
-    return reverted
+    return revert_entries(repo_path, forbidden)
 
 
 def revert_unlisted_changes(repo_path: Path, allowed_files: list[str], log_path: Path) -> list[str]:
-    """Candado: revierte (git checkout -- y git clean) cualquier archivo
-    modificado o creado que no este en `allowed_files`. Se registra en
-    `log_path` para que quede rastro de lo que Aider intento tocar de mas."""
+    """Candado: revierte cualquier archivo modificado o creado que no este en
+    `allowed_files` (archivo por archivo; un archivo permitido dentro de un
+    directorio nuevo sobrevive). Se registra en `log_path` para que quede
+    rastro de lo que Aider intento tocar de mas."""
     allowed = {normalize_rel_path(f) for f in allowed_files}
-    reverted: list[str] = []
-    for rel_path in changed_files(repo_path):
-        if normalize_rel_path(rel_path) in allowed:
-            continue
-        run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
-        run_cli(["git", "clean", "-fd", "--", rel_path], cwd=repo_path)
-        reverted.append(rel_path)
+    unlisted = [(code, rel) for code, rel in changed_entries(repo_path) if normalize_rel_path(rel) not in allowed]
+    reverted = revert_entries(repo_path, unlisted)
     if reverted:
         append_to_log(log_path, "candado (fuera de la lista permitida, revertidos)", "\n".join(reverted))
     return reverted
@@ -956,9 +1016,7 @@ def discard_changes(repo_path: Path) -> None:
     """Descarta todos los cambios sin commitear del workspace (usado cuando
     un intento de Aider falla la verificacion, para dejar el repo limpio
     antes del siguiente intento)."""
-    for rel_path in changed_files(repo_path):
-        run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
-        run_cli(["git", "clean", "-fd", "--", rel_path], cwd=repo_path)
+    revert_entries(repo_path, changed_entries(repo_path))
 
 
 def strip_comments_and_blank(content: str, suffix: str) -> str:
@@ -991,6 +1049,7 @@ def delete_empty_allowed_files(repo_path: Path, allowed_files: list[str], log_pa
             continue
         full.unlink()
         emptied.append(rel)
+    prune_empty_dirs(repo_path, emptied)
     if emptied:
         append_to_log(log_path, "candado (archivos permitidos vacios, eliminados)", "\n".join(emptied))
     return emptied
@@ -1125,7 +1184,7 @@ def setup_workspace_repo(repo_full_name: str, workspace_dir: Path, branch: str) 
 
 
 def repo_is_clean(repo_path: Path) -> bool:
-    status = run_cli(["git", "status", "--porcelain"], cwd=repo_path)
+    status = run_cli(["git", "status", "--porcelain", "--untracked-files=all"], cwd=repo_path)
     return status.returncode == 0 and not status.stdout.strip()
 
 
@@ -1891,6 +1950,35 @@ def read_allowed_files_content(repo_path: Path, allowed_files: list[str]) -> str
     return "\n\n".join(chunks)
 
 
+def missing_or_empty_allowed_files(repo_path: Path, allowed_files: list[str]) -> list[str]:
+    """Archivos permitidos que todavia no existen o estan vacios (solo
+    espacios/comentarios): la escalacion debe crearlos todos, no solo los que
+    menciona el ultimo error de verificacion."""
+    pending: list[str] = []
+    for rel in allowed_files:
+        full = repo_path / rel
+        if not full.is_file():
+            pending.append(rel)
+            continue
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pending.append(rel)
+            continue
+        if not strip_comments_and_blank(content, full.suffix):
+            pending.append(rel)
+    return pending
+
+
+def is_greenfield_node(repo_path: Path, allowed_files: list[str]) -> bool:
+    """Repo Node que nace en este issue: `package-lock.json` esta permitido
+    pero aun no existe (el `package.json` puede existir o no)."""
+    allowed = {normalize_rel_path(f) for f in allowed_files}
+    return "package-lock.json" in allowed and not (repo_path / "package-lock.json").exists() and (
+        "package.json" in allowed or (repo_path / "package.json").exists()
+    )
+
+
 def describe_verification(repo_path: Path, profile: dict) -> list[str]:
     return [
         f"- [{stack_name}] {step.get('cmd') or step.get('builtin')}"
@@ -1908,7 +1996,26 @@ def build_claude_escalation_prompt(
     files_content: str,
     last_error: str,
     verification: list[str],
+    pending_files: Optional[list[str]] = None,
+    greenfield_node: bool = False,
 ) -> str:
+    pending_section = (
+        "## Archivos permitidos que faltan o estan vacios\nDebes crear TODOS estos archivos con su "
+        "contenido completo (no solo los que menciona el error de verificacion):\n"
+        + "\n".join(f"- {f}" for f in pending_files)
+        if pending_files
+        else ""
+    )
+    greenfield_section = (
+        "## Repo Node nuevo (greenfield)\n"
+        "- Crea `package.json` con TODAS las dependencias y devDependencies que usa el codigo y los "
+        "tests, y los scripts `build` y `test` (y `lint` si aplica).\n"
+        "- Ejecuta `npm install` para generar `package-lock.json` (se comitea con el resto).\n"
+        "- Antes de terminar, ejecuta tu mismo `npm run build` y los tests (`npm test` o "
+        "`npx vitest run`) y corrige hasta que pasen."
+        if greenfield_node
+        else ""
+    )
     parts = [
         "Eres la escalacion del modo Desarrollo nocturno. Aider con un modelo local (qwen) intento "
         "resolver este issue y no paso la verificacion. Estas en el workspace aislado del repositorio "
@@ -1917,6 +2024,8 @@ def build_claude_escalation_prompt(
         f"## Issue #{issue['number']} de {issue['repo']}: {issue['title']}\n{body[:6000]}",
         "## Archivos permitidos\nSOLO puedes crear o editar estos archivos (cualquier otro cambio se "
         "revierte automaticamente):\n" + "\n".join(f"- {f}" for f in allowed_files),
+        pending_section,
+        greenfield_section,
         f"## Contenido actual de los archivos permitidos\n{files_content}",
         f"## Ultimo error de verificacion (ultimas {ESCALATION_ERROR_LINES} lineas)\n{last_error}",
         "## Verificacion que se correra despues de tus cambios\n"
@@ -1931,11 +2040,21 @@ def build_claude_escalation_prompt(
     return "\n\n".join(part for part in parts if part)
 
 
-def run_claude_escalation(claude_bin: str, prompt: str, repo_path: Path, timeout: int, log_path: Path) -> bool:
+def run_claude_escalation(
+    claude_bin: str,
+    prompt: str,
+    repo_path: Path,
+    timeout: int,
+    log_path: Path,
+    allowed_tools: Optional[list[str]] = None,
+) -> bool:
     """`claude -p --permission-mode acceptEdits` en el workspace. El prompt va
     por stdin (puede superar el limite de tamano de un argumento) y la salida
-    se escribe en vivo a `log_path`, con secretos enmascarados al terminar."""
+    se escribe en vivo a `log_path`, con secretos enmascarados al terminar.
+    `allowed_tools` (p. ej. `Bash(npm install:*)`) habilita comandos puntuales."""
     cmd = [claude_bin, "-p", "--permission-mode", "acceptEdits"]
+    if allowed_tools:
+        cmd += ["--allowedTools", ",".join(allowed_tools)]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     timed_out = False
     returncode: Optional[int] = None
@@ -2013,6 +2132,7 @@ def escalate_to_claude(
         if last_full_output
         else "(Aider no llego a un intento verificable: termino por timeout o error)"
     )
+    greenfield_node = is_greenfield_node(repo_path, allowed_files)
     prompt = build_claude_escalation_prompt(
         issue,
         body,
@@ -2021,8 +2141,17 @@ def escalate_to_claude(
         read_allowed_files_content(repo_path, allowed_files),
         last_error,
         describe_verification(repo_path, profile),
+        missing_or_empty_allowed_files(repo_path, allowed_files),
+        greenfield_node,
     )
-    claude_ok = run_claude_escalation(claude_bin, prompt, repo_path, int(min(claude_timeout, remaining_seconds)), log_path)
+    claude_ok = run_claude_escalation(
+        claude_bin,
+        prompt,
+        repo_path,
+        int(min(claude_timeout, remaining_seconds)),
+        log_path,
+        GREENFIELD_NODE_CLAUDE_TOOLS if greenfield_node else None,
+    )
 
     apply_guard(repo_path, allowed_files, log_path, tag, "claude")
     if not changed_files(repo_path):
@@ -2111,7 +2240,7 @@ def describe_dependency_patch(patch: dict) -> str:
     if patch["manifest"] == UV_LOCK:
         return (f"uv lock --upgrade-package {pkg}=={to} + uv sync --locked "
                 f"(cota minima >={to} en pyproject.toml solo si hace falta)")
-    return f"fijar {pkg}=={to} en requirements.txt"
+    return f"fijar {pkg}=={to} en cada requirements*.txt/.lock que lo fije (o agregarlo a requirements.txt)"
 
 
 def py_key(name: str) -> str:
@@ -2135,17 +2264,9 @@ def installed_versions(repo_path: Path, patch: dict) -> list[str]:
             log.warning("%s: no se pudo leer package-lock.json: %s", repo_path.name, exc)
             return []
         return sorted({version for name, version, _ in lock_all_packages(lock) if name == package})
-    req = repo_path / "requirements.txt"
-    if not req.exists():
-        return []
-    versions: set[str] = set()
-    for line in req.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = REQ_PIN_LINE_RE.match(line.split("#", 1)[0])
-        if match and py_key(match.group(1)) == py_key(package):
-            pin = re.search(r"===?\s*([^\s,;]+)", match.group(3))
-            if pin:
-                versions.add(pin.group(1))
-    return sorted(versions)
+    return sorted(
+        {v for rel in requirements_pin_candidates(repo_path) for v in requirement_pins(repo_path / rel, package)}
+    )
 
 
 def osv_vulnerable_versions(patch: dict, versions: list[str]) -> tuple[Optional[list[str]], str]:
@@ -2432,35 +2553,93 @@ def apply_pypi_patch(config: dict, repo_path: Path, patch: dict, plog: PatchLog)
     """Fija `paquete==to` en requirements.txt (conserva extras, marcadores y
     comentario de la linea; si no estaba, lo agrega). Misma firma y retorno
     que `apply_npm_patch`."""
+    files = requirement_files_for_patch(repo_path, patch)
     error = pin_requirement(repo_path, patch, plog)
-    plog.step(f"fijar {patch['package']}=={patch['to']} en requirements.txt", not error, error)
+    plog.step(
+        f"fijar {patch['package']}=={patch['to']} en {', '.join(files) or 'requirements.txt'}", not error, error
+    )
     return error, "", [] if error else [f"{patch['package']} {patch['from']} -> {patch['to']}"]
 
 
-def pin_requirement(repo_path: Path, patch: dict, plog: PatchLog) -> str:
-    if patch["manifest"] not in ("", "requirements.txt", "requirements.in"):
-        return f"el paquete viene de {patch['manifest']}: solo se parchea requirements.txt de forma determinista"
-    req = repo_path / "requirements.txt"
-    if not req.exists():
-        return "el repo no tiene requirements.txt"
-    package, target = patch["package"], patch["to"]
-    lines = req.read_text(encoding="utf-8").splitlines()
-    replaced = False
-    for idx, line in enumerate(lines):
+def is_requirements_file(rel_path: str) -> bool:
+    return any(fnmatchcase(Path(rel_path).name, glob) for glob in REQUIREMENTS_PIN_GLOBS)
+
+
+def requirements_pin_candidates(repo_path: Path) -> list[str]:
+    """`requirements*.txt` y `requirements*.lock` de la raiz del repo."""
+    return sorted({p.name for glob in REQUIREMENTS_PIN_GLOBS for p in repo_path.glob(glob) if p.is_file()})
+
+
+def requirement_pins(path: Path, package: str) -> list[str]:
+    """Versiones fijadas (`==`/`===`) de `package` en un archivo de requirements."""
+    versions: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return versions
+    for line in text.splitlines():
         if line.lstrip().startswith(("#", "-")):
             continue
-        match = REQ_PIN_LINE_RE.match(line)
-        if not match or py_key(match.group(1)) != py_key(package):
-            continue
-        rest = match.group(4).strip()
-        if rest.startswith("@"):
-            return f"{package} se instala desde una URL en requirements.txt; no se fija version"
-        lines[idx] = f"{match.group(1)}{match.group(2) or ''}=={target}" + (f" {rest}" if rest else "")
-        replaced = True
-    if not replaced:
-        lines.append(f"{package}=={target}")
-    req.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    plog.note("requirements.txt", f"{'actualizado' if replaced else 'agregado'}: {package}=={target}")
+        match = REQ_PIN_LINE_RE.match(line.split("#", 1)[0])
+        if match and py_key(match.group(1)) == py_key(package):
+            pin = re.search(r"===?\s*([^\s,;\\]+)", match.group(3))
+            if pin:
+                versions.append(pin.group(1))
+    return versions
+
+
+def requirement_files_for_patch(repo_path: Path, patch: dict) -> list[str]:
+    """Archivos de requirements que el parche PyPI edita: todos los
+    `requirements*.txt`/`requirements*.lock` que fijan el paquete (p. ej.
+    `requirements-dev.lock`). Si ninguno lo fija, el manifiesto del issue
+    (si es un requirements existente) o `requirements.txt`, donde se agrega."""
+    package = patch["package"]
+    pinned = [rel for rel in requirements_pin_candidates(repo_path) if requirement_pins(repo_path / rel, package)]
+    if pinned:
+        return pinned
+    manifest = normalize_rel_path(patch.get("manifest") or "")
+    if manifest and is_requirements_file(manifest) and (repo_path / manifest).is_file():
+        return [manifest]
+    if manifest not in ("", "requirements.in") and not is_requirements_file(manifest):
+        return []
+    return ["requirements.txt"] if (repo_path / "requirements.txt").is_file() else []
+
+
+def pin_requirement(repo_path: Path, patch: dict, plog: PatchLog) -> str:
+    package, target = patch["package"], patch["to"]
+    files = requirement_files_for_patch(repo_path, patch)
+    if not files:
+        manifest = patch["manifest"]
+        if manifest and manifest != "requirements.in" and not is_requirements_file(manifest):
+            return (f"el paquete viene de {manifest} y ningun requirements*.txt/.lock lo fija: "
+                    "solo se parchean requirements de forma determinista")
+        return f"el repo no tiene un requirements*.txt/.lock donde fijar {package}"
+
+    rewritten: dict[str, list[str]] = {}
+    for rel in files:
+        lines = (repo_path / rel).read_text(encoding="utf-8").splitlines()
+        replaced = False
+        for idx, line in enumerate(lines):
+            if line.lstrip().startswith(("#", "-")):
+                continue
+            match = REQ_PIN_LINE_RE.match(line)
+            if not match or py_key(match.group(1)) != py_key(package):
+                continue
+            rest = match.group(4).strip()
+            if rest.startswith("@"):
+                return f"{package} se instala desde una URL en {rel}; no se fija version"
+            following = lines[idx + 1].lstrip() if idx + 1 < len(lines) else ""
+            if "--hash" in rest or rest.endswith("\\") or following.startswith("--hash"):
+                return f"{package} esta fijado con --hash en {rel}: hay que regenerarlo (pip-compile), no editarlo a mano"
+            lines[idx] = f"{match.group(1)}{match.group(2) or ''}=={target}" + (f" {rest}" if rest else "")
+            replaced = True
+        if not replaced:
+            lines.append(f"{package}=={target}")
+        rewritten[rel] = lines
+        plog.note(rel, f"{'actualizado' if replaced else 'agregado'}: {package}=={target}")
+    # Se escribe al final: un error en cualquier archivo no deja cambios a medias.
+    for rel, lines in rewritten.items():
+        (repo_path / rel).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ""
 
 
@@ -2471,7 +2650,11 @@ def is_uv_patch(repo_path: Path, patch: dict) -> bool:
 
 def patch_files(repo_path: Path, patch: dict) -> list[str]:
     """Archivos que el parche puede tocar (lista permitida del candado y del commit)."""
-    return UV_PATCH_FILES if is_uv_patch(repo_path, patch) else PATCH_FILES[patch["ecosystem"]]
+    if is_uv_patch(repo_path, patch):
+        return UV_PATCH_FILES
+    if patch["ecosystem"] == "PyPI":
+        return requirement_files_for_patch(repo_path, patch) or PATCH_FILES["PyPI"]
+    return PATCH_FILES[patch["ecosystem"]]
 
 
 def raised_requirement(requirement: str, target: str) -> tuple[Optional[str], str]:
