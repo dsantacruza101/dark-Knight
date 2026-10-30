@@ -145,6 +145,14 @@ batwoman:
     - /etc/cloudflared
     - /etc/systemd/system
     - /home/dsantacruz/.claude/settings.json
+  # Cambios en rutas criticas explicados por un sudo interactivo (instalar
+  # units): van al digest en vez de alertar. sudoers, ssh, authorized_keys y
+  # los .env de secretos alertan SIEMPRE (fijo en el codigo).
+  sudo_buffer_seconds: 600    # buffer de eventos sudo (5402 y relacionadas)
+  sudo_explain_window: 120    # el sudo debe ser hasta N s ANTES del cambio
+  sudo_explain_grace: 30      # alerta FIM mas reciente que esto sin sudo: se aplaza un poll
+  sudo_explain_user: dsantacruz
+  never_explain_paths: []     # rutas extra que nunca se explican (solo amplia la lista fija)
   # Conexiones salientes (batcave/egress.py). Linea base por
   # (proceso o container, ASN destino, puerto destino, protocolo), nunca por IP.
   egress:

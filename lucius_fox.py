@@ -81,7 +81,7 @@ MAINTENANCE_PATH = BASE_DIR / "batcave" / "maintenance.json"
 ALERT_STATE_PATH = BASE_DIR / "batcave" / "memory" / "lucius_alert_state.json"
 ALERT_REPEAT_COOLDOWN = timedelta(hours=6)
 
-CLAUDE_NODE_BIN = "/home/dsantacruz/.nvm/versions/node/v22.23.2/bin/node"
+CLAUDE_NODE_BIN = "/home/dsantacruz/.local/share/node-current/bin/node"
 CLAUDE_INSTALL_SCRIPT = (
     "/home/dsantacruz/.nvm/versions/node/v22.23.2/lib/node_modules/"
     "@anthropic-ai/claude-code/install.cjs"
