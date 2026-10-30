@@ -44,6 +44,7 @@ from typing import Optional
 from telegram.error import TelegramError
 
 from modes.development import (
+    changed_entries,
     changed_files,
     commit_allowed_and_push,
     get_workspace_dir,
@@ -53,6 +54,7 @@ from modes.development import (
     normalize_rel_path,
     repo_is_clean,
     resolve_work_branch,
+    revert_entries,
     run_cli,
     setup_workspace_repo,
 )
@@ -131,14 +133,8 @@ def get_commit_line_stats(repo_path: Path, commit_hash: str) -> tuple[int, int]:
     return (int(ins_match.group(1)) if ins_match else 0, int(del_match.group(1)) if del_match else 0)
 
 
-def _revert_forbidden_changes(repo_path: Path, status_lines: list[str]) -> list[str]:
-    reverted = []
-    for line in status_lines:
-        path = line[3:].strip()
-        if path and is_forbidden_path(path):
-            run_cli(["git", "checkout", "--", path], cwd=repo_path)
-            reverted.append(path)
-    return reverted
+def _revert_forbidden_changes(repo_path: Path) -> list[str]:
+    return revert_entries(repo_path, [(code, rel) for code, rel in changed_entries(repo_path) if is_forbidden_path(rel)])
 
 
 def get_commit_files(repo_path: Path, commit_hash: str) -> list[str]:
@@ -151,11 +147,7 @@ def get_commit_files(repo_path: Path, commit_hash: str) -> list[str]:
 def _discard_leftover_changes(repo_path: Path) -> list[str]:
     """Descarta lo que quedo sin comitear (fuera de la lista permitida o de un
     commit abortado) para que el siguiente commit se revise sobre repo limpio."""
-    discarded = changed_files(repo_path)
-    for path in discarded:
-        run_cli(["git", "checkout", "--", path], cwd=repo_path)
-        run_cli(["git", "clean", "-fd", "--", path], cwd=repo_path)
-    return discarded
+    return revert_entries(repo_path, changed_entries(repo_path))
 
 
 def review_and_fix_commit(claude_bin: str, branch: str, repo_full_name: str, repo_path: Path, commit: dict) -> dict:
@@ -185,14 +177,11 @@ def review_and_fix_commit(claude_bin: str, branch: str, repo_full_name: str, rep
     )
     run_claude(claude_bin, fix_prompt, cwd=repo_path, accept_edits=True, timeout=CLAUDE_FIX_TIMEOUT)
 
-    status = run_cli(["git", "status", "--porcelain"], cwd=repo_path)
-    status_lines = [line for line in status.stdout.splitlines() if line.strip()]
-    reverted = _revert_forbidden_changes(repo_path, status_lines)
+    reverted = _revert_forbidden_changes(repo_path)
     if reverted:
         log.warning("%s: se revirtieron archivos protegidos: %s", tag, ", ".join(reverted))
 
-    status = run_cli(["git", "status", "--porcelain"], cwd=repo_path)
-    if not status.stdout.strip():
+    if not changed_files(repo_path):
         return base
 
     allowed = [f for f in get_commit_files(repo_path, commit["hash"]) if not is_forbidden_path(f)]

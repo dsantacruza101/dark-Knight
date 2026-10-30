@@ -31,7 +31,11 @@ Hoy existen:
 - **Nightwing** (`nightwing.yaml`, default): backend (`label: backend`),
   TypeScript/JavaScript/Python/Java, NestJS, Express, FastAPI, Spring Boot,
   TypeORM/Prisma, NATS; dueño de `dsantacruz-client-gateway`,
-  `NodeMailer_MicroService`, `telegram-bot` y `dark-Knight` (rama `dev`).
+  `NodeMailer_MicroService`, `telegram-bot`, `dark-Knight` y `bills`
+  (`~/projects/bills`) (rama `dev`). Repo greenfield (hay `package.json` sin
+  `package-lock.json`) con `package-lock.json` en los archivos permitidos del
+  issue: la verificacion corre `npm install` en vez de `npm ci` (tambien en
+  escalaciones a Claude) y el lockfile se comitea con el resto.
 - **Batgirl** (Cassandra Cain, `batgirl.yaml`): frontend (`label: frontend`),
   TypeScript/JavaScript/HTML/CSS-SCSS, Angular, React, Next.js, Vue, Nuxt,
   Astro; UI PrimeNG/PrimeFlex/Tailwind/Bootstrap; tests Vitest/Jest/Angular
