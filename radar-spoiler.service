@@ -8,7 +8,7 @@ Type=oneshot
 User=dsantacruz
 WorkingDirectory=/home/dsantacruz/projects/night-agent
 ExecStart=/home/dsantacruz/projects/night-agent/venv/bin/python3 -m batcave.radar --specialist spoiler
-Environment=PATH=/home/dsantacruz/.nvm/versions/node/v22.23.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/home/dsantacruz/.local/share/node-current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=/etc/night-agent.env
 TimeoutStartSec=1800
 Nice=10
