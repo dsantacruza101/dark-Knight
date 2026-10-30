@@ -29,6 +29,19 @@ Sin TYPESAFE_API_KEY (o si TypeSafe falla): notify_now si level >= 12 o
 ruta critica, si no digest. Una ruta critica nunca se descarta con
 `ignore` (como minimo va al digest).
 
+Cambios explicados por sudo: el estado guarda un buffer de los sudo
+exitosos de los ultimos `sudo_buffer_seconds` (10 min: usuario, TTY, PWD y
+COMMAND). Un cambio FIM en ruta critica precedido (hasta
+`sudo_explain_window`, 120s, por la hora del syslog) por un sudo de
+`sudo_explain_user` desde una TTY interactiva cuyo comando lo explica
+(menciona el nombre del archivo; systemctl enable/disable: la unit del
+symlink; cp/install/mv/ln/tee/sed -i: la ruta destino) no se alerta: va al
+digest en "Cambios explicados por sudo" con el comando enmascarado. Si no
+hay explicacion y la alerta tiene menos de `sudo_explain_grace` segundos se
+aplaza un poll (el sudo puede llegar despues); si tampoco aparece, se
+alerta como siempre. sudoers, ssh, authorized_keys y los .env de secretos
+(NEVER_EXPLAIN_PATHS) nunca se explican: alertan siempre de inmediato.
+
 Las notificaciones a Alfred empiezan con "🦇 Batwoman" y se deduplican en
 batcave/memory/batwoman_alert_state.json por rule id + srcip/ruta: solo se
 reenvia si pasaron 6 horas. Los hallazgos de severidad high/critical se
@@ -86,6 +99,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -128,6 +142,11 @@ DEFAULTS = {
     "alert_cooldown_hours": 6,
     "critical_paths": [],
     "integrity_timeout": 600,
+    "sudo_buffer_seconds": 600,
+    "sudo_explain_window": 120,
+    "sudo_explain_grace": 30,
+    "sudo_explain_user": "dsantacruz",
+    "never_explain_paths": [],
 }
 
 # Tope de bytes leidos por poll: si Wazuh genera una rafaga enorme, el resto
@@ -144,6 +163,34 @@ INTEGRITY_IGNORED_PREFIX = "/etc/"
 # o "missing  "), espacio, atributo ('c' = conffile o espacio), espacio, ruta.
 DPKG_VERIFY_LINE = re.compile(r"^(?P<result>.{9}) (?P<attr>[c ]) (?P<path>/.*)$")
 INTEGRITY_MAX_LISTED = 15
+
+# Cambios en rutas criticas explicados por un sudo interactivo del admin
+# (instalar units: sudo cp ... /etc/systemd/system/, systemctl enable).
+# Estas rutas NUNCA se explican: siempre alertan, aunque haya un sudo.
+NEVER_EXPLAIN_PATHS = (
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/etc/ssh",
+    "/etc/night-agent.env",
+    "/etc/webhook.env",
+    "/etc/telegram-bot.env",
+)
+INTERACTIVE_TTY = re.compile(r"^(/dev/)?(pts/\d+|tty\d+)$")
+SUDO_FAILURE_GROUPS = {"authentication_failed", "authentication_failures", "invalid_login"}
+SYSLOG_TIME = re.compile(r"^(?P<month>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})")
+SYSLOG_MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+SYSLOG_MAX_DRIFT = timedelta(minutes=10)
+# El syslog del sudo tiene resolucion de segundos y la alerta FIM puede
+# llevar la hora del manager: tolerancia minima "despues" del cambio.
+SUDO_CLOCK_SKEW = timedelta(seconds=2)
+SUDO_BUFFER_MAX = 500
+SUDO_EXPLAINED_MAX = 100
+SUDO_COMMAND_CHARS = 300
+SUDO_DIGEST_GROUPS = 10
+SYSTEMCTL_LINK_VERBS = {"enable", "disable", "reenable"}
+DEST_COMMANDS = {"cp", "install", "mv", "ln"}
+DEST_VALUE_OPTS = {"-S", "--suffix"}
+INSTALL_VALUE_OPTS = {"-m", "--mode", "-o", "--owner", "-g", "--group"}
 
 SEVERITY_LEVELS = ["info", "low", "medium", "high", "critical"]
 COMMS_SEVERITIES = {"high", "critical"}
@@ -544,6 +591,270 @@ def triage(fields: dict, config: dict, allowlist: list[dict]) -> tuple[str, str]
     if fields["level"] < config["evaluate_level"]:
         return "digest", f"nivel {fields['level']}"
     return "evaluate", f"nivel {fields['level']} >= {config['evaluate_level']}"
+
+
+# --- Cambios explicados por sudo ------------------------------------------------
+
+
+def parse_alert_timestamp(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%f%z")
+    except (TypeError, ValueError):
+        return None
+
+
+def syslog_time(text: Optional[str], reference: datetime) -> Optional[datetime]:
+    """Hora del syslog ("Oct 30 03:01:36", hora local del host, sin anio).
+    Es la hora real del comando: la alerta de Wazuh del sudo puede llegar
+    DESPUES que la del FIM que provoco (journald va con ~2s de retraso).
+    None si no se puede leer o si se aleja de la alerta mas de lo razonable
+    (zona horaria distinta): entonces se usa la hora de la alerta."""
+    match = SYSLOG_TIME.match(text or "")
+    if not match or match.group("month") not in SYSLOG_MONTHS:
+        return None
+    try:
+        naive = datetime(
+            reference.year, SYSLOG_MONTHS[match.group("month")], int(match.group("day")),
+            *(int(part) for part in match.group("time").split(":")),
+        )
+    except ValueError:
+        return None
+    parsed = naive.astimezone()  # naive = hora local del host
+    if parsed - reference > timedelta(days=1):  # cruce de anio (31 dic -> 1 ene)
+        parsed = parsed.replace(year=parsed.year - 1)
+    if abs(parsed - reference) > SYSLOG_MAX_DRIFT:
+        return None
+    return parsed
+
+
+def _sudo_log_field(full_log: str, name: str) -> str:
+    match = re.search(rf"\b{name}=([^;]*?)\s*(?:;|$)", full_log)
+    return match.group(1).strip() if match else ""
+
+
+def sudo_event(alert: dict) -> Optional[dict]:
+    """Evento de sudo exitoso (5402 y relacionadas: decoder `sudo` con
+    COMMAND) para el buffer, o None si la alerta no lo es."""
+    decoder = alert.get("decoder") or {}
+    if "sudo" not in (decoder.get("parent"), decoder.get("name")):
+        return None
+    rule = alert.get("rule") or {}
+    if SUDO_FAILURE_GROUPS & set(rule.get("groups") or []):
+        return None
+    data = alert.get("data") or {}
+    full_log = alert.get("full_log") or ""
+    # COMMAND va al final de la linea y puede traer ';' propios.
+    command = data.get("command") or (full_log.split("COMMAND=", 1)[1].strip() if "COMMAND=" in full_log else "")
+    alert_ts = parse_alert_timestamp(alert.get("timestamp", ""))
+    if not command or alert_ts is None:
+        return None
+    user_match = re.search(r"sudo(?:\[\d+\])?:\s+(\S+) :", full_log)
+    event_ts = syslog_time((alert.get("predecoder") or {}).get("timestamp"), alert_ts) or alert_ts
+    return {
+        "id": str(alert.get("id", "")),
+        "rule_id": str(rule.get("id", "?")),
+        "timestamp": event_ts.isoformat(),
+        "user": data.get("srcuser") or (user_match.group(1) if user_match else ""),
+        "tty": data.get("tty") or _sudo_log_field(full_log, "TTY"),
+        "pwd": data.get("pwd") or _sudo_log_field(full_log, "PWD"),
+        "command": command,
+    }
+
+
+def update_sudo_buffer(buffer: list[dict], alerts: list[dict], config: dict, now: Optional[datetime] = None) -> list[dict]:
+    """Agrega los sudo del lote al buffer y descarta los mas viejos que
+    `sudo_buffer_seconds` (10 min). Se llama ANTES de procesar el lote, asi
+    un sudo cuya alerta llega despues de la del FIM (mismo lote) igual cuenta."""
+    known = {ev.get("id") for ev in buffer}
+    for alert in alerts:
+        ev = sudo_event(alert)
+        if ev and ev["id"] not in known:
+            buffer.append(ev)
+            known.add(ev["id"])
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=config["sudo_buffer_seconds"])
+    kept = []
+    for ev in buffer:
+        try:
+            if datetime.fromisoformat(ev["timestamp"]) >= cutoff:
+                kept.append(ev)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return kept[-SUDO_BUFFER_MAX:]
+
+
+def is_never_explained(path: str, config: dict) -> bool:
+    """Rutas que SIEMPRE alertan aunque las cambie un sudo interactivo
+    (sudoers, ssh, authorized_keys, archivos .env de secretos). Regla fija:
+    config.yaml (`never_explain_paths`) solo puede ampliar la lista."""
+    if is_critical_path(path, list(NEVER_EXPLAIN_PATHS) + list(config.get("never_explain_paths") or [])):
+        return True
+    base = os.path.basename(path)
+    return "/.ssh/" in path or base.startswith("authorized_keys") or base.endswith(".env")
+
+
+def _abs_path(token: str, pwd: str) -> str:
+    return os.path.normpath(os.path.join(pwd or "/", token))
+
+
+def _systemctl_explains(path: str, args: list[str]) -> bool:
+    """enable/disable/reenable crean o borran el symlink de la unit: explica
+    el cambio si el symlink se llama como la unit o apunta a ella."""
+    positional = [a for a in args if not a.startswith("-")]
+    if not positional or positional[0] not in SYSTEMCTL_LINK_VERBS:
+        return False
+    units = {os.path.basename(u) if "." in os.path.basename(u) else f"{os.path.basename(u)}.service" for u in positional[1:]}
+    names = {os.path.basename(path)}
+    try:
+        names.add(os.path.basename(os.readlink(path)))
+    except OSError:
+        pass  # disable ya lo borro, o no es symlink
+    return bool(names & units)
+
+
+def _copy_explains(path: str, prog: str, args: list[str], pwd: str) -> bool:
+    """cp/install/mv/ln: explica el cambio solo si `path` es el destino (el
+    archivo destino, o <directorio destino>/<nombre de una fuente>)."""
+    value_opts = DEST_VALUE_OPTS | (INSTALL_VALUE_OPTS if prog == "install" else set())
+    target_dir: Optional[str] = None
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            positional += args[i + 1:]
+            break
+        if arg in ("-t", "--target-directory"):
+            target_dir = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
+        if arg.startswith("--target-directory="):
+            target_dir = arg.split("=", 1)[1]
+        elif arg in value_opts:
+            i += 1
+        elif not arg.startswith("-") or arg == "-":
+            positional.append(arg)
+        i += 1
+
+    if target_dir:
+        dest_dir, sources, candidates = _abs_path(target_dir, pwd), positional, set()
+    else:
+        if len(positional) < 2:
+            return False
+        dest = _abs_path(positional[-1], pwd)
+        dest_dir, sources, candidates = dest, positional[:-1], {dest}
+    candidates |= {os.path.join(dest_dir, os.path.basename(s.rstrip("/"))) for s in sources}
+    # Copias recursivas: archivos dentro de <destino>/<fuente>/. Nunca el
+    # prefijo del directorio destino solo (explicaria todo lo que hay ahi).
+    return path in candidates or any(
+        path.startswith(c + "/") for c in candidates if c != dest_dir
+    )
+
+
+def _sed_explains(path: str, args: list[str], pwd: str) -> bool:
+    """sed solo modifica con -i/--in-place; los archivos son los posicionales
+    (el primero es el script si no se uso -e/-f)."""
+    in_place = script_given = False
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-e", "--expression", "-f", "--file", "-l", "--line-length"):
+            script_given = script_given or arg not in ("-l", "--line-length")
+            i += 2
+            continue
+        if arg.startswith(("--expression=", "--file=")):
+            script_given = True
+        elif arg.startswith("--in-place"):
+            in_place = True
+        elif arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
+            flags = arg[1:]
+            for j, flag in enumerate(flags):
+                if flag == "i":  # -i[SUFIJO]: lo que sigue es el sufijo del respaldo
+                    in_place = True
+                    break
+                if flag in "efl":
+                    script_given = script_given or flag != "l"
+                    if j == len(flags) - 1:
+                        i += 1  # el valor es el siguiente argumento
+                    break
+        elif not arg.startswith("--"):
+            positional.append(arg)
+        i += 1
+    files = positional if script_given else positional[1:]
+    return in_place and path in {_abs_path(f, pwd) for f in files}
+
+
+def command_explains(path: str, command: str, pwd: str) -> bool:
+    """True si el comando de sudo explica el cambio FIM en `path`."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return False
+    prog, args = os.path.basename(tokens[0]), tokens[1:]
+    if prog == "systemctl":
+        return _systemctl_explains(path, args)
+    if prog in DEST_COMMANDS:
+        return _copy_explains(path, prog, args, pwd)
+    if prog == "tee":
+        return path in {_abs_path(a, pwd) for a in args if not a.startswith("-")}
+    if prog == "sed":
+        return _sed_explains(path, args, pwd)
+    base = os.path.basename(path)
+    return any(os.path.basename(a.rstrip("/")) == base for a in args)
+
+
+def find_sudo_explanation(fields: dict, buffer: list[dict], config: dict) -> Optional[dict]:
+    """Sudo interactivo de `sudo_explain_user` (TTY pts/tty) hasta
+    `sudo_explain_window` segundos ANTES del cambio cuyo comando lo explica.
+    Devuelve el mas reciente, o None (nunca para rutas is_never_explained)."""
+    path = fields["syscheck_path"]
+    change_ts = parse_alert_timestamp(fields["timestamp"])
+    if not path or change_ts is None or is_never_explained(path, config):
+        return None
+    window = timedelta(seconds=config["sudo_explain_window"])
+    best, best_ts = None, None
+    for ev in buffer:
+        if ev.get("user") != config["sudo_explain_user"] or not INTERACTIVE_TTY.match(ev.get("tty") or ""):
+            continue
+        try:
+            ts = datetime.fromisoformat(ev["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (change_ts - window <= ts <= change_ts + SUDO_CLOCK_SKEW):
+            continue
+        if command_explains(path, ev.get("command", ""), ev.get("pwd", "")) and (best_ts is None or ts > best_ts):
+            best, best_ts = ev, ts
+    return best
+
+
+def should_defer(fields: dict, config: dict, now: Optional[datetime] = None) -> bool:
+    """Una ruta critica sin explicacion cuya alerta tiene menos de
+    `sudo_explain_grace` segundos se aplaza un poll: la alerta del sudo
+    puede no haberse escrito todavia en alerts.json."""
+    change_ts = parse_alert_timestamp(fields["timestamp"])
+    if change_ts is None or is_never_explained(fields["syscheck_path"], config):
+        return False
+    age = (now or datetime.now(timezone.utc)) - change_ts
+    return age < timedelta(seconds=config["sudo_explain_grace"])
+
+
+def record_sudo_explained(digest: dict, fields: dict, ev: dict) -> None:
+    digest["sudo_explained_count"] = digest.get("sudo_explained_count", 0) + 1
+    items = digest.setdefault("sudo_explained", [])
+    if len(items) < SUDO_EXPLAINED_MAX:
+        items.append(
+            {
+                "timestamp": fields["timestamp"],
+                "path": fields["syscheck_path"],
+                "event": fields["syscheck_event"] or "cambio",
+                "sudo_id": ev.get("id", ""),
+                "user": ev.get("user", ""),
+                "tty": ev.get("tty", ""),
+                "command": mask_secrets(ev.get("command", ""))[:SUDO_COMMAND_CHARS],
+            }
+        )
 
 
 # --- Evaluacion ---------------------------------------------------------------
@@ -971,6 +1282,48 @@ def add_to_digest(digest: dict, fields: dict) -> None:
         digest["fim_changes"] += 1
 
 
+def render_sudo_explained(digest: dict) -> tuple[list[str], list[str]]:
+    """Seccion 'Cambios explicados por sudo' del digest: (HTML, Markdown).
+    En Telegram se agrupa por comando (un cp instala varios archivos)."""
+    count = digest.get("sudo_explained_count", 0)
+    if not count:
+        return [], []
+    items = digest.get("sudo_explained") or []
+    groups: dict[str, list[dict]] = {}
+    for item in items:
+        groups.setdefault(item.get("sudo_id") or item["command"], []).append(item)
+
+    html_lines = [f"<b>Cambios explicados por sudo:</b> {_code(count)}"]
+    for group in list(groups.values())[:SUDO_DIGEST_GROUPS]:
+        first = group[0]
+        paths = ", ".join(_code(i["path"]) for i in group[:5]) + (f" (+{len(group) - 5})" if len(group) > 5 else "")
+        html_lines.append(
+            f"• {_code(format_local_time(first['timestamp']))} {_code(first['command'])} "
+            f"({html.escape(first['user'])} en {html.escape(first['tty'])}) → {paths}"
+        )
+    if len(groups) > SUDO_DIGEST_GROUPS:
+        html_lines.append(f"• ... y {len(groups) - SUDO_DIGEST_GROUPS} comando(s) mas (ver reporte)")
+
+    md = [
+        "## Cambios explicados por sudo",
+        "",
+        "Cambios en rutas criticas precedidos por un sudo interactivo del admin "
+        "(no se alertaron de inmediato).",
+        "",
+        "| Hora | Ruta | Evento | Usuario / TTY | Comando |",
+        "|---|---|---|---|---|",
+        *[
+            f"| {format_local_time(i['timestamp'])} | {_table_cell(i['path'])} | {_table_cell(i['event'])} "
+            f"| {_table_cell(i['user'])} {_table_cell(i['tty'])} | `{_table_cell(i['command'])}` |"
+            for i in items
+        ],
+    ]
+    if count > len(items):
+        md.append(f"\n- ... y {count - len(items)} cambio(s) mas no listados.")
+    md.append("")
+    return html_lines, md
+
+
 def render_digest(digest: dict, config: dict) -> tuple[str, str]:
     """Devuelve (mensaje HTML para Telegram, reporte Markdown)."""
     total = sum(digest["by_level"].values())
@@ -990,6 +1343,8 @@ def render_digest(digest: dict, config: dict) -> tuple[str, str]:
     msg.append("<b>Top IPs de origen:</b>")
     msg += [f"• {_code(ip)} — {n}" for ip, n in top_ips] or ["• ninguna"]
     msg.append(f"<b>Cambios FIM:</b> {_code(digest['fim_changes'])}")
+    explained_html, explained_md = render_sudo_explained(digest)
+    msg += explained_html
     integrity_html, integrity_md = render_integrity(digest.get("integrity"))
     msg.append(f"<b>Integridad de paquetes:</b> {integrity_html}")
     egress_html, egress_md = [], []
@@ -1011,6 +1366,7 @@ def render_digest(digest: dict, config: dict) -> tuple[str, str]:
         f"- Notificadas a Alfred/Batman: {digest['notified']}",
         f"- Ignoradas por allowlist: {digest['allowlisted']}",
         f"- Cambios FIM: {digest['fim_changes']}",
+        f"- Cambios explicados por sudo: {digest.get('sudo_explained_count', 0)}",
         f"- Integridad de paquetes (dpkg --verify): {integrity_md}",
         "",
         "## Conteo por nivel",
@@ -1028,6 +1384,7 @@ def render_digest(digest: dict, config: dict) -> tuple[str, str]:
         "|---|---|",
         *[f"| {ip} | {n} |" for ip, n in top_ips],
         "",
+        *explained_md,
         *egress_md,
     ]
     return "\n".join(msg), mask_secrets("\n".join(md))
@@ -1089,9 +1446,13 @@ async def process_alert(
     allowlist: list[dict],
     client: Optional[AsyncTypeSafeClient],
     notifier: TelegramNotifier,
+    sudo_buffer: list[dict],
+    allow_defer: bool = True,
 ) -> str:
     """Triage + evaluacion + notificacion de una alerta. Devuelve la
-    decision de triage (para el resumen del poll)."""
+    decision de triage (para el resumen del poll): ademas de las de
+    triage(), `explained` (ruta critica explicada por sudo, va al digest) y
+    `deferred` (aplazada al proximo poll esperando el sudo)."""
     fields = alert_fields(alert)
     decision_kind, reason = triage(fields, config, allowlist)
     if decision_kind == "allowlisted":
@@ -1100,6 +1461,21 @@ async def process_alert(
         return decision_kind
     if decision_kind == "below_level":
         return decision_kind
+
+    if decision_kind == "critical":
+        explanation = find_sudo_explanation(fields, sudo_buffer, config)
+        if explanation:
+            add_to_digest(state["digest"], fields)
+            record_sudo_explained(state["digest"], fields, explanation)
+            log.info(
+                "Ruta critica %s (%s) explicada por sudo de %s en %s: %s",
+                fields["syscheck_path"], fields["syscheck_event"], explanation["user"],
+                explanation["tty"], explanation["command"],
+            )
+            return "explained"
+        if allow_defer and should_defer(fields, config):
+            state.setdefault("fim_pending", []).append(alert)
+            return "deferred"
 
     add_to_digest(state["digest"], fields)
     if decision_kind == "digest":
@@ -1124,10 +1500,16 @@ async def poll(config: dict, client: Optional[AsyncTypeSafeClient], notifier: Te
     alerts, state = fetch_new_alerts(config, state)
     allowlist = load_allowlist()
     counts: Counter = Counter()
+    # Los sudo del lote entran al buffer antes de procesar nada: la alerta
+    # del sudo suele llegar despues que la del FIM que provoco.
+    sudo_buffer = update_sudo_buffer(state.get("sudo_buffer") or [], alerts, config)
+    state["sudo_buffer"] = sudo_buffer
+    # Las aplazadas del poll anterior se resuelven ahora, sin volver a aplazar.
+    pending = [(alert, False) for alert in state.pop("fim_pending", None) or []]
 
-    for alert in alerts:
+    for alert, allow_defer in pending + [(alert, True) for alert in alerts]:
         try:
-            counts[await process_alert(alert, state, config, allowlist, client, notifier)] += 1
+            counts[await process_alert(alert, state, config, allowlist, client, notifier, sudo_buffer, allow_defer)] += 1
         except Exception:  # noqa: BLE001 - una alerta rara no debe bloquear el resto del lote
             counts["error"] += 1
             log.exception("Fallo procesando la alerta %s", alert.get("id", "?"))
@@ -1149,10 +1531,15 @@ async def dry_run(config: dict, client: Optional[AsyncTypeSafeClient]) -> None:
     allowlist = load_allowlist()
     counts: Counter = Counter()
     digest = empty_digest()
+    sudo_buffer = [ev for ev in map(sudo_event, alerts) if ev]
     print(f"=== Batwoman dry-run: {len(alerts)} alerta(s), {len(allowlist)} regla(s) de allowlist ===")
     for alert in alerts:
         fields = alert_fields(alert)
         decision_kind, reason = triage(fields, config, allowlist)
+        if decision_kind == "critical":
+            explanation = find_sudo_explanation(fields, sudo_buffer, config)
+            if explanation:
+                decision_kind, reason = "explained", f"sudo: {explanation['command'][:80]}"
         counts[decision_kind] += 1
         target = fields["srcip"] or fields["syscheck_path"]
         line = (

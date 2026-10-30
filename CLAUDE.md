@@ -544,6 +544,23 @@ Triage, en este orden:
    cambios FIM bajo `night-agent` (git pull) NO se ignoran a proposito.
 3. **Nivel**: < 7 se ignora; 7-9 va al digest; >= 10 se evalua.
 
+**Cambios explicados por sudo** (ruta critica): el estado guarda un buffer
+de 10 min (`sudo_buffer_seconds`) de los sudo exitosos (decoder `sudo` con
+COMMAND: usuario, TTY, PWD, comando); se llena con todo el lote ANTES de
+procesarlo (la alerta del sudo llega ~2s despues que la del FIM) y la hora
+del sudo es la del syslog. Si hasta `sudo_explain_window` (120s) antes del
+cambio hay un sudo de `sudo_explain_user` desde TTY interactiva
+(`pts/N`/`ttyN`) cuyo comando lo explica (systemctl enable/disable/reenable:
+symlink con el nombre de la unit o que apunta a ella; cp/install/mv/ln:
+destino o `<dir destino>/<fuente>`; tee y `sed -i`: archivos destino; otros:
+menciona el nombre del archivo), no se alerta: va al digest en "Cambios
+explicados por sudo" con el comando enmascarado. Sin explicacion y con
+alerta de menos de `sudo_explain_grace` (30s) se aplaza UN poll
+(`fim_pending`); despues alerta como siempre. Nunca se explican
+(`NEVER_EXPLAIN_PATHS` fijo + `never_explain_paths`): sudoers(.d), `/etc/ssh`,
+cualquier `/.ssh/` o `authorized_keys*` y los `*.env`. Tests:
+`tests/test_batwoman_sudo.py`.
+
 Evaluacion con TypeSafe (Jev): `is_real_threat` (Noul), `severity` (Score:
 info/low/medium/high/critical), `action` (Choice: notify_now/digest/ignore),
 con estado = regla, nivel, descripcion, tacticas MITRE, grupos, srcip, ruta y
