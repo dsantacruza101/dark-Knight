@@ -113,6 +113,7 @@ from modes.development import (
     DEFAULT_WORK_BRANCH,
     OLLAMA_API_BASE,
     PROTECTED_BRANCHES,
+    changed_entries,
     changed_files,
     commit_allowed_and_push,
     git_cmd,
@@ -126,6 +127,7 @@ from modes.development import (
     read_repo_claude_md,
     remove_aider_artifacts,
     repo_is_clean,
+    revert_entries,
     resolve_work_branch,
     run_cli,
     run_test_file,
@@ -947,9 +949,7 @@ def only_test_files_changed(repo_path: Path) -> bool:
 
 
 def discard_changes(repo_path: Path) -> None:
-    for rel_path in changed_files(repo_path):
-        run_cli(["git", "checkout", "--", rel_path], cwd=repo_path)
-        run_cli(["git", "clean", "-f", "--", rel_path], cwd=repo_path)
+    revert_entries(repo_path, changed_entries(repo_path))
 
 
 def run_single_node_test(repo_path: Path, test_rel: str) -> bool:

@@ -1,0 +1,16 @@
+[Unit]
+Description=Spoiler release manager — sincroniza ramas de trabajo con la base y prepara PRs (nunca mergea)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dsantacruz
+WorkingDirectory=/home/dsantacruz/projects/night-agent
+ExecStart=/home/dsantacruz/projects/night-agent/venv/bin/python3 -m batcave.release
+Environment=PATH=/home/dsantacruz/.nvm/versions/node/v22.23.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/etc/night-agent.env
+TimeoutStartSec=1800
+Nice=10
+StandardOutput=journal
+StandardError=journal

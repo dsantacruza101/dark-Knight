@@ -1,0 +1,9 @@
+[Unit]
+Description=Spoiler release manager — diario a las 6:30 AM (tras la noche de Batman)
+
+[Timer]
+OnCalendar=*-*-* 06:30:00 America/El_Salvador
+Persistent=true
+
+[Install]
+WantedBy=timers.target
