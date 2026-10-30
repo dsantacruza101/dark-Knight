@@ -14,6 +14,7 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 | **Red Hood** | `red_hood.py` (`red-hood.service` + `red-hood.timer`, diario a las 02:00 America/El_Salvador) | QA brutal, sin piedad. Audita tests, cobertura, lint, vulnerabilidades y secretos hardcodeados en los repos locales, genera tests faltantes con Aider y reporta todo sin filtro. |
 | **Batwoman** (Kate Kane) | `batwoman.py` (`batwoman.service`, `Type=simple`, poll cada `batwoman.poll_interval` s) | Analista de seguridad. Lee las alertas de Wazuh, hace triage (allowlist, rutas criticas, nivel), las evalua con TypeSafe (Jev) y avisa a Alfred/Batman de las amenazas reales; digest diario a las 08:00. |
 | **Radar** | `batcave/radar.py` (`radar-nightwing.timer` diario 07:00 y `radar-nightwing-weekly.timer` lunes 01:00; `radar-batgirl.timer` diario 07:10 y `radar-batgirl-weekly.timer` lunes 01:20; `radar-red-robin.timer` diario 07:20 y `radar-red-robin-weekly.timer` lunes 01:40; `radar-robin.timer` diario 07:30 y `radar-robin-weekly.timer` lunes 02:00; `radar-spoiler.timer` diario 07:40 y `radar-spoiler-weekly.timer` lunes 02:20) | Radar tecnologico por especialista: inventario de dependencias, vulnerabilidades (OSV) y ultimas versiones; abre issues de parches para que el especialista los aplique de noche. Spoiler: GitHub Actions + imagenes base de Docker. |
+| **Spoiler (release manager)** | `batcave/release.py` (`spoiler-release.service` + `spoiler-release.timer`, diario 06:30 America/El_Salvador) | Mergea la rama base en cada rama de trabajo (sin force-push), crea/actualiza el PR rama de trabajo -> base con los commits agrupados, `Closes #N` y CI; nunca mergea. Avisa a Alfred de los PRs listos. |
 
 ## Modos de Batman (`modes/`)
 
@@ -333,6 +334,53 @@ workspace, OSV, issues, Telegram, Claude, estado ni reporte.
   `--specialist` y la hora (escalonada 10-20 min), y agregar los timers al
   `CATALOG` de Lucius (medium).
 
+## Release manager de Spoiler (`batcave/release.py`)
+
+`python3 -m batcave.release [--dry-run]` (con el venv; timer
+`spoiler-release.timer`, diario 06:30 America/El_Salvador, despues de la
+noche de Batman y antes de los radares). Config en `config.yaml`
+(`release:` `workspace_dir`, `max_commits_listed`).
+
+Repos: la union (sin duplicados) de `repos` de todos los perfiles de
+`batcave/specialists/*.yaml`; rama de trabajo = `resolve_work_branch` (`dev`,
+`development` en my_Portfolio_React_v2), base = rama por defecto del repo en
+GitHub (sin token, en dry-run: `origin/HEAD`). Si la rama de trabajo es
+main/master, igual a la base o no existe en origin, el repo se omite con
+error. Copia aislada en `release.workspace_dir/<repo>`
+(`~/projects/.release-workspace`; se niega a correr si se cruza con
+`repo_paths` / `red_hood.local_repos`). Auth de git por entorno
+(`github_auth_env`) y log enmascarado en `release.log`.
+
+1. **SYNC**: copia local = `origin/<rama>` (el `reset --hard` es solo local).
+   Si la base tiene commits que no estan en la rama de trabajo: `git merge
+   --no-edit origin/<base>` + `git push origin <rama>` (nunca reset del
+   remoto ni force-push). Conflicto -> `git merge --abort`, no se pushea
+   nada, Telegram a Alfred (una vez por par de SHAs base/trabajo) y queda en
+   el estado (`conflict`, `conflict_files`). Un merge que falla sin
+   conflictos (p. ej. identidad de git) es error del repo.
+2. **PR**: si la rama de trabajo tiene commits sin mergear (`git log
+   --no-merges base..rama`; el merge de sync solo no cuenta), crea el PR
+   `<rama> -> <base>` (`chore(release): <rama> -> <base>`) si no hay uno
+   abierto, o actualiza su cuerpo si cambio. Cuerpo (marcador `<!--
+   spoiler-release -->`): commits agrupados en parches de seguridad
+   (`fix(deps): ... (radar)` o `Resuelto por: deterministic-patch`),
+   features (`feat`), fixes (`fix`) y otros (max `max_commits_listed` por
+   grupo); `Closes #N` por cada issue abierto con `in-dev` cuyo commit de
+   arreglo esta en el PR (SHA del comentario `Aplicado en <rama>: <sha>` o
+   `Resuelve #N` en un commit del PR); CI del HEAD (statuses + check runs:
+   success/failure/pending/none). Nunca mergea un PR.
+3. **NOTIFY**: un solo mensaje a Alfred ("🚀 Spoiler — releases listos",
+   HTML escapado) con los repos con PR listo (sin conflicto ni error):
+   link, commits, parches de seguridad y CI; solo si la firma (repo, PR,
+   HEAD, commits, seguridad) cambio desde la corrida anterior. Estado en
+   `batcave/memory/release_state.json`.
+
+`--dry-run`: sincroniza la copia local e imprime el plan (merge pendiente,
+PR a crear/actualizar y el cuerpo completo); sin merge, push, PRs, Telegram
+ni estado. El token necesita `Contents: write` y `Pull requests: write`;
+para el CI, `Commit statuses: read` y `Checks: read` (si falta, el CI sale
+`unknown` y se sigue). Tests: `tests/test_release.py`.
+
 ## Comunicacion: `batcave/comms.json`
 
 Bandeja compartida entre Batman y Lucius (Alfred la lee como contexto, no
@@ -395,8 +443,8 @@ Catalogo de `ServiceCheck` (`kind` → chequeo/reparacion):
   `radar-nightwing-weekly.timer`, `radar-batgirl.timer`,
   `radar-batgirl-weekly.timer`, `radar-red-robin.timer`,
   `radar-red-robin-weekly.timer`, `radar-robin.timer`,
-  `radar-robin-weekly.timer`, `radar-spoiler.timer` y
-  `radar-spoiler-weekly.timer` (medium) → `systemctl is-active` / `systemctl restart`
+  `radar-robin-weekly.timer`, `radar-spoiler.timer`,
+  `radar-spoiler-weekly.timer` y `spoiler-release.timer` (medium) → `systemctl is-active` / `systemctl restart`
   (para `*.timer`, `systemctl enable --now` en vez de solo `restart`, para
   que la reparacion sobreviva reinicios del servidor).
 - **docker**: `daniel-portfolio-app`, `portfolioservicelauncher-client-gateway-1`,
@@ -619,12 +667,13 @@ sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.time
   radar-batgirl.service radar-batgirl.timer radar-batgirl-weekly.service radar-batgirl-weekly.timer \
   radar-red-robin.service radar-red-robin.timer radar-red-robin-weekly.service radar-red-robin-weekly.timer \
   radar-robin.service radar-robin.timer radar-robin-weekly.service radar-robin-weekly.timer \
-  radar-spoiler.service radar-spoiler.timer radar-spoiler-weekly.service radar-spoiler-weekly.timer /etc/systemd/system/
+  radar-spoiler.service radar-spoiler.timer radar-spoiler-weekly.service radar-spoiler-weekly.timer \
+  spoiler-release.service spoiler-release.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer batwoman.service \
   radar-nightwing.timer radar-nightwing-weekly.timer radar-batgirl.timer radar-batgirl-weekly.timer \
   radar-red-robin.timer radar-red-robin-weekly.timer radar-robin.timer radar-robin-weekly.timer \
-  radar-spoiler.timer radar-spoiler-weekly.timer
+  radar-spoiler.timer radar-spoiler-weekly.timer spoiler-release.timer
 ```
 
 ## Convenciones

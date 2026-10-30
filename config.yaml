@@ -102,6 +102,13 @@ radar:
   max_weekly_summaries: 5          # notas de Claude por semana (protege el presupuesto semanal)
   claude_timeout: 600              # segundos por nota en modo --weekly
 
+# Release manager de Spoiler (batcave/release.py, spoiler-release.timer 06:30):
+# merge base -> rama de trabajo (sin force-push) y PR rama de trabajo -> base
+# (nunca se mergea). Workspace aislado, nunca produccion.
+release:
+  workspace_dir: ~/projects/.release-workspace
+  max_commits_listed: 50     # commits por grupo en el cuerpo del PR
+
 knowledge_base:
   path: ~/projects/night-agent/knowledge
   max_examples: 1000
