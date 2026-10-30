@@ -163,7 +163,10 @@ Builtins:
 
 - `npm_ci_if_needed` — `npm ci` solo si falta `node_modules` o cambio
   `package-lock.json` (hash guardado en `node_modules`). Su fallo no corta la
-  verificacion (el build fallara de todas formas).
+  verificacion (el build fallara de todas formas). Repo greenfield (hay
+  `package.json` sin `package-lock.json`) con `package-lock.json` entre los
+  archivos permitidos del issue: corre `npm install`, y el lockfile generado
+  se comitea con el resto.
 - `py_compile_changed` — `py_compile` sobre los `.py` modificados/creados.
 - `compose_config` — `docker compose [--env-file <plantilla>] -f <archivo>
   config -q` por cada `docker-compose*.y*ml`/`compose*.y*ml` del repo (en el
