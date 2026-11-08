@@ -1,0 +1,112 @@
+{
+  "title": "CISA Catalog of Known Exploited Vulnerabilities",
+  "catalogVersion": "2026.11.07",
+  "dateReleased": "2026-11-07T17:00:00.0000Z",
+  "count": 8,
+  "vulnerabilities": [
+    {
+      "cveID": "CVE-2026-1001",
+      "vendorProject": "Linux",
+      "product": "Kernel",
+      "vulnerabilityName": "Linux Kernel Use-After-Free Vulnerability",
+      "dateAdded": "2026-11-01",
+      "shortDescription": "Use-after-free en netfilter.",
+      "requiredAction": "Apply mitigations per vendor instructions.",
+      "dueDate": "2026-11-22",
+      "knownRansomwareCampaignUse": "Unknown",
+      "notes": "",
+      "cwes": ["CWE-416"]
+    },
+    {
+      "cveID": "CVE-2026-1002",
+      "vendorProject": "Linux",
+      "product": "Kernel",
+      "vulnerabilityName": "Linux Kernel Privilege Escalation <io_uring> & friends",
+      "dateAdded": "2026-11-05",
+      "shortDescription": "Escalada local en io_uring.",
+      "requiredAction": "Apply mitigations per vendor instructions.",
+      "dueDate": "2026-11-26",
+      "knownRansomwareCampaignUse": "Known",
+      "notes": "",
+      "cwes": ["CWE-787"]
+    },
+    {
+      "cveID": "CVE-2016-5195",
+      "vendorProject": "Linux",
+      "product": "Kernel",
+      "vulnerabilityName": "Linux Kernel Race Condition Vulnerability (Dirty COW)",
+      "dateAdded": "2022-03-03",
+      "shortDescription": "Race condition en copy-on-write.",
+      "requiredAction": "Apply updates per vendor instructions.",
+      "dueDate": "2022-03-24",
+      "knownRansomwareCampaignUse": "Unknown",
+      "notes": "",
+      "cwes": []
+    },
+    {
+      "cveID": "CVE-2026-2001",
+      "vendorProject": "OpenBSD",
+      "product": "OpenSSH",
+      "vulnerabilityName": "OpenSSH Signal Handler Race Condition",
+      "dateAdded": "2026-10-20",
+      "shortDescription": "Race en sshd.",
+      "requiredAction": "Apply updates per vendor instructions.",
+      "dueDate": "2026-11-10",
+      "knownRansomwareCampaignUse": "Unknown",
+      "notes": "",
+      "cwes": []
+    },
+    {
+      "cveID": "CVE-2026-3001",
+      "vendorProject": "Docker",
+      "product": "Desktop",
+      "vulnerabilityName": "Docker Desktop SSRF",
+      "dateAdded": "2026-10-30",
+      "shortDescription": "No corre en el servidor.",
+      "requiredAction": "Apply updates per vendor instructions.",
+      "dueDate": "2026-11-20",
+      "knownRansomwareCampaignUse": "Unknown",
+      "notes": "",
+      "cwes": []
+    },
+    {
+      "cveID": "CVE-2026-4001",
+      "vendorProject": "Microsoft",
+      "product": "Windows",
+      "vulnerabilityName": "Microsoft Windows Kernel Vulnerability",
+      "dateAdded": "2026-11-06",
+      "shortDescription": "No aplica.",
+      "requiredAction": "Apply updates per vendor instructions.",
+      "dueDate": "2026-11-27",
+      "knownRansomwareCampaignUse": "Unknown",
+      "notes": "",
+      "cwes": []
+    },
+    {
+      "cveID": "CVE-2026-5001",
+      "vendorProject": "Sudo",
+      "product": "Sudo",
+      "vulnerabilityName": "Sudo Heap Overflow",
+      "dateAdded": "2026-11-03",
+      "shortDescription": "Heap overflow en sudoedit.",
+      "requiredAction": "Remove sudoedit from sudoers until a patch is available.",
+      "dueDate": "2026-11-24",
+      "knownRansomwareCampaignUse": "Unknown",
+      "notes": "",
+      "cwes": []
+    },
+    {
+      "cveID": "CVE-2026-6001",
+      "vendorProject": "Docker",
+      "product": "Engine",
+      "vulnerabilityName": "Docker Engine AuthZ Bypass",
+      "dateAdded": "2026-11-02",
+      "shortDescription": "Bypass de plugins de autorizacion.",
+      "requiredAction": "Apply updates per vendor instructions.",
+      "dueDate": "2026-11-23",
+      "knownRansomwareCampaignUse": "Unknown",
+      "notes": "",
+      "cwes": []
+    }
+  ]
+}

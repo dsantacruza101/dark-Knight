@@ -14,6 +14,7 @@ del servidor: servicios, dominios, repos, reglas de despliegue).
 | **Red Hood** | `red_hood.py` (`red-hood.service` + `red-hood.timer`, diario a las 02:00 America/El_Salvador) | QA brutal, sin piedad. Audita tests, cobertura, lint, vulnerabilidades y secretos hardcodeados en los repos locales, genera tests faltantes con Aider y reporta todo sin filtro. |
 | **Batwoman** (Kate Kane) | `batwoman.py` (`batwoman.service`, `Type=simple`, poll cada `batwoman.poll_interval` s) | Analista de seguridad. Lee las alertas de Wazuh, hace triage (allowlist, rutas criticas, nivel), las evalua con TypeSafe (Jev) y avisa a Alfred/Batman de las amenazas reales; digest diario a las 08:00. |
 | **Radar** | `batcave/radar.py` (`radar-nightwing.timer` diario 07:00 y `radar-nightwing-weekly.timer` lunes 01:00; `radar-batgirl.timer` diario 07:10 y `radar-batgirl-weekly.timer` lunes 01:20; `radar-red-robin.timer` diario 07:20 y `radar-red-robin-weekly.timer` lunes 01:40; `radar-robin.timer` diario 07:30 y `radar-robin-weekly.timer` lunes 02:00; `radar-spoiler.timer` diario 07:40 y `radar-spoiler-weekly.timer` lunes 02:20) | Radar tecnologico por especialista: inventario de dependencias, vulnerabilidades (OSV) y ultimas versiones; abre issues de parches para que el especialista los aplique de noche. Spoiler: GitHub Actions + imagenes base de Docker. |
+| **Julia Pennyworth** | `julia.py` (`julia.service` + `julia.timer`, diario 07:50 America/El_Salvador) | Inteligencia de amenazas, SOLO LECTURA. Cruza el inventario local (kernel, reinicio pendiente, paquetes, apt, Node, imagenes) con CISA KEV, los avisos/CVEs de Ubuntu y las releases de Node.js; alerta lo explotado activamente e informa que correr. Nunca actualiza, reinicia ni usa sudo. |
 | **Spoiler (release manager)** | `batcave/release.py` (`spoiler-release.service` + `spoiler-release.timer`, diario 06:30 America/El_Salvador) | Mergea la rama base en cada rama de trabajo (sin force-push), crea/actualiza el PR rama de trabajo -> base con los commits agrupados, `Closes #N` y CI; nunca mergea. Avisa a Alfred de los PRs listos. |
 
 ## Modos de Batman (`modes/`)
@@ -393,6 +394,80 @@ ni estado. El token necesita `Contents: write` y `Pull requests: write`;
 para el CI, `Commit statuses: read` y `Checks: read` (si falta, el CI sale
 `unknown` y se sigue). Tests: `tests/test_release.py`.
 
+## Julia Pennyworth: inteligencia de amenazas (`julia.py`)
+
+`python3 julia.py [--dry-run] [--egress-check]` (con el venv; timer
+`julia.timer`, diario 07:50 America/El_Salvador). Config en `config.yaml`
+(`julia:`). **Solo lectura**: nunca instala, actualiza, reinicia ni
+rebootea, y nunca usa sudo; cada hallazgo trae el comando para arreglarlo a
+mano.
+
+1. **Inventario** (local, sin red): `uname -r` vs el `linux-image-*` mas
+   nuevo instalado del mismo flavor; `/var/run/reboot-required(.pkgs)` y
+   dias pendiente (mtime); `dpkg-query` (version + paquete/version source);
+   `apt list --upgradable` clasificado en `ubuntu-security` / `ubuntu-updates`
+   (por pocket) o `third-party` (`third_party_packages`, o el host del
+   candidato en `apt-cache policy` no es de Ubuntu/Canonical); Node del host
+   (`host_node`) y de cada container (`docker exec <c> node -v`, se omite si
+   no hay node); fecha de la imagen de cada container (`docker inspect`);
+   versiones de cloudflared, nginx, openssh-server y docker;
+   `net.mptcp.enabled` (de `/proc/sys`).
+2. **Feeds** (`http_timeout`; cache en `batcave/memory/julia_cache/`, cada
+   feed como mucho una vez por corrida y solo si el cache tiene mas de
+   `feed_cache_hours`; red caida -> cache viejo, avisado en el informe):
+   CISA KEV, `ubuntu.com/security/notices.json?release=resolute&limit=20&offset=N`
+   (la API rechaza `limit` > 20 con 422; se leen `notices_pages` paginas, 3 ~ un mes),
+   `ubuntu.com/security/cves/<CVE>.json` para cada KEV que mapea a algo
+   instalado (estado del release; tope `max_cve_lookups`, las KEV mas
+   recientes primero; 404 = Ubuntu no la sigue), `nodejs.org/dist/index.json`
+   y `schedule.json` de nodejs/Release (fin de vida; sin el, estimado: linea
+   par 36 meses, impar 8).
+3. **Correlacion**:
+   - **KEV** (`KEV_PRODUCTS`: Linux Kernel, Docker Engine, containerd,
+     OpenSSH, nginx, Node.js, Python, OpenSSL, sudo, systemd, Cloudflare;
+     Docker Desktop / NGINX Plus excluidos): version corriendo < version
+     `released` de Ubuntu para el source (`linux` para el kernel; para
+     terceros como `docker-ce`, la upstream de `docker.io(-app)` como
+     referencia) -> **CRITICAL**, alerta inmediata. Kernel con el fix
+     instalado pero no corriendo -> CRITICAL "falta reiniciar". Ubuntu sin
+     parche (`needed`/`pending`/`deferred`) -> HIGH con la mitigacion de
+     CISA. Sin datos y KEV de menos de `kev_unknown_days` -> MEDIUM.
+   - **Reinicio**: `.pkgs` con `linux-image` y mas de `reboot_alert_days`
+     (3) -> HIGH inmediato; si no (o kernel nuevo sin reboot-required) -> MEDIUM.
+   - **USN** del release con version corregida > instalada (binario, o
+     binarios del source; el kernel solo via la imagen corriendo o el source
+     `linux`) -> HIGH. Parches `ubuntu-security` pendientes fuera de esos USN
+     y paquetes de terceros con actualizacion -> MEDIUM.
+   - **Node** (host o container) bajo la ultima release `security: true` de
+     su linea, o en linea EOL -> HIGH. Imagen con tag mutable de mas de
+     `image_max_age_days` -> LOW: `docker compose build --pull <svc>` si el
+     servicio tiene `build:` en sus archivos de compose, si no `docker compose
+     pull <svc>` (+ `up -d <svc>`); "via webhook" solo en `webhook_projects`
+     (my_Portfolio_React_v2, portfolioServiceLauncher). Tag fijado a version
+     exacta (`4.14.8`): sin chequeo de edad; LOW si Docker Hub tiene un parche
+     mas nuevo del mismo major.minor (`feeds.docker_tags`). `docker exec ...
+     node -v` con codigo 127 (sin node) se loguea en DEBUG.
+     `net.mptcp.enabled=1` (de `/proc/sys`, fallback `sysctl -n`) -> LOW.
+4. **Salida**: un mensaje "🕵️ Julia — informe de inteligencia" (🚨 KEV, 🔄
+   reinicio, 📦 parches, 🟢 runtimes, 🛡️ hardening; max
+   `max_items_per_section`, recortado a 4000 chars), mas "🚨 Julia — alerta
+   de inteligencia" para los inmediatos. Reporte completo en
+   `reports/julia-YYYY-MM-DD.md`; CRITICAL/HIGH a Batman en `comms.json`
+   (`type: threat_intel`, con `fix`). Dedup en
+   `batcave/memory/julia_state.json`: alertas y comms se repiten cada
+   `alert_cooldown_hours` (24, con 30 min de holgura) mientras sigan
+   abiertos; los que desaparecen se listan como resueltos. Memoria en
+   `batcave/memory/julia.md`.
+
+`--dry-run`: todo igual pero imprime el reporte, el mensaje y las alertas;
+sin Telegram, estado, comms, reporte ni memoria (el cache de feeds si se
+actualiza). `--egress-check`: resuelve los hosts de los feeds (ASN via Team
+Cymru, sin guardar cache) y dice si `egress_orgs` cubre `host:python3`
+443/tcp. Egress: ubuntu.com -> Canonical, nodejs.org y hub.docker.com -> Cloudflare,
+raw.githubusercontent.com -> Fastly, www.cisa.gov -> Akamai (entrada CDN
+acotada a `host:python3` 443/tcp). Tests: `tests/test_julia.py` (fixtures en
+`tests/fixtures/julia/`, sin red).
+
 ## Comunicacion: `batcave/comms.json`
 
 Bandeja compartida entre Batman y Lucius (Alfred la lee como contexto, no
@@ -456,7 +531,7 @@ Catalogo de `ServiceCheck` (`kind` → chequeo/reparacion):
   `radar-batgirl-weekly.timer`, `radar-red-robin.timer`,
   `radar-red-robin-weekly.timer`, `radar-robin.timer`,
   `radar-robin-weekly.timer`, `radar-spoiler.timer`,
-  `radar-spoiler-weekly.timer` y `spoiler-release.timer` (medium) → `systemctl is-active` / `systemctl restart`
+  `radar-spoiler-weekly.timer`, `spoiler-release.timer` y `julia.timer` (medium) → `systemctl is-active` / `systemctl restart`
   (para `*.timer`, `systemctl enable --now` en vez de solo `restart`, para
   que la reparacion sobreviva reinicios del servidor).
 - **docker**: `daniel-portfolio-app`, `portfolioservicelauncher-client-gateway-1`,
@@ -650,7 +725,8 @@ resolvers del sistema: `/etc/resolv.conf` + upstreams de systemd-resolved):
   `ports` (si faltan, la entrada se rechaza al cargar con un warning) y una
   entrada amplia no los cubre. Hoy: Cloudflare -> `host:cloudflared`
   7844/udp+tcp, `host:python3`/`host:penguin` 443/tcp; Fastly ->
-  `host:python3`/`host:pip` 443/tcp; GitHub, Telegram, Anthropic, Canonical
+  `host:python3`/`host:pip` 443/tcp; Akamai -> `host:python3` 443/tcp
+  (KEV de cisa.gov para Julia); GitHub, Telegram, Anthropic, Canonical
   y Docker por organizacion. Si no hay entrada que cubra el flujo (p. ej.
   otro proceso hacia Cloudflare), TypeSafe (Jev): `is_suspicious` (Noul),
   `severity` (Score), `action` (Choice: notify_now/digest/learn), con
@@ -697,12 +773,12 @@ sudo cp night-agent.service night-agent.timer lucius-fox.service lucius-fox.time
   radar-red-robin.service radar-red-robin.timer radar-red-robin-weekly.service radar-red-robin-weekly.timer \
   radar-robin.service radar-robin.timer radar-robin-weekly.service radar-robin-weekly.timer \
   radar-spoiler.service radar-spoiler.timer radar-spoiler-weekly.service radar-spoiler-weekly.timer \
-  spoiler-release.service spoiler-release.timer /etc/systemd/system/
+  spoiler-release.service spoiler-release.timer julia.service julia.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now night-agent.timer lucius-fox.timer red-hood.timer batwoman.service \
   radar-nightwing.timer radar-nightwing-weekly.timer radar-batgirl.timer radar-batgirl-weekly.timer \
   radar-red-robin.timer radar-red-robin-weekly.timer radar-robin.timer radar-robin-weekly.timer \
-  radar-spoiler.timer radar-spoiler-weekly.timer spoiler-release.timer
+  radar-spoiler.timer radar-spoiler-weekly.timer spoiler-release.timer julia.timer
 ```
 
 ## Convenciones
