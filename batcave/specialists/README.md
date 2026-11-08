@@ -108,10 +108,14 @@ Cada archivo de test permitido (`*.spec.ts(x)`, `*.test.ts(x)`, `.js(x)`,
 `test_*.py`, `*_test.dart`) se corre aparte apuntando solo a ese archivo, y debe ejecutar
 > 0 tests y 0 fallidos:
 
-- `vitest` -> `CI=true npx vitest run <archivo> --reporter=json --outputFile=<tmp>`
+- `vitest` -> `CI=true npx --no-install vitest run <archivo> --reporter=json --outputFile=<tmp>`
   (el JSON es compatible con el de jest; el posicional de vitest es un
   filtro por substring, por eso se filtra el reporte por la ruta exacta).
-- `jest` -> `CI=true npm test -- --runTestsByPath <archivo> --ci --json --outputFile=<tmp>`.
+- `jest` -> `CI=true npx --no-install jest --runTestsByPath <archivo> --ci --json --outputFile=<tmp>`.
+- Antes de vitest/jest: sin `package.json` el test falla con un mensaje
+  claro; sin `node_modules` o sin `package-lock.json` se corre `npm install`.
+  Nunca se usa el cache de npx (`--no-install`): si el binario no esta en
+  `node_modules/.bin`, el test falla diciendo que falta en las devDependencies.
 - `pytest` -> `python3 -m pytest <archivo> -q`; los `.py` usan pytest siempre.
 - `flutter` -> `flutter test --machine <archivo>`; los `.dart` usan flutter
   siempre (repos con `pubspec.yaml`). Se cuentan los eventos `testDone` no

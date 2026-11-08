@@ -119,18 +119,26 @@ archivos permitidos tocados), `when: glob:<patron>` y `when` en lista.
 
 **Runner por archivo de test** (`test_runner` del perfil: `auto|vitest|jest|pytest|flutter`):
 cada test permitido se corre solo y debe ejecutar > 0 tests y 0 fallidos:
-vitest -> `npx vitest run <archivo> --reporter=json --outputFile=<tmp>`;
-jest -> `npm test -- --runTestsByPath <archivo> --json`; `.py` -> pytest
+vitest -> `npx --no-install vitest run <archivo> --reporter=json --outputFile=<tmp>`;
+jest -> `npx --no-install jest --runTestsByPath <archivo> --json` (solo el
+binario local, nunca el cache de npx; antes, sin `package.json` falla con
+mensaje claro y sin `node_modules` o sin lockfile corre `npm install`); `.py` -> pytest
 (repo con `uv.lock`: `uv run --locked pytest <archivo> --no-cov -q`, sin
 uv: `python3 -m pytest`; siempre con las variables `VAR=valor` del paso
 pytest del perfil, p. ej. `PENGUIN_ENV_FILE=/nonexistent/...`, y sin
-ninguna `*DATABASE_URL*` heredada);
+ninguna `*DATABASE_URL*` ni secreto heredado del servicio
+(`is_test_unsafe_var`: `*_TOKEN`, `*_API_KEY`, `*_SECRET`, `*CHAT_ID`...;
+igual en los pasos de tests de la suite completa y en Red Hood));
 `*_test.dart` -> `flutter test --machine <archivo>` (cuenta eventos
 `testDone` no ocultos ni omitidos; fallback: linea `+N ~S -F:` del
 resumen). `auto` elige vitest si esta en package.json o hay `vitest.config.*`.
 
 Flujo por issue en `modes/development.py`:
 
+0. **Espera humana**: `get_open_issues` omite (con log) los issues con
+   `needs-review` o `needs-human`; solo se reintentan cuando un humano quita
+   el label. La seccion `Archivos:` acepta una ruta por linea o la variante
+   en una linea separada por comas (`Archivos: a, b, c`).
 1. **Enrutamiento**: el issue va al especialista cuyo `label` de perfil este
    en el issue (ademas de `night-agent`). Sin label de especialidad va a
    `specialists.default` (Nightwing), compatible con los issues viejos. Si
@@ -147,7 +155,7 @@ Flujo por issue en `modes/development.py`:
    --watchAll=false`; Python -> `py_compile` de los cambiados + `pytest -q`
    si hay `tests/`; Spring Boot -> `./mvnw -q test` si hay `mvnw`; Batgirl:
    `npm ci` si hace falta, `npm run build`, `npm run lint --if-present`,
-   `CI=true npx vitest run`), mas la validacion por archivo permitido de
+   `CI=true npx --no-install vitest run`), mas la validacion por archivo permitido de
    siempre y el runner por archivo de cada test permitido.
 4. **Escalacion qwen -> Claude**: si los `development.aider_attempts`
    intentos fallan, se llama UNA vez a `claude -p --permission-mode
@@ -173,7 +181,11 @@ Flujo por issue en `modes/development.py`:
 cuerpo) y aplica: npm directa -> `npm install [-D] <pkg>@<to>` (`-D` segun
 package.json); npm transitiva -> `npm update <pkg>` y, si OSV aun ve una
 version vulnerable en el lock, `"overrides": {<pkg>: <to>}` + `npm install`;
-PyPI -> fija `<pkg>==<to>` en requirements.txt; PyPI en repo uv (`uv.lock`)
+PyPI -> fija `<pkg>==<to>` en requirements.txt (un `requirements*.lock`/`.txt`
+con `--hash` no se edita: se regenera con el comando de su encabezado de
+pip-compile/uv traducido a `uv pip compile` con los mismos flags, lista
+blanca, + `--upgrade-package <pkg>==<to>`; sin encabezado falla con mensaje
+claro); PyPI en repo uv (`uv.lock`)
 -> sube la cota minima en pyproject.toml SOLO si el requisito excluye la
 version objetivo (`>=`/`>` -> `>=to`, `==` -> `==to`; una cota superior,
 `!=` o `~=` que la excluya falla), `uv lock --upgrade-package <pkg>==<to>`

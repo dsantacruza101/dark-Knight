@@ -43,5 +43,5 @@ verification:
         when: script:build
       - cmd: npm run lint --if-present
       # `npm test` es `vitest` (modo watch): se llama a `vitest run` directo.
-      - cmd: CI=true npx vitest run
+      - cmd: CI=true npx --no-install vitest run
         counts_tests: node
