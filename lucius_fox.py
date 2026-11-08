@@ -133,6 +133,7 @@ CATALOG: list[ServiceCheck] = [
     ServiceCheck("radar-spoiler.timer", "systemd", "medium", "Radar diario de Spoiler (07:40): GitHub Actions (OSV) e imagenes base de Docker, abre issues needs-human"),
     ServiceCheck("radar-spoiler-weekly.timer", "systemd", "medium", "Radar semanal de Spoiler (lunes 02:20): notas de Claude sobre majors de Actions + resumen"),
     ServiceCheck("spoiler-release.timer", "systemd", "medium", "Release manager de Spoiler (06:30): merge base -> rama de trabajo y PRs rama de trabajo -> base, nunca mergea"),
+    ServiceCheck("julia.timer", "systemd", "medium", "Julia Pennyworth (07:50): inteligencia de amenazas, cruza CISA KEV / avisos de Ubuntu / Node.js con lo instalado (solo lectura)"),
     ServiceCheck("webhook-portfolio", "systemd", "high", "Servidor de webhooks que dispara los deploys via Docker"),
     ServiceCheck("signal.service", "systemd", "high", "Vigilante diurno Signal, complemento de Batman en horario diurno"),
     ServiceCheck("batwoman.service", "systemd", "high", "Batwoman — analista de seguridad"),

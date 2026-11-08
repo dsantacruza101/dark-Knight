@@ -170,3 +170,31 @@ batwoman:
     command_timeout: 20         # segundos por ss / conntrack / docker
     max_lookups_per_cycle: 50   # IPs nuevas resueltas por ciclo (el resto en el siguiente)
     max_evaluations_per_cycle: 10   # destinos nuevos evaluados por ciclo (el resto en el siguiente)
+
+# Julia Pennyworth (julia.py, julia.timer 07:50): inteligencia de amenazas.
+# SOLO LECTURA: inventario local + feeds (CISA KEV, avisos/CVEs de Ubuntu,
+# releases de Node.js); nunca instala, actualiza, reinicia ni usa sudo.
+julia:
+  release: resolute             # codename de Ubuntu 26.04 (avisos y estado por CVE)
+  http_timeout: 30              # segundos por descarga de feed
+  feed_cache_hours: 20          # KEV/USN/Node: se bajan como mucho una vez por corrida y solo si el cache es mas viejo
+  cve_cache_hours: 24           # ubuntu.com/security/cves/<CVE>.json
+  cve_cache_old_days: 7         # CVEs agregadas a KEV hace mas de un ano: cache mas largo
+  max_cve_lookups: 60           # consultas de CVE a ubuntu.com por corrida (las KEV mas recientes primero)
+  alert_cooldown_hours: 24      # alertas inmediatas y comms.json: se repiten mientras sigan abiertas
+  reboot_alert_days: 3          # reinicio pendiente con linux-image hace mas de esto -> HIGH inmediato
+  image_max_age_days: 14        # imagen con tag mutable mas vieja -> build --pull (servicio con build:) o compose pull
+  notices_pages: 3              # paginas de 20 USN (la API no acepta limit > 20); 3 ~ el ultimo mes
+  webhook_projects: [my_Portfolio_React_v2, portfolioServiceLauncher]   # solo estos se redespliegan via webhook
+  kev_unknown_days: 90          # KEV sin version corregida conocida: se reporta (MEDIUM) si es mas reciente que esto
+  max_items_per_section: 8      # items por seccion en Telegram (el reporte tiene todos)
+  kernel_source: linux          # paquete source del kernel generic en el tracker de Ubuntu
+  host_node: ~/.local/share/node-current/bin/node
+  third_party_packages: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin, cloudflared]
+  feeds:
+    kev: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+    notices: https://ubuntu.com/security/notices.json?release={release}&limit=20&offset={offset}   # limit 1..20 (si no, 422)
+    cve: https://ubuntu.com/security/cves/{cve}.json
+    docker_tags: https://hub.docker.com/v2/namespaces/{namespace}/repositories/{repo}/tags?page_size=100&name={prefix}   # parches de imagenes fijadas
+    node_index: https://nodejs.org/dist/index.json
+    node_schedule: https://raw.githubusercontent.com/nodejs/Release/main/schedule.json   # fechas de fin de vida

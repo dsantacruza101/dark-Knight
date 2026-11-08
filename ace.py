@@ -13,6 +13,7 @@ SERVICES = {
     "Signal": "signal.timer",
     "Batwoman": "batwoman.service",
     "Spoiler (release)": "spoiler-release.timer",
+    "Julia": "julia.timer",
 }
 
 WAZUH_CONTAINERS = {

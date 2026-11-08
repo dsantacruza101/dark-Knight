@@ -1,0 +1,46 @@
+{
+  "CVE-2026-1001": {
+    "id": "CVE-2026-1001",
+    "packages": [
+      {"name": "linux", "statuses": [
+        {"release_codename": "noble", "status": "released", "description": "6.8.0-90.91"},
+        {"release_codename": "resolute", "status": "released", "description": "7.0.0-44.44"}
+      ]},
+      {"name": "linux-aws", "statuses": [
+        {"release_codename": "resolute", "status": "needed", "description": ""}
+      ]}
+    ]
+  },
+  "CVE-2026-1002": {
+    "id": "CVE-2026-1002",
+    "packages": [
+      {"name": "linux", "statuses": [
+        {"release_codename": "resolute", "status": "released", "description": "7.0.0-45.45"}
+      ]}
+    ]
+  },
+  "CVE-2026-2001": {
+    "id": "CVE-2026-2001",
+    "packages": [
+      {"name": "openssh", "statuses": [
+        {"release_codename": "resolute", "status": "released", "description": "1:10.0p1-5ubuntu1"}
+      ]}
+    ]
+  },
+  "CVE-2026-5001": {
+    "id": "CVE-2026-5001",
+    "packages": [
+      {"name": "sudo", "statuses": [
+        {"release_codename": "resolute", "status": "needed", "description": ""}
+      ]}
+    ]
+  },
+  "CVE-2026-6001": {
+    "id": "CVE-2026-6001",
+    "packages": [
+      {"name": "docker.io-app", "statuses": [
+        {"release_codename": "resolute", "status": "released", "description": "28.5.1-0ubuntu1"}
+      ]}
+    ]
+  }
+}

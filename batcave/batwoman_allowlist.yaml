@@ -76,7 +76,7 @@ egress_orgs:
     cdn: true
     sources: ["host:python3", "host:penguin"]
     ports: ["443/tcp"]
-    reason: "Agentes de la Batifamilia y penguin hacia APIs detras de Cloudflare"
+    reason: "Agentes de la Batifamilia y penguin hacia APIs detras de Cloudflare (incluye nodejs.org de Julia)"
   - org: "GitHub"
     reason: "git fetch/push, API de issues, release notes del radar"
   - org: "Telegram"
@@ -87,8 +87,13 @@ egress_orgs:
     cdn: true
     sources: ["host:python3", "host:pip"]
     ports: ["443/tcp"]
-    reason: "PyPI (pip y el radar consultando PyPI JSON)"
+    reason: "PyPI (pip y el radar consultando PyPI JSON) y raw.githubusercontent.com (schedule.json de Node para Julia)"
+  - org: "Akamai"
+    cdn: true
+    sources: ["host:python3"]
+    ports: ["443/tcp"]
+    reason: "Julia descargando el catalogo KEV de www.cisa.gov (servido por Akamai)"
   - org: "Canonical"
-    reason: "Repositorios apt y servicios de Ubuntu"
+    reason: "Repositorios apt y servicios de Ubuntu (incluye ubuntu.com/security de Julia)"
   - org: "Docker"
     reason: "Docker Hub (pull de imagenes)"
