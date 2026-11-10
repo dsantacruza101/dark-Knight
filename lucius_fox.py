@@ -47,6 +47,13 @@ mensaje para Batman en comms.json y el registro en el log no se ven
 afectados, siguen en cada ronda). Cuando el repo/servicio vuelve a estar
 bien, se envia una unica vez "✅ Lucius: <nombre> volvio a la normalidad"
 y se limpia su entrada.
+
+Aparte del check "claude" (binary, solo `claude --version`), Lucius verifica
+como mucho cada 12h la SESION de Claude Code con `claude -p "responde solo:
+ok"` (timeout 60s; estado en batcave/memory/lucius_claude_session_state.json).
+Un error de autenticacion/OAuth dispara una alerta HIGH a Alfred deduplicada
+por 12h; si el binario no aparece (auto-update en curso) se reintenta una
+vez tras 60s y, si sigue ausente, se deja al check binary.
 """
 
 from __future__ import annotations
@@ -59,6 +66,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -86,6 +94,34 @@ CLAUDE_INSTALL_SCRIPT = (
     "/home/dsantacruz/.nvm/versions/node/v22.23.2/lib/node_modules/"
     "@anthropic-ai/claude-code/install.cjs"
 )
+
+# Chequeo de SESION de Claude Code (distinto del check "claude" de tipo
+# binary, que solo valida `claude --version`): una vez cada 12h corre un
+# prompt minimo para detectar el OAuth expirado, que el binario no delata.
+CLAUDE_SESSION_KEY = "claude-session"
+CLAUDE_SESSION_STATE_PATH = BASE_DIR / "batcave" / "memory" / "lucius_claude_session_state.json"
+CLAUDE_SESSION_INTERVAL = timedelta(hours=12)
+CLAUDE_SESSION_ALERT_COOLDOWN = timedelta(hours=12)
+CLAUDE_SESSION_PROMPT = "responde solo: ok"
+CLAUDE_SESSION_TIMEOUT_SECONDS = 60
+# Claude Code se auto-actualiza reemplazando el binario: si no aparece, se
+# espera y se reintenta una vez antes de concluir nada.
+CLAUDE_SESSION_MISSING_RETRY_SECONDS = 60
+CLAUDE_AUTH_ERROR_PATTERNS = (
+    "oauth",
+    "failed to authenticate",
+    "authentication_error",
+    "authentication error",
+    "not logged in",
+    "please log in",
+    "/login",
+    "login",
+    "invalid api key",
+    "token expired",
+    "session expired",
+    "401",
+)
+CLAUDE_SESSION_ALERT = "🦊 Lucius: la sesión de Claude Code expiró — corre claude y /login en el servidor"
 
 MAX_REPAIR_ATTEMPTS = 3
 REPAIR_RETRY_DELAY_SECONDS = 5
@@ -372,10 +408,10 @@ def _hash_alert_content(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def should_send_alert(key: str, content: str) -> bool:
+def should_send_alert(key: str, content: str, cooldown: timedelta = ALERT_REPEAT_COOLDOWN) -> bool:
     """True si hay que notificar a Alfred: el contenido de la alerta cambio
-    respecto a la ultima enviada para `key`, o paso mas de
-    ALERT_REPEAT_COOLDOWN desde la ultima notificacion identica."""
+    respecto a la ultima enviada para `key`, o paso mas de `cooldown`
+    (ALERT_REPEAT_COOLDOWN por defecto) desde la ultima notificacion identica."""
     entry = read_alert_state().get(key)
     if entry is None:
         return True
@@ -385,7 +421,7 @@ def should_send_alert(key: str, content: str) -> bool:
         last_sent = datetime.fromisoformat(entry["timestamp"])
     except (KeyError, ValueError):
         return True
-    return datetime.now(timezone.utc) - last_sent > ALERT_REPEAT_COOLDOWN
+    return datetime.now(timezone.utc) - last_sent > cooldown
 
 
 def record_alert(key: str, content: str) -> None:
@@ -784,6 +820,137 @@ async def check_production_integrity(notifier: TelegramNotifier) -> None:
         )
 
 
+def read_claude_session_state() -> dict:
+    try:
+        return json.loads(CLAUDE_SESSION_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_claude_session_state(state: dict) -> None:
+    CLAUDE_SESSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_SESSION_STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def claude_session_check_due(state: dict, now: datetime) -> bool:
+    """True si toca chequear la sesion: nunca se chequeo, pasaron 12h, o el
+    ultimo resultado fue un error de autenticacion (asi se detecta rapido
+    cuando Daniel vuelve a hacer /login; el reenvio de la alerta lo frena el
+    cooldown de 12h)."""
+    if state.get("last_result") == "auth_error":
+        return True
+    try:
+        last = datetime.fromisoformat(state["last_check"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return now - last >= CLAUDE_SESSION_INTERVAL
+
+
+def is_claude_auth_error(output: str) -> bool:
+    lowered = output.lower()
+    return any(pattern in lowered for pattern in CLAUDE_AUTH_ERROR_PATTERNS)
+
+
+def run_claude_session_probe() -> tuple[str, str]:
+    """Corre `claude -p "responde solo: ok"` (timeout 60s) en un directorio
+    temporal vacio, para no cargar el CLAUDE.md del proyecto. Devuelve
+    (resultado, detalle) con resultado en ok/auth_error/binary_missing/error."""
+    with tempfile.TemporaryDirectory(prefix="lucius-claude-") as tmp:
+        try:
+            proc = subprocess.run(
+                ["claude", "-p", CLAUDE_SESSION_PROMPT],
+                capture_output=True,
+                text=True,
+                timeout=CLAUDE_SESSION_TIMEOUT_SECONDS,
+                cwd=tmp,
+                stdin=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return "binary_missing", "binario claude no encontrado en el PATH"
+        except subprocess.TimeoutExpired:
+            return "error", f"timeout de {CLAUDE_SESSION_TIMEOUT_SECONDS}s"
+        except OSError as exc:
+            return "error", f"no se pudo ejecutar claude: {exc}"
+
+    output = f"{proc.stdout}\n{proc.stderr}".strip()
+    detail = output[-300:]
+    if proc.returncode == 127:
+        return "binary_missing", detail or "codigo 127"
+    if proc.returncode == 0 and not is_claude_auth_error(output):
+        return "ok", detail
+    if is_claude_auth_error(output):
+        return "auth_error", detail
+    return "error", f"codigo {proc.returncode}: {detail}"
+
+
+async def check_claude_session(notifier: TelegramNotifier) -> None:
+    """Chequeo de sesion de Claude Code, como mucho cada 12h (estado en
+    batcave/memory/lucius_claude_session_state.json). Si el OAuth expiro,
+    alerta HIGH a Alfred deduplicada por 12h. Un binario ausente no se
+    alerta aqui (eso es del check "claude" de tipo binary): se reintenta una
+    vez tras 60s por si Claude Code se estaba auto-actualizando."""
+    maintenance = get_active_maintenance(CLAUDE_SESSION_KEY) or get_active_maintenance("claude")
+    if maintenance:
+        log.info(
+            "%s en mantenimiento: %s",
+            CLAUDE_SESSION_KEY, maintenance.get("reason", "sin razon especificada"),
+        )
+        return
+
+    state = read_claude_session_state()
+    now = datetime.now(timezone.utc)
+    if not claude_session_check_due(state, now):
+        log.info("Sesion de Claude Code: chequeada hace menos de 12h (%s), se omite", state.get("last_check"))
+        return
+
+    result, detail = await asyncio.to_thread(run_claude_session_probe)
+    if result == "binary_missing":
+        log.warning(
+            "Sesion de Claude Code: %s; posible auto-update, se reintenta en %ds",
+            detail, CLAUDE_SESSION_MISSING_RETRY_SECONDS,
+        )
+        await asyncio.sleep(CLAUDE_SESSION_MISSING_RETRY_SECONDS)
+        result, detail = await asyncio.to_thread(run_claude_session_probe)
+
+    if result == "binary_missing":
+        # No se marca como chequeado: se vuelve a intentar en la proxima ronda.
+        log.warning(
+            "Sesion de Claude Code: el binario sigue ausente tras el reintento (%s); "
+            "lo cubre el check 'claude' (binary), no se alerta la sesion", detail,
+        )
+        return
+
+    write_claude_session_state(
+        {"last_check": now.isoformat(), "last_result": result, "last_detail": detail[-300:]}
+    )
+
+    if result == "ok":
+        log.info("Sesion de Claude Code OK")
+        if clear_alert(CLAUDE_SESSION_KEY):
+            await notifier.send("✅ Lucius: la sesión de Claude Code volvio a la normalidad")
+        return
+
+    if result == "auth_error":
+        log.error("Sesion de Claude Code expirada o sin autenticar: %s", detail)
+        alert_content = "high|auth_error"
+        if should_send_alert(CLAUDE_SESSION_KEY, alert_content, CLAUDE_SESSION_ALERT_COOLDOWN):
+            await notifier.send(
+                f"{CLAUDE_SESSION_ALERT}\nPrioridad: high\n<code>{html.escape(detail[-200:])}</code>"
+            )
+            record_alert(CLAUDE_SESSION_KEY, alert_content)
+        else:
+            log.info(
+                "Sesion de Claude Code sigue expirada (dentro del cooldown de %s), no se reenvia a Alfred",
+                CLAUDE_SESSION_ALERT_COOLDOWN,
+            )
+        return
+
+    # Timeout, rate limit, red caida...: no es un problema de sesion.
+    log.warning("Chequeo de sesion de Claude Code fallo sin error de autenticacion: %s", detail)
+
+
 async def main() -> None:
     load_env()
     notifier = TelegramNotifier()
@@ -791,6 +958,10 @@ async def main() -> None:
     await check_production_integrity(notifier)
 
     results = await run_checks(CATALOG, notifier)
+    try:
+        await check_claude_session(notifier)
+    except Exception as exc:  # noqa: BLE001 - el chequeo de sesion no debe tumbar la ronda
+        log.error("Fallo el chequeo de sesion de Claude Code: %s", exc)
     if results:
         log.info("Ronda de Lucius completada: %s", "; ".join(results))
     else:

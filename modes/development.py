@@ -112,15 +112,17 @@ Flujo por issue:
      error, antes de verificar o comitear.
   6. Verificacion antes de comitear (`verify_changes`): sin lista de
      archivos permitidos no hay intento posible (needs-review directo). Cada
-     archivo permitido debe existir, no estar vacio, diferir de su version
-     en `origin/<work_branch>` (o ser nuevo) y pasar una validacion
-     minima segun su tipo (`validate_allowed_file_content`): `.py` debe
+     archivo permitido debe existir, no estar vacio y pasar una validacion
+     minima segun su tipo, y AL MENOS UNO debe diferir de su version en
+     `origin/<work_branch>` (o ser nuevo; uno identico al remoto no hace
+     fallar el intento por si solo) (`validate_allowed_file_content`): `.py` debe
      tener al menos un `def`/`class`; `.service`
      debe tener `[Unit]`/`[Service]` y `ExecStart=`; `.timer` debe tener
      `[Timer]` y `OnCalendar=`/`OnUnitActiveSec=`; `.spec.ts`/`.test.ts`/
      `_test.dart` debe tener `describe(`/`it(`/`test(`/`testWidgets(`/`group(`. Ademas se corren los pasos de
      `verification` del perfil del especialista para cada stack detectado
-     (p. ej. Node: npm ci si hace falta, build, lint, test; Python:
+     (p. ej. Node: npm ci si hace falta, build, lint solo si el script ya
+     existia en `origin/<work_branch>` (`when: base_script:lint`), test; Python:
      py_compile + pytest; Spoiler: `docker compose config -q`, shellcheck,
      actionlint, hadolint, terraform; un paso con `requires` cuya
      herramienta no esta instalada se omite con un aviso, y el resultado
@@ -1360,15 +1362,29 @@ def count_node_tests_detected(output: str) -> int:
     return sum(vitest) if vitest else 0
 
 
-def node_has_script(repo_path: Path, script: str) -> bool:
-    package_json = repo_path / "package.json"
-    if not package_json.exists():
-        return False
+def node_has_script(repo_path: Path, script: str, ref: Optional[str] = None) -> bool:
+    """`package.json` (de la raiz) tiene el script `script`: en disco, o en
+    el commit/rama `ref` de git si se pasa (`git show <ref>:package.json`;
+    si ahi no existe package.json, False)."""
+    if ref:
+        proc = run_cli(["git", "show", f"{ref}:package.json"], cwd=repo_path)
+        if proc.returncode != 0:
+            return False
+        raw = proc.stdout
+    else:
+        package_json = repo_path / "package.json"
+        if not package_json.exists():
+            return False
+        try:
+            raw = package_json.read_text(encoding="utf-8")
+        except OSError:
+            return False
     try:
-        pkg = json.loads(package_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        pkg = json.loads(raw)
+    except json.JSONDecodeError:
         return False
-    return script in pkg.get("scripts", {})
+    scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
+    return isinstance(scripts, dict) and script in scripts
 
 
 def verify_python_files(repo_path: Path, py_files: list[str]) -> tuple[list[str], list[str]]:
@@ -1435,18 +1451,22 @@ def npm_ci_if_needed(repo_path: Path, allowed_files: Optional[list[str]] = None)
     return proc
 
 
-def step_condition_met(repo_path: Path, when) -> bool:
+def step_condition_met(repo_path: Path, when, base_branch: Optional[str] = None) -> bool:
     """Condicion `when` de un paso de verificacion: `script:<n>`,
-    `exists:<ruta>`, `glob:<patron>` (Path.glob desde la raiz: `*.tf` solo la
-    raiz, `**/*.tf` recursivo), una lista de ellas (todas deben cumplirse) o
-    ninguna."""
+    `base_script:<n>` (el script ya existia en `origin/<base_branch>` antes
+    del intento: uno que el modelo agrego no se vuelve requisito; sin
+    `base_branch`, se mira el package.json en disco), `exists:<ruta>`,
+    `glob:<patron>` (Path.glob desde la raiz: `*.tf` solo la raiz, `**/*.tf`
+    recursivo), una lista de ellas (todas deben cumplirse) o ninguna."""
     if not when:
         return True
     if isinstance(when, list):
-        return all(step_condition_met(repo_path, cond) for cond in when)
+        return all(step_condition_met(repo_path, cond, base_branch) for cond in when)
     kind, _, arg = str(when).partition(":")
     if kind == "script":
         return node_has_script(repo_path, arg)
+    if kind == "base_script":
+        return node_has_script(repo_path, arg, f"origin/{base_branch}" if base_branch else None)
     if kind == "exists":
         return (repo_path / arg).exists()
     if kind == "glob":
@@ -1562,9 +1582,12 @@ def run_verification_steps(
     allowed_files: list[str],
     test_files: list[str],
     step_log: Optional[list[tuple[str, bool, str, float]]] = None,
+    base_branch: Optional[str] = None,
 ) -> tuple[list[str], list[str]]:
     """Corre los pasos de `verification` del perfil para cada stack detectado.
     Los pasos de tests (`is_test_step`) no heredan secretos del servicio.
+    `base_branch` (rama de trabajo) resuelve las condiciones `base_script:`
+    contra `origin/<base_branch>`.
 
     Si se pasa `step_log`, agrega (comando, ok, detalle, segundos) por cada
     paso ejecutado (resumen del log de parches de dependencias).
@@ -1582,7 +1605,7 @@ def run_verification_steps(
     allowed = {normalize_rel_path(f) for f in allowed_files}
     for stack_name, stack in detected_stacks(repo_path, profile):
         for step in stack.get("steps", []):
-            if not step_condition_met(repo_path, step.get("when")):
+            if not step_condition_met(repo_path, step.get("when"), base_branch):
                 continue
             builtin = step.get("builtin")
             label = str(step.get("cmd") or builtin)
@@ -1964,14 +1987,18 @@ def verify_changes(
 ) -> tuple[bool, str, str, dict[str, dict]]:
     """Criterio de exito de un intento (Aider o Claude), antes de comitear:
       - hay lista de archivos permitidos;
-      - CADA archivo permitido existe, no esta vacio, pasa su validacion
-        minima por tipo (`validate_allowed_file_content`) y difiere de su
-        version en `origin/<branch>` (o es nuevo);
-      - pasan los pasos de `verification` del perfil (`run_verification_steps`);
+      - CADA archivo permitido existe, no esta vacio y pasa su validacion
+        minima por tipo (`validate_allowed_file_content`);
+      - AL MENOS UNO difiere de su version en `origin/<branch>` (o es nuevo);
+        un archivo permitido identico al remoto no hace fallar el intento
+        por si solo;
+      - pasan los pasos de `verification` del perfil (`run_verification_steps`;
+        `base_script:` se evalua contra `origin/<branch>`, asi un script de
+        lint que agrego el modelo no es requisito);
       - cada archivo de test permitido, corrido aparte con su runner, ejecuta
         > 0 tests y 0 fallidos (`verify_test_files`).
-    Si ningun archivo permitido existe o cambio respecto al remoto no se
-    corren los pasos (no hay nada que verificar). Si falla, el intento cuenta como
+    Si ningun archivo permitido cambio respecto al remoto no se corren los
+    pasos (no hay nada que verificar). Si falla, el intento cuenta como
     fallido, la salida COMPLETA de los comandos fallidos queda en el log del
     intento y se devuelve junto con un resumen corto (para needs-review).
     Devuelve (ok, resumen, salida completa, tests por archivo)."""
@@ -1982,16 +2009,18 @@ def verify_changes(
 
     test_files = [f for f in allowed_files if TEST_FILE_NAME_RE.match(Path(f).name)]
     errors = validate_allowed_file_content(repo_path, allowed_files)
-    unchanged = unchanged_vs_remote(repo_path, branch, allowed_files)
-    errors.extend(f"{rel}: identico a origin/{branch} (no se cambio nada)" for rel in unchanged)
-    present = [f for f in allowed_files if (repo_path / f).is_file()]
-    if len(unchanged) == len(present):
+    unchanged = set(unchanged_vs_remote(repo_path, branch, allowed_files))
+    changed = [f for f in allowed_files if (repo_path / f).is_file() and f not in unchanged]
+    if not changed:
+        errors.append(f"ningun archivo permitido cambio respecto a origin/{branch} (no se cambio nada)")
         full_output = "\n".join(errors)
         append_to_log(log_path, "verificacion fallida", full_output)
         return False, "; ".join(errors), full_output, {}
 
     full_outputs: list[str] = []
-    step_errors, step_full = run_verification_steps(repo_path, profile, allowed_files, test_files)
+    step_errors, step_full = run_verification_steps(
+        repo_path, profile, allowed_files, test_files, base_branch=branch
+    )
     errors.extend(step_errors)
     full_outputs.extend(step_full)
 
@@ -3080,7 +3109,7 @@ def process_dependency_patch(config: dict, issue: dict, profile: dict, repo_path
     if not changed_files(repo_path):
         return fail("el comando no cambio ningun archivo del manifiesto")
 
-    step_errors, step_full = run_verification_steps(repo_path, profile, files, [], plog.steps)
+    step_errors, step_full = run_verification_steps(repo_path, profile, files, [], plog.steps, base_branch=branch)
     if step_errors:
         plog.note("verificacion fallida", "\n\n".join(step_full + step_errors))
         return fail("; ".join(step_errors), step_full[0] if step_full else "")
