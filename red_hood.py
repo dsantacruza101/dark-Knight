@@ -120,7 +120,10 @@ from modes.development import (
     github_auth_env,
     is_forbidden_path,
     UV_LOCK,
-    is_test_db_var,
+    is_test_unsafe_var,
+    ensure_verify_venv,
+    VERIFY_VENV_DIR,
+    verify_venv_failure,
     load_specialists,
     profile_repos,
     python_test_env,
@@ -525,7 +528,7 @@ def run_node_tests(repo_path: Path) -> dict:
     # CI=true siempre: evita que jest/vitest queden esperando input interactivo (FASE 2).
     env = {**os.environ, "CI": "true"}
     if node_test_runner(repo_path) == "vitest":
-        cmd = ["npx", "vitest", "run", "--coverage"]
+        cmd = ["npx", "--no-install", "vitest", "run", "--coverage"]
     else:
         cmd = ["npm", "test", "--", "--passWithNoTests", "--coverage", "--watchAll=false"]
 
@@ -604,19 +607,25 @@ def parse_pytest_counts(output: str) -> tuple[int, int]:
 
 
 def run_python_tests(repo_path: Path, test_env: Optional[dict] = None) -> dict:
-    """Suite completa de pytest. Repo uv (`uv.lock`): `uv run --locked
-    pytest` con el entorno seguro del perfil (`test_env`) y sin variables
-    `*DATABASE_URL*`; si no, pytest del venv del repo (o python3)."""
-    if not (repo_path / "tests").exists():
+    """Suite completa de pytest, siempre con el entorno seguro del perfil
+    (`test_env`) y sin variables `*DATABASE_URL*` ni secretos heredados.
+    Repo uv (`uv.lock`): `uv run --locked pytest`; si no, el python del venv
+    aislado `.verify-venv` del workspace (`ensure_verify_venv`, compartido
+    con el modo Desarrollo), nunca el python3 del PATH."""
+    if not (repo_path / "tests").is_dir():
         return {"status": "sin_tests", "passed": 0, "failed": 0, "coverage_pct": None, "output": ""}
 
+    env = {k: v for k, v in os.environ.items() if not is_test_unsafe_var(k)}
+    env.update({**(test_env or {}), "CI": "true"})
     if (repo_path / UV_LOCK).exists():
-        env = {k: v for k, v in os.environ.items() if not is_test_db_var(k)}
-        env.update({**(test_env or {}), "CI": "true"})
         cmd = ["uv", "run", "--locked", "pytest", "--tb=short", "-q"]
     else:
-        env = {**os.environ, "CI": "true"}
-        cmd = [venv_python(repo_path) or "python3", "-m", "pytest", "--tb=short", "-q"]
+        python, venv_runs = ensure_verify_venv(repo_path)
+        if python is None:
+            output = verify_venv_failure(venv_runs)
+            log.error("%s: %s", repo_path.name, output[-500:])
+            return {"status": "failing", "passed": 0, "failed": 0, "coverage_pct": None, "output": output}
+        cmd = [str(python), "-m", "pytest", "--tb=short", "-q"]
     proc, timed_out = _run_with_timeout(cmd, cwd=repo_path, timeout=TEST_TIMEOUT_SECONDS, env=env)
     output = (proc.stdout + "\n" + proc.stderr)[-20000:]
     if timed_out:
@@ -628,9 +637,9 @@ def run_python_tests(repo_path: Path, test_env: Optional[dict] = None) -> dict:
 
 def run_py_compile(repo_path: Path) -> list[str]:
     errors: list[str] = []
-    skip_dirs = {"venv", ".venv", "__pycache__", "node_modules"}
+    skip_dirs = {"venv", ".venv", VERIFY_VENV_DIR, "__pycache__", "node_modules"}
     for py_file in repo_path.rglob("*.py"):
-        if skip_dirs & set(py_file.parts):
+        if skip_dirs & set(py_file.relative_to(repo_path).parts):
             continue
         try:
             proc = subprocess.run(
@@ -840,7 +849,7 @@ def find_untested_python_files(repo_path: Path, limit: int) -> list[str]:
 
     candidates: list[str] = []
     for py_file in sorted(repo_path.glob("*.py")) + sorted(repo_path.glob("**/*.py")):
-        if "venv" in py_file.parts or ".venv" in py_file.parts or "__pycache__" in py_file.parts:
+        if {"venv", ".venv", VERIFY_VENV_DIR, "__pycache__"} & set(py_file.relative_to(repo_path).parts):
             continue
         if py_file.name.startswith("test_") or py_file.name == "__init__.py":
             continue
@@ -962,17 +971,13 @@ def run_single_node_test(repo_path: Path, test_rel: str) -> bool:
 
 
 def run_single_python_test(repo_path: Path, test_rel: str, test_env: Optional[dict] = None) -> bool:
-    """Repo uv (`uv.lock`): runner por archivo del modo Desarrollo
-    (`run_test_file` -> `uv run --locked pytest <archivo> --no-cov -q`, con
-    el entorno seguro del perfil y sin `*DATABASE_URL*`; exige > 0 tests y 0
-    fallidos). Si no, `pytest` del venv del repo (o python3)."""
-    if (repo_path / UV_LOCK).exists():
-        executed, failed, _ = run_test_file(repo_path, test_rel, "pytest", test_env)
-        log.info("%s: %s -> %d test(s) ejecutados, %d fallido(s)", repo_path.name, test_rel, executed, failed)
-        return executed > 0 and failed == 0
-    python_bin = venv_python(repo_path) or "python3"
-    proc = run_cli([python_bin, "-m", "pytest", test_rel, "--tb=short", "-q"], cwd=repo_path, timeout=SINGLE_TEST_TIMEOUT)
-    return proc.returncode == 0
+    """Runner por archivo del modo Desarrollo (`run_test_file`): repo uv ->
+    `uv run --locked pytest <archivo> --no-cov -q`; sin uv -> python del
+    venv aislado `.verify-venv`. Con el entorno seguro del perfil y sin
+    `*DATABASE_URL*` ni secretos; exige > 0 tests y 0 fallidos."""
+    executed, failed, _ = run_test_file(repo_path, test_rel, "pytest", test_env)
+    log.info("%s: %s -> %d test(s) ejecutados, %d fallido(s)", repo_path.name, test_rel, executed, failed)
+    return executed > 0 and failed == 0
 
 
 def generate_tests_for_repo(

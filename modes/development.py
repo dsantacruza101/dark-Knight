@@ -334,7 +334,17 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # Resumen de `flutter test` (reporter de package:test): "00:03 +12 ~1 -2: Some tests failed."
 FLUTTER_SUMMARY_RE = re.compile(r"\d+:\d+\s+\+(\d+)(?:\s+~(\d+))?(?:\s+-(\d+))?:")
 AIDER_ARTIFACT_PREFIX = ".aider"
-ARTIFACT_SCAN_SKIP_DIRS = {".git", "node_modules"}
+# Entorno aislado y cacheado para pytest en repos Python SIN uv.lock
+# (`ensure_verify_venv`): nunca el python3 que este primero en el PATH (en
+# el servicio es ~/.aider-venv/bin/python3, sin pytest ni deps del repo).
+# Vive dentro del workspace, excluido en `.git/info/exclude` y por el
+# candado (`changed_entries`): nunca se comitea ni se revierte.
+VERIFY_VENV_DIR = ".verify-venv"
+VERIFY_VENV_MARKER = ".night-agent-requirements-hash"
+# Se instalan en este orden los que existan (ademas de pytest).
+VERIFY_REQUIREMENTS_FILES = ("requirements.txt", "requirements-dev.txt", "requirements-dev.lock")
+VERIFY_VENV_TIMEOUT = 900
+ARTIFACT_SCAN_SKIP_DIRS = {".git", "node_modules", VERIFY_VENV_DIR}
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 NOTE_KEYWORDS_RE = re.compile(r"^\s*keywords\s*:\s*(.+)$", re.IGNORECASE)
 NOTE_STEM_SPLIT_RE = re.compile(r"[-_.\s]+")
@@ -367,7 +377,7 @@ COMMENT_PREFIXES_BY_SUFFIX = {
 }
 # Pasos de verificacion con `files:` (globs, ver `matches_globs`): archivos que
 # nunca se consideran al expandir `{files}`/`{file}`.
-VERIFY_SKIP_DIRS = {".git", "node_modules", ".terraform", "venv", ".venv", "dist", "build", "coverage"}
+VERIFY_SKIP_DIRS = {".git", "node_modules", ".terraform", "venv", ".venv", VERIFY_VENV_DIR, "dist", "build", "coverage"}
 COMPOSE_FILE_GLOBS = ("docker-compose*.yml", "docker-compose*.yaml", "compose.yml", "compose.yaml", "compose.*.yml", "compose.*.yaml")
 # Plantillas versionadas para interpolar `${VAR}` al validar un compose (nunca el .env real).
 COMPOSE_ENV_TEMPLATES = (".env.template", ".env.example", ".env.sample")
@@ -937,6 +947,8 @@ def normalize_rel_path(rel_path: str) -> str:
 
 
 def is_forbidden_path(rel_path: str) -> bool:
+    if is_verify_venv_path(rel_path):
+        return True  # entorno de verificacion: nunca un archivo del issue
     normalized = normalize_rel_path(rel_path).lower()
     name = Path(normalized).name
     if any(sub in name for sub in FORBIDDEN_NAME_SUBSTRINGS):
@@ -963,8 +975,16 @@ def changed_entries(repo_path: Path) -> list[tuple[str, str]]:
         code, rel_path = field[:2], field[3:]
         if "R" in code or "C" in code:
             i += 1  # el siguiente campo es la ruta de origen
+        if is_verify_venv_path(rel_path):
+            continue  # entorno de verificacion cacheado: ni se revierte ni se comitea
         entries.append((code, rel_path))
     return entries
+
+
+def is_verify_venv_path(rel_path: str) -> bool:
+    """`rel_path` es `.verify-venv` o algo dentro de el (raiz del repo)."""
+    first = Path(normalize_rel_path(rel_path)).parts[:1]
+    return first == (VERIFY_VENV_DIR,)
 
 
 def changed_files(repo_path: Path) -> list[str]:
@@ -1206,13 +1226,13 @@ def setup_workspace_repo(repo_full_name: str, workspace_dir: Path, branch: str) 
         if run_cli(["git", "checkout", branch], cwd=workspace_repo_path).returncode != 0:
             run_cli(["git", "checkout", "-b", branch, f"origin/{branch}"], cwd=workspace_repo_path)
         run_cli(["git", "reset", "--hard", f"origin/{branch}"], cwd=workspace_repo_path)
-        run_cli(["git", "clean", "-fd"], cwd=workspace_repo_path)
+        run_cli(["git", "clean", "-fd", "-e", VERIFY_VENV_DIR], cwd=workspace_repo_path)
     else:
         log.warning("%s: origin no tiene la rama '%s', se crea desde origin/main", repo_full_name, branch)
         if run_cli(["git", "checkout", "main"], cwd=workspace_repo_path).returncode != 0:
             run_cli(["git", "checkout", "-b", "main", "origin/main"], cwd=workspace_repo_path)
         run_cli(["git", "reset", "--hard", "origin/main"], cwd=workspace_repo_path)
-        run_cli(["git", "clean", "-fd"], cwd=workspace_repo_path)
+        run_cli(["git", "clean", "-fd", "-e", VERIFY_VENV_DIR], cwd=workspace_repo_path)
         if run_cli(["git", "checkout", "-b", branch], cwd=workspace_repo_path).returncode != 0:
             log.error("%s: no se pudo crear la rama '%s' en el workspace", repo_full_name, branch)
             return None
@@ -1654,6 +1674,21 @@ def run_verification_steps(
                 if not files:
                     log.info("%s: paso '%s' omitido, ningun archivo coincide con %s", repo_path.name, command, step["files"])
                     continue
+            if is_python_pytest_cmd(cmd) and not (repo_path / UV_LOCK).exists():
+                # Repo Python sin uv: pytest SOLO desde el venv aislado
+                # `.verify-venv`, nunca el python3 del PATH del servicio.
+                if not (repo_path / "tests").is_dir():
+                    log.info("%s: paso '%s' omitido, el repo no tiene tests/", repo_path.name, command)
+                    continue
+                python, venv_runs = ensure_verify_venv(repo_path)
+                for venv_label, venv_proc in venv_runs:
+                    record(venv_label, venv_proc.returncode == 0, f"codigo {venv_proc.returncode}", started)
+                if python is None:
+                    errors.append(f"{command} fallo: no se pudo preparar {VERIFY_VENV_DIR}")
+                    full_outputs.append(f"=== {command} ===\n{verify_venv_failure(venv_runs)}")
+                    continue
+                cmd = [str(python), "-m", "pytest", *pytest_args(cmd)]
+                command = " ".join([f"{VERIFY_VENV_DIR}/bin/python", *cmd[1:]])
             output = ""
             drop = is_test_unsafe_var if is_test_step(step) else None
             for run in expand_step_command(cmd, files):
@@ -1867,6 +1902,15 @@ def is_test_unsafe_var(name: str) -> bool:
     return is_test_db_var(name) or bool(HOST_SECRET_VAR_RE.search(name.upper()))
 
 
+def verify_venv_failure(runs: list[tuple[str, subprocess.CompletedProcess]]) -> str:
+    """Salida (enmascarada) del comando que fallo al preparar `.verify-venv`."""
+    if not runs:
+        return f"no se pudo preparar {VERIFY_VENV_DIR}"
+    label, proc = runs[-1]
+    return mask_secrets(f"no se pudo preparar {VERIFY_VENV_DIR}: `{label}` codigo {proc.returncode}\n"
+                        f"{proc.stdout}{proc.stderr}")
+
+
 def python_test_env(repo_path: Path, profile: Optional[dict]) -> dict:
     """Entorno seguro para pytest por archivo: las asignaciones `VAR=valor`
     del paso pytest del perfil en los stacks detectados del repo (p. ej.
@@ -1881,11 +1925,132 @@ def python_test_env(repo_path: Path, profile: Optional[dict]) -> dict:
     return env
 
 
+def verify_venv_python(repo_path: Path) -> Path:
+    return repo_path / VERIFY_VENV_DIR / "bin" / "python"
+
+
+def exclude_verify_venv(repo_path: Path) -> None:
+    """Agrega `/.verify-venv/` a `.git/info/exclude` del workspace (local,
+    no versionado): `git status`/`git add` no lo ven y `git clean -fd` no lo
+    borra entre issues (el cache sobrevive)."""
+    git_dir = repo_path / ".git"
+    if not git_dir.is_dir():
+        return
+    exclude = git_dir / "info" / "exclude"
+    pattern = f"/{VERIFY_VENV_DIR}/"
+    try:
+        current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if pattern in current.splitlines():
+            return
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        sep = "" if not current or current.endswith("\n") else "\n"
+        exclude.write_text(f"{current}{sep}{pattern}\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("%s: no se pudo escribir .git/info/exclude: %s", repo_path.name, exc)
+
+
+def verify_requirement_sources(repo_path: Path) -> list[tuple[str, bool]]:
+    """(archivo, tiene --hash) de los requirements a instalar en el venv de
+    verificacion (`VERIFY_REQUIREMENTS_FILES` presentes). Sin ninguno pero
+    con `pyproject.toml`, sus dependencias (`uv pip install -r
+    pyproject.toml --all-extras`, sin construir el proyecto)."""
+    sources = [
+        (name, is_hashed_requirements(repo_path / name))
+        for name in VERIFY_REQUIREMENTS_FILES
+        if (repo_path / name).is_file()
+    ]
+    if not sources and (repo_path / "pyproject.toml").is_file():
+        sources.append(("pyproject.toml", False))
+    return sources
+
+
+def verify_venv_fingerprint(repo_path: Path, sources: list[tuple[str, bool]]) -> str:
+    """Hash de los requirements (nombre + contenido) y de `.python-version`:
+    si cambian (p. ej. el issue toco requirements.txt), el venv se rehace."""
+    digest = hashlib.sha256()
+    for name in [s for s, _ in sources] + [".python-version"]:
+        path = repo_path / name
+        if path.is_file():
+            digest.update(name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def ensure_verify_venv(repo_path: Path) -> tuple[Optional[Path], list[tuple[str, subprocess.CompletedProcess]]]:
+    """Venv aislado y cacheado para pytest en un repo Python SIN uv.lock:
+    `uv venv .verify-venv` dentro del workspace, `uv pip install -r` de cada
+    requirements (`--require-hashes` en los que traen `--hash`; los hasheados
+    se instalan cada uno por separado, porque en modo hash todo el comando
+    exige hashes) y despues `pytest`. Se reutiliza mientras el fingerprint
+    de los requirements no cambie (marcador dentro del venv, escrito solo si
+    todo se instalo bien). Ningun comando hereda secretos del servicio.
+
+    Devuelve (python del venv o None si fallo, [(comando, resultado)] de lo
+    que se ejecuto: vacio si se uso el cache)."""
+    exclude_verify_venv(repo_path)
+    venv_dir = repo_path / VERIFY_VENV_DIR
+    python = verify_venv_python(repo_path)
+    marker = venv_dir / VERIFY_VENV_MARKER
+    sources = verify_requirement_sources(repo_path)
+    fingerprint = verify_venv_fingerprint(repo_path, sources)
+    if python.exists() and marker.is_file() and marker.read_text(encoding="utf-8").strip() == fingerprint:
+        return python, []
+
+    runs: list[tuple[str, subprocess.CompletedProcess]] = []
+    if not tool_available("uv"):
+        missing = subprocess.CompletedProcess(
+            ["uv"], returncode=127, stdout="",
+            stderr=f"uv no esta en el PATH: no se puede crear {VERIFY_VENV_DIR} "
+                   "(nunca se usa el python3 del PATH para los tests)",
+        )
+        return None, [(f"uv venv {VERIFY_VENV_DIR}", missing)]
+
+    shutil.rmtree(venv_dir, ignore_errors=True)
+    # Sin VIRTUAL_ENV heredado: uv elegiria ese entorno en vez de --python.
+    drop = lambda name: is_test_unsafe_var(name) or name == "VIRTUAL_ENV"  # noqa: E731
+    commands: list[list[str]] = [["uv", "venv", VERIFY_VENV_DIR]]
+    install = ["uv", "pip", "install", "--python", str(python)]
+    plain = [name for name, hashed in sources if not hashed]
+    if plain:
+        extras = ["--all-extras"] if "pyproject.toml" in plain else []
+        commands.append(install + [arg for name in plain for arg in ("-r", name)] + extras)
+    for name, hashed in sources:
+        if hashed:
+            commands.append(install + ["--require-hashes", "-r", name])
+    commands.append(install + ["pytest"])
+
+    log.info("%s: preparando %s (requirements: %s)", repo_path.name, VERIFY_VENV_DIR,
+             ", ".join(name for name, _ in sources) or "ninguno")
+    for cmd in commands:
+        proc = run_cli(cmd, cwd=repo_path, timeout=VERIFY_VENV_TIMEOUT, extra_env={}, drop_env=drop)
+        runs.append((" ".join(cmd), proc))
+        if proc.returncode != 0:
+            return None, runs
+    if not python.exists():
+        runs.append((f"{VERIFY_VENV_DIR}/bin/python", subprocess.CompletedProcess(
+            [str(python)], returncode=1, stdout="", stderr=f"{python} no existe tras `uv venv`")))
+        return None, runs
+    marker.write_text(fingerprint, encoding="utf-8")
+    return python, runs
+
+
+def is_python_pytest_cmd(cmd: list[str]) -> bool:
+    """`python3 -m pytest ...`, `python -m pytest ...` o `pytest ...`."""
+    if cmd[:1] == ["pytest"]:
+        return True
+    return len(cmd) >= 3 and Path(cmd[0]).name in ("python", "python3") and cmd[1:3] == ["-m", "pytest"]
+
+
+def pytest_args(cmd: list[str]) -> list[str]:
+    """Argumentos de pytest de un `is_python_pytest_cmd` (sin el interprete)."""
+    return cmd[1:] if cmd[:1] == ["pytest"] else cmd[3:]
+
+
 def run_pytest_file(repo_path: Path, rel: str, env: Optional[dict] = None) -> tuple[int, int, str]:
     """pytest apuntado a `rel`. Repo uv (`uv.lock`): `uv run --locked pytest
     <rel> --no-cov -q` (el venv bloqueado del repo; `--no-cov` evita que el
     `fail_under` de cobertura de la suite completa tumbe un solo archivo, y
-    solo se pasa si pytest-cov esta en el lock); si no, `python3 -m pytest`.
+    solo se pasa si pytest-cov esta en el lock); si no, el python del venv
+    aislado `.verify-venv` (`ensure_verify_venv`), nunca el python3 del PATH.
     Siempre con `env` (entorno seguro del perfil) y sin variables
     `*DATABASE_URL*` ni secretos heredados (`is_test_unsafe_var`): nunca una
     base real. Ejecutados = passed + failed + errors."""
@@ -1893,7 +2058,10 @@ def run_pytest_file(repo_path: Path, rel: str, env: Optional[dict] = None) -> tu
         no_cov = ["--no-cov"] if uv_locked_versions(repo_path, "pytest-cov") else []
         cmd = ["uv", "run", "--locked", "pytest", rel, *no_cov, "-q", "-p", "no:cacheprovider"]
     else:
-        cmd = ["python3", "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"]
+        python, runs = ensure_verify_venv(repo_path)
+        if python is None:
+            return 0, 1, verify_venv_failure(runs)
+        cmd = [str(python), "-m", "pytest", rel, "-q", "-p", "no:cacheprovider"]
     proc = run_cli(cmd, cwd=repo_path, timeout=DEFAULT_STEP_TIMEOUT, extra_env=env or None, drop_env=is_test_unsafe_var)
     output = mask_secrets(proc.stdout + proc.stderr)
     summaries = PYTEST_SUMMARY_LINE_RE.findall(output)
