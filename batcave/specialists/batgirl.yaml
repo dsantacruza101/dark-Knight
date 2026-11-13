@@ -41,7 +41,19 @@ verification:
       - builtin: npm_ci_if_needed
       - cmd: npm run build
         when: script:build
-      - cmd: npm run lint --if-present
-      # `npm test` es `vitest` (modo watch): se llama a `vitest run` directo.
-      - cmd: CI=true npx --no-install vitest run
+      # Solo si `lint` ya existia en origin/<rama de trabajo>: un script
+      # que el modelo agrego en el intento no es requisito.
+      - cmd: npm run lint
+        when: base_script:lint
+      # Runner de la suite segun `detect_suite_runner` (igual que el runner por
+      # archivo): `--watchAll` es solo de jest; vitest lo rechaza con
+      # `Unknown option` y no corre ningun test.
+      # Con vitest, `npm test` es `vitest` (modo watch): se llama a `vitest
+      # run` directo. Con `test_runner: vitest` el paso jest no aplica; queda
+      # para cuando el perfil pase a `auto` con un repo jest (Angular).
+      - cmd: CI=true npx --no-install vitest run --passWithNoTests
+        when: "runner:vitest"
+        counts_tests: node
+      - cmd: CI=true npm test -- --passWithNoTests --watchAll=false
+        when: [script:test, "runner:jest"]
         counts_tests: node

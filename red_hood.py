@@ -30,9 +30,10 @@ Por repo (fuera de `--dry-run`):
      el repo.
   2. Tests: detecta el stack por archivos (`package.json` -> Node,
      `requirements.txt`/`*.py` -> Python) y corre la suite siempre con
-     `CI=true` y sin watch mode (`npx vitest run --coverage` si el repo usa
-     Vitest, `npm test -- --passWithNoTests --coverage --watchAll=false`
-     si usa Jest; `pytest` si existe `tests/`), con timeout de 10 minutos.
+     `CI=true` y sin watch mode (runner segun `detect_suite_runner`, igual
+     que el modo Desarrollo: `npx --no-install vitest run --passWithNoTests
+     --coverage` si el repo usa Vitest, `npm test -- --passWithNoTests
+     --coverage --watchAll=false` si usa Jest; `pytest` si existe `tests/`), con timeout de 10 minutos.
      Un timeout no cuenta como test fallido: se clasifica aparte como
      categoria `test_timeout` (severidad base `low`).
   3. Analisis estatico: lint (`npm run lint --if-present`), auditoria de
@@ -134,6 +135,7 @@ from modes.development import (
     resolve_work_branch,
     run_cli,
     run_test_file,
+    detect_suite_runner,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -520,15 +522,16 @@ def parse_node_test_counts(output: str) -> tuple[int, int]:
     return 0, 0
 
 
-def run_node_tests(repo_path: Path) -> dict:
+def run_node_tests(repo_path: Path, test_runner: str = "auto") -> dict:
     pkg = read_package_json(repo_path)
     if "test" not in pkg.get("scripts", {}):
         return {"status": "sin_tests", "passed": 0, "failed": 0, "coverage_pct": None, "output": ""}
 
     # CI=true siempre: evita que jest/vitest queden esperando input interactivo (FASE 2).
     env = {**os.environ, "CI": "true"}
-    if node_test_runner(repo_path) == "vitest":
-        cmd = ["npx", "--no-install", "vitest", "run", "--coverage"]
+    # `--watchAll` es solo de jest: vitest lo rechaza (`Unknown option`) y no corre nada.
+    if node_test_runner(repo_path, test_runner) == "vitest":
+        cmd = ["npx", "--no-install", "vitest", "run", "--passWithNoTests", "--coverage"]
     else:
         cmd = ["npm", "test", "--", "--passWithNoTests", "--coverage", "--watchAll=false"]
 
@@ -564,10 +567,11 @@ def find_low_coverage_files(output: str, limit: int) -> list[str]:
     return result
 
 
-def node_test_runner(repo_path: Path) -> str:
-    pkg = read_package_json(repo_path)
-    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-    return "vitest" if "vitest" in deps else "jest"
+def node_test_runner(repo_path: Path, test_runner: str = "auto") -> str:
+    """`vitest` o `jest`, con la misma deteccion que el modo Desarrollo
+    (`detect_suite_runner`: `test_runner` del perfil dueño del repo; si es
+    `auto`, vitest en package.json o `vitest.config.*`)."""
+    return detect_suite_runner(repo_path, test_runner)
 
 
 def run_node_lint(repo_path: Path) -> str:
@@ -961,11 +965,11 @@ def discard_changes(repo_path: Path) -> None:
     revert_entries(repo_path, changed_entries(repo_path))
 
 
-def run_single_node_test(repo_path: Path, test_rel: str) -> bool:
+def run_single_node_test(repo_path: Path, test_rel: str, test_runner: str = "auto") -> bool:
     """Runner por archivo compartido con el modo Desarrollo
     (`modes.development.run_test_file`: vitest con `--reporter=json`, jest
     con `--json`): el test generado debe ejecutar > 0 tests y 0 fallidos."""
-    executed, failed, _ = run_test_file(repo_path, test_rel, node_test_runner(repo_path))
+    executed, failed, _ = run_test_file(repo_path, test_rel, node_test_runner(repo_path, test_runner))
     log.info("%s: %s -> %d test(s) ejecutados, %d fallido(s)", repo_path.name, test_rel, executed, failed)
     return executed > 0 and failed == 0
 
@@ -988,10 +992,11 @@ def generate_tests_for_repo(
     model: str,
     max_files: int,
     test_env: Optional[dict] = None,
+    test_runner: str = "auto",
 ) -> list[dict]:
     claude_md = read_repo_claude_md(repo_path)
     if stack == "node":
-        framework = "Vitest" if node_test_runner(repo_path) == "vitest" else "Jest"
+        framework = "Vitest" if node_test_runner(repo_path, test_runner) == "vitest" else "Jest"
     else:
         framework = "pytest"
 
@@ -1014,7 +1019,7 @@ def generate_tests_for_repo(
             continue
 
         passed = (
-            run_single_node_test(repo_path, test_rel) if stack == "node" else run_single_python_test(repo_path, test_rel, test_env)
+            run_single_node_test(repo_path, test_rel, test_runner) if stack == "node" else run_single_python_test(repo_path, test_rel, test_env)
         )
         if passed:
             # Solo se stagea el test generado; cualquier otro cambio (p. ej.
@@ -1373,7 +1378,7 @@ async def audit_repo(
 
     if stack == "node":
         npm_ci_if_needed(repo_path, state_entry)
-        test_result = run_node_tests(repo_path)
+        test_result = run_node_tests(repo_path, (profile or {}).get("test_runner", "auto"))
         lint_output = run_node_lint(repo_path)
         audit_vulns = run_node_audit(repo_path)
     elif stack == "python":
@@ -1447,7 +1452,10 @@ async def audit_repo(
             if candidates:
                 model = config["models"]["aider"]
                 test_env = python_test_env(repo_path, profile) if stack == "python" else {}
-                generated = generate_tests_for_repo(repo_path, stack, branch, candidates, model, max_files, test_env)
+                generated = generate_tests_for_repo(
+                    repo_path, stack, branch, candidates, model, max_files, test_env,
+                    (profile or {}).get("test_runner", "auto"),
+                )
                 for item in generated:
                     if item["status"] == "committed":
                         update_memory("test_generated_success", file=item["file"], framework=stack, branch=branch)

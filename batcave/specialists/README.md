@@ -116,7 +116,18 @@ Cada archivo de test permitido (`*.spec.ts(x)`, `*.test.ts(x)`, `.js(x)`,
   claro; sin `node_modules` o sin `package-lock.json` se corre `npm install`.
   Nunca se usa el cache de npx (`--no-install`): si el binario no esta en
   `node_modules/.bin`, el test falla diciendo que falta en las devDependencies.
-- `pytest` -> `python3 -m pytest <archivo> -q`; los `.py` usan pytest siempre.
+- `pytest` -> los `.py` usan pytest siempre. Repo uv (`uv.lock`): `uv run
+  --locked pytest <archivo> -q`. Sin uv: `.verify-venv/bin/python -m pytest
+  <archivo> -q`, nunca el `python3` del PATH (en el servicio es el de
+  `~/.aider-venv`, sin pytest). `.verify-venv` es un venv aislado dentro del
+  workspace (`uv venv`; requiere `uv` en el PATH) con `requirements.txt`,
+  `requirements-dev.txt` y `requirements-dev.lock` si existen (o, si no hay
+  ninguno, las dependencias de `pyproject.toml`), `--require-hashes` en los
+  que traen `--hash`, mas `pytest`; se cachea por hash de esos archivos (+
+  `.python-version`). Esta en `.git/info/exclude`, `git clean` no lo borra y
+  el candado lo ignora (nunca se revierte ni se comitea). Lo mismo aplica a
+  un paso `python3 -m pytest ...`/`pytest ...` de la suite completa (que se
+  omite si el repo no tiene `tests/`) y a la suite de Red Hood.
 - `flutter` -> `flutter test --machine <archivo>`; los `.dart` usan flutter
   siempre (repos con `pubspec.yaml`). Se cuentan los eventos `testDone` no
   ocultos ni omitidos (un "loading" fallido = no compilo = fallido);
@@ -152,6 +163,23 @@ verification:
 Condiciones `when` (string o lista; en lista deben cumplirse todas):
 
 - `script:<nombre>` — `package.json` tiene ese script.
+- `base_script:<nombre>` — el `package.json` de `origin/<rama de trabajo>`
+  (antes del intento) ya tenia ese script; uno que agrego el modelo no
+  cuenta (p. ej. `npm run lint` con `when: base_script:lint`).
+- `runner:<vitest|jest>` — el runner JS del repo es ese (`detect_suite_runner`,
+  la misma deteccion que el runner por archivo: `test_runner` del perfil si
+  es `vitest`/`jest`; si no, vitest si esta en `package.json` o hay
+  `vitest.config.*`, si no jest). Sirve para elegir el comando de la suite:
+  `--watchAll` es solo de jest y vitest lo rechaza (`Unknown option`):
+
+  ```yaml
+  - cmd: CI=true npx --no-install vitest run --passWithNoTests
+    when: [script:test, "runner:vitest"]
+    counts_tests: node
+  - cmd: CI=true npm test -- --passWithNoTests --watchAll=false
+    when: [script:test, "runner:jest"]
+    counts_tests: node
+  ```
 - `exists:<ruta>` — la ruta existe en el repo (relativa a la raiz).
 - `glob:<patron>` — `Path.glob` desde la raiz encuentra algo (`*.tf` solo la
   raiz, `**/*.tf` recursivo; se ignoran `node_modules`, `.git`, `.terraform`...).

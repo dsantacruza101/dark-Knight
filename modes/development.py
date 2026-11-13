@@ -1471,18 +1471,24 @@ def npm_ci_if_needed(repo_path: Path, allowed_files: Optional[list[str]] = None)
     return proc
 
 
-def step_condition_met(repo_path: Path, when, base_branch: Optional[str] = None) -> bool:
+def step_condition_met(
+    repo_path: Path, when, base_branch: Optional[str] = None, test_runner: str = "auto"
+) -> bool:
     """Condicion `when` de un paso de verificacion: `script:<n>`,
     `base_script:<n>` (el script ya existia en `origin/<base_branch>` antes
     del intento: uno que el modelo agrego no se vuelve requisito; sin
     `base_branch`, se mira el package.json en disco), `exists:<ruta>`,
     `glob:<patron>` (Path.glob desde la raiz: `*.tf` solo la raiz, `**/*.tf`
-    recursivo), una lista de ellas (todas deben cumplirse) o ninguna."""
+    recursivo), `runner:<vitest|jest>` (runner JS de la suite segun
+    `detect_suite_runner` con el `test_runner` del perfil), una lista de
+    ellas (todas deben cumplirse) o ninguna."""
     if not when:
         return True
     if isinstance(when, list):
-        return all(step_condition_met(repo_path, cond, base_branch) for cond in when)
+        return all(step_condition_met(repo_path, cond, base_branch, test_runner) for cond in when)
     kind, _, arg = str(when).partition(":")
+    if kind == "runner":
+        return detect_suite_runner(repo_path, test_runner) == arg.strip().lower()
     if kind == "script":
         return node_has_script(repo_path, arg)
     if kind == "base_script":
@@ -1625,7 +1631,7 @@ def run_verification_steps(
     allowed = {normalize_rel_path(f) for f in allowed_files}
     for stack_name, stack in detected_stacks(repo_path, profile):
         for step in stack.get("steps", []):
-            if not step_condition_met(repo_path, step.get("when"), base_branch):
+            if not step_condition_met(repo_path, step.get("when"), base_branch, profile.get("test_runner", "auto")):
                 continue
             builtin = step.get("builtin")
             label = str(step.get("cmd") or builtin)
@@ -1779,6 +1785,17 @@ def detect_test_runner(repo_path: Path, rel: str, configured: str = "auto") -> s
     if "vitest" in deps or any(any(repo_path.glob(pattern)) for pattern in VITEST_CONFIG_GLOBS):
         return "vitest"
     return "jest"
+
+
+def detect_suite_runner(repo_path: Path, configured: str = "auto") -> str:
+    """Runner JS de la suite completa del repo (`vitest` o `jest`), con la
+    misma deteccion que el runner por archivo (`detect_test_runner`): el
+    `test_runner` del perfil si es `vitest`/`jest`; si no, vitest si esta en
+    package.json o hay `vitest.config.*`, si no jest. Lo usan la condicion
+    `when: runner:<nombre>` de los pasos de verificacion y la suite de Red
+    Hood (`--watchAll` es solo de jest: vitest lo rechaza con `Unknown
+    option`)."""
+    return detect_test_runner(repo_path, "package.json", str(configured or "auto").lower())
 
 
 def ensure_local_node_deps(repo_path: Path) -> str:
@@ -2295,7 +2312,7 @@ def describe_verification(repo_path: Path, profile: dict) -> list[str]:
         f"- [{stack_name}] {step.get('cmd') or step.get('builtin')}"
         for stack_name, stack in detected_stacks(repo_path, profile)
         for step in stack.get("steps", [])
-        if step_condition_met(repo_path, step.get("when"))
+        if step_condition_met(repo_path, step.get("when"), test_runner=profile.get("test_runner", "auto"))
     ]
 
 
