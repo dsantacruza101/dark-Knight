@@ -74,6 +74,9 @@ verification:
     detect: [requirements.txt, setup.py]
     steps:
       - builtin: py_compile_changed
+      # Sin uv.lock el comando se reescribe a `.verify-venv/bin/python -m
+      # pytest -q`: venv aislado y cacheado en el workspace con los
+      # requirements del repo + pytest (nunca el python3 del PATH).
       - cmd: python3 -m pytest -q
         when: exists:tests
   node:
@@ -84,11 +87,19 @@ verification:
         when: script:build
       - cmd: npm run typecheck
         when: script:typecheck
-      - cmd: npm run lint --if-present
-      # Los repos Node de Red Robin usan vitest (no acepta --watchAll de jest).
-      # tests/cardRepository.test.ts (tarjetas) exige
+      # Solo si `lint` ya existia en origin/<rama de trabajo>: un script
+      # que el modelo agrego en el intento no es requisito.
+      - cmd: npm run lint
+        when: base_script:lint
+      # Runner de la suite segun `detect_suite_runner` (igual que el runner por
+      # archivo): `--watchAll` es solo de jest; vitest lo rechaza con
+      # `Unknown option` y no corre ningun test.
+      # tests/cardRepository.test.ts (tarjetas, vitest) exige
       # TARJETAS_TEST_DATABASE_URL (Postgres real), que el workspace no tiene:
       # se excluye de la suite completa.
       - cmd: CI=true npx --no-install vitest run --passWithNoTests --exclude tests/cardRepository.test.ts
-        when: script:test
+        when: [script:test, "runner:vitest"]
+        counts_tests: node
+      - cmd: CI=true npm test -- --passWithNoTests --watchAll=false
+        when: [script:test, "runner:jest"]
         counts_tests: node

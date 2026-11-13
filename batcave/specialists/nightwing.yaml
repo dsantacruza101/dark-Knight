@@ -38,14 +38,26 @@ verification:
       - builtin: npm_ci_if_needed
       - cmd: npm run build
         when: script:build
-      - cmd: npm run lint --if-present
+      # Solo si `lint` ya existia en origin/<rama de trabajo>: un script
+      # que el modelo agrego en el intento no es requisito.
+      - cmd: npm run lint
+        when: base_script:lint
+      # Runner de la suite segun `detect_suite_runner` (igual que el runner por
+      # archivo): `--watchAll` es solo de jest; vitest lo rechaza con
+      # `Unknown option` y no corre ningun test.
+      - cmd: CI=true npx --no-install vitest run --passWithNoTests
+        when: [script:test, "runner:vitest"]
+        counts_tests: node
       - cmd: CI=true npm test -- --passWithNoTests --watchAll=false
-        when: script:test
+        when: [script:test, "runner:jest"]
         counts_tests: node
   python:
     detect: [requirements.txt, pyproject.toml, setup.py]
     steps:
       - builtin: py_compile_changed
+      # Sin uv.lock el comando se reescribe a `.verify-venv/bin/python -m
+      # pytest -q`: venv aislado y cacheado en el workspace con los
+      # requirements del repo + pytest (nunca el python3 del PATH).
       - cmd: python3 -m pytest -q
         when: exists:tests
   spring:

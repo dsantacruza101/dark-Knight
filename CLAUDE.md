@@ -125,7 +125,12 @@ jest -> `npx --no-install jest --runTestsByPath <archivo> --json` (solo el
 binario local, nunca el cache de npx; antes, sin `package.json` falla con
 mensaje claro y sin `node_modules` o sin lockfile corre `npm install`); `.py` -> pytest
 (repo con `uv.lock`: `uv run --locked pytest <archivo> --no-cov -q`, sin
-uv: `python3 -m pytest`; siempre con las variables `VAR=valor` del paso
+uv: `.verify-venv/bin/python -m pytest`, venv aislado y cacheado en el
+workspace con `uv venv` + requirements.txt/requirements-dev.txt/.lock
+(`--require-hashes` si traen `--hash`) + pytest, nunca el python3 del
+PATH; `.verify-venv` va en `.git/info/exclude` y el candado lo ignora; el
+paso `python3 -m pytest` de la suite completa se reescribe igual y se omite
+sin `tests/`); siempre con las variables `VAR=valor` del paso
 pytest del perfil, p. ej. `PENGUIN_ENV_FILE=/nonexistent/...`, y sin
 ninguna `*DATABASE_URL*` ni secreto heredado del servicio
 (`is_test_unsafe_var`: `*_TOKEN`, `*_API_KEY`, `*_SECRET`, `*CHAT_ID`...;
@@ -152,11 +157,18 @@ Flujo por issue en `modes/development.py`:
    archivo mencionado).
 3. **Verificacion**: los pasos de `verification` del perfil para cada stack
    detectado (Nightwing: Node -> `npm ci` si hace falta, `npm run build`,
-   `npm run lint --if-present`, `CI=true npm test -- --passWithNoTests
-   --watchAll=false`; Python -> `py_compile` de los cambiados + `pytest -q`
+   `npm run lint` si ya existia en la base, y la suite segun el runner
+   (`when: runner:vitest|jest`, `detect_suite_runner`: misma deteccion que
+   el runner por archivo, con el `test_runner` del perfil): vitest ->
+   `CI=true npx --no-install vitest run --passWithNoTests`, jest -> `CI=true
+   npm test -- --passWithNoTests --watchAll=false` (`--watchAll` es solo de
+   jest: vitest lo rechaza con `Unknown option` y no corre nada, bills#3);
+   Python -> `py_compile` de los cambiados + `pytest -q`
    si hay `tests/`; Spring Boot -> `./mvnw -q test` si hay `mvnw`; Batgirl:
-   `npm ci` si hace falta, `npm run build`, `npm run lint --if-present`,
-   `CI=true npx --no-install vitest run`), mas la validacion por archivo permitido de
+   `npm ci` si hace falta, `npm run build`, `npm run lint` si ya existia,
+   la misma suite por runner (con `test_runner: vitest` siempre vitest);
+   Red Robin igual con `--exclude tests/cardRepository.test.ts` en vitest),
+   mas la validacion por archivo permitido de
    siempre y el runner por archivo de cada test permitido.
 4. **Escalacion qwen -> Claude**: si los `development.aider_attempts`
    intentos fallan, se llama UNA vez a `claude -p --permission-mode
@@ -574,7 +586,10 @@ en my_Portfolio_React_v2); si no existe, audita `main` en modo solo-lectura
 el HEAD contra el ultimo hash auditado en
 `batcave/memory/red_hood_state.json`; sin commits nuevos, se omite.
 
-Corre tests con cobertura (`npm test -- --passWithNoTests --coverage` /
+Corre tests con cobertura (runner segun `detect_suite_runner`, con el
+`test_runner` del perfil dueño: vitest -> `npx --no-install vitest run
+--passWithNoTests --coverage`; jest -> `npm test -- --passWithNoTests
+--coverage --watchAll=false` /
 `pytest` si existe `tests/`, timeout 10 min), lint, auditoria de dependencias
 (`npm audit` / `pip-audit`), `py_compile` en Python, y un escaneo de secretos
 hardcodeados (regex: `sk-ant-`, `ghp_`, `apikey_`, `bot<digitos>:AA`,
@@ -597,7 +612,7 @@ del modo Desarrollo (`run_test_file`: vitest/jest con reporte JSON; exige
 > 0 tests ejecutados y 0 fallidos). En repos uv (`uv.lock`, tambien
 detectados como Python) la suite y el test por archivo corren con `uv run
 --locked pytest` y el entorno seguro del perfil dueño del repo
-(`python_test_env`), sin `*DATABASE_URL*`; sin uv, pytest del venv o python3. Si pasa, se comitea (y pushea) a la rama
+(`python_test_env`), sin `*DATABASE_URL*`; sin uv, pytest del `.verify-venv` aislado (igual que el modo Desarrollo). Si pasa, se comitea (y pushea) a la rama
 de trabajo del repo.
 
 Reporta hallazgos high/critical y tests fallidos como issues en GitHub
